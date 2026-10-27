@@ -111,7 +111,7 @@ Work is never dropped and never done twice, for consumers that are not always
 connected. [`tests/offline/run.sh`](tests/offline/run.sh) is that claim, run on
 every pull request by the `offline` job of CI, against Iggy through compose. It
 mints an agent credential for a fresh tenant with `mansio principals create`
-and runs two scenarios of N items (`MANSIO_OFFLINE_ITEMS`, 50) with a
+and runs three scenarios of N items (`MANSIO_OFFLINE_ITEMS`, 50) with a
 consumer, [`tests/offline/consumer.sh`](tests/offline/consumer.sh): a plain
 shell loop of `mansio work pull --wait` and `mansio work ack` that appends the
 item's id to a file only when the ack succeeds. Any harness can copy it.
@@ -126,16 +126,26 @@ item's id to a file only when the ack succeeds. Any harness can copy it.
    passed. The file ends as in 1, and for the held item `facts.work` holds
    exactly one `expired` and one `retried`, then the claim and the ack of
    attempt 2.
+3. As in 2, but the consumer that died starts again under the same name while
+   its lease is live. A consumer that holds a live lease is given it again, so
+   it gets the held item back and acknowledges it once. The file ends as in 1,
+   and `facts.work` holds one claim and one ack of attempt 1 for every item,
+   the held one included: no expiry, no second attempt.
 
-The second consumer has a name of its own because a consumer that holds a live
-lease is given it again: a restart under the same name picks its lease up
-instead of waiting for it to end.
+The consumer that takes over in scenario 2 has a name of its own because the
+dead one's name would be given its lease back, and there would be no expiry to
+wait for.
+
+After the last item of a scenario is done the test goes on watching for as long
+as a redelivery can take, so that a duplicate that arrives late is still caught
+(`MANSIO_OFFLINE_SETTLE_SECONDS`).
 
 To run it you need a built `mansio`, `jq`, `curl`, `pkill` and `pgrep`, and a
 server with a lease of seconds, not the default five minutes, because scenario
-2 waits for it. The test reads the server's lease and backoff from
-`GET /v1/settings` and refuses to start if its timeout is shorter. On Linux,
-with Docker:
+2 waits for it, and long enough to restart a consumer inside, because scenario
+3 does. The test reads the server's lease, backoff and tick from
+`GET /v1/settings` and refuses to start if its timeout, or a settle time you
+set, is shorter than they need. On Linux, with Docker:
 
 ```sh
 MANSIO_LEASE_SECONDS=8 MANSIO_MAX_ATTEMPTS=3 MANSIO_BACKOFF_BASE_SECONDS=1 \
@@ -805,16 +815,18 @@ topics it creates, and leaves Iggy's own settings at its defaults.
 ### The offline test
 
 Read by `tests/offline/run.sh` and `tests/offline/consumer.sh` (see [The
-guarantee](#the-guarantee)). The test also reads `MANSIO_URL` and takes the
-admin token from `MANSIO_TOKEN`; its consumers are given the credential it
-mints as their `MANSIO_TOKEN`.
+guarantee](#the-guarantee)). The test also reads `MANSIO_URL` and
+`MANSIO_POLL_INTERVAL_MILLIS` (see the CLI settings) and takes the admin token
+from `MANSIO_TOKEN`; its consumers are given the credential it mints as their
+`MANSIO_TOKEN`.
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `MANSIO_BIN` | `mansio` | The `mansio` command that the test and its consumers run. |
 | `MANSIO_OFFLINE_ITEMS` | `50` | Items published in each scenario. |
 | `MANSIO_OFFLINE_TIMEOUT_SECONDS` | `120` | How long a scenario waits for every item to be done. It must be longer than the server's lease plus its backoff cap, which the test checks before it starts. |
-| `MANSIO_OFFLINE_SETTLE_SECONDS` | `5` | How long the test keeps watching after the last item is done, before it checks for a duplicate that arrives late. |
+| `MANSIO_OFFLINE_SETTLE_SECONDS` | the server's lease plus its backoff cap plus twice its tick and the CLI's poll interval, read from `GET /v1/settings` | How long the test keeps watching after the last item is done, before it checks for a duplicate that arrives late. The longest a redelivery can take is that default, so the test refuses to start with a shorter one. |
+| `MANSIO_OFFLINE_KILL_WAIT_SECONDS` | `5` | How long a consumer that was killed may take to disappear from the process table before the test fails. |
 | `MANSIO_OFFLINE_CREDENTIAL_TTL_SECONDS` | `3600` | How long the agent credentials the test mints last. |
 | `MANSIO_OFFLINE_PULL_WAIT_SECONDS` | `5` | How long one `work pull` of the consumer looks for an item. |
 | `MANSIO_OFFLINE_RETRY_SECONDS` | `1` | The consumer's wait after a pull that failed. |

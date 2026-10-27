@@ -50,8 +50,9 @@ All notable changes to mansio are listed here. The format follows
   by the CI `e2e` job against Iggy: a queue longer than a page with a claimed
   item, and an `alerts` topic that retention has trimmed.
 - The offline-consumer test, `tests/offline/run.sh`, run by the CI `offline`
-  job against compose: a consumer killed while idle, and one killed holding a
-  lease, and in both every one of N items is done exactly once. The consumer,
+  job against compose: a consumer killed while idle, one killed holding a
+  lease and replaced by another, and one killed holding a lease and restarted
+  under its name, and in each every one of N items is done exactly once. The consumer,
   `tests/offline/consumer.sh`, is a plain shell loop of `mansio work pull
   --wait` and `mansio work ack`. The settings `MANSIO_BIN` and
   `MANSIO_OFFLINE_*` are listed in the README.
