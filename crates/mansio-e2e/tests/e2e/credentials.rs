@@ -160,7 +160,8 @@ async fn an_agent_credential_publishes_to_its_build_and_claims_from_its_queue_an
 
 /// Done criterion 2: publishing to another tenant's stream is refused by the
 /// broker, not by mansio. The test asks the broker with the credential, and
-/// fails if it cannot.
+/// fails if it cannot. A credential's user may read what its scopes cover and
+/// send to nothing at all: every write goes through the server.
 #[tokio::test]
 async fn the_broker_refuses_a_credential_that_sends_to_another_tenants_stream() -> anyhow::Result<()>
 {
@@ -175,35 +176,66 @@ async fn the_broker_refuses_a_credential_that_sends_to_another_tenants_stream() 
         .issue(
             "agent",
             "builder-1",
-            &scopes(&[("facts.build", &["publish"])]),
+            &scopes(&[("facts.build", &["publish", "subscribe"])]),
             None,
         )
         .await?;
+    let own = target.tenant.as_str();
 
-    // The credential works at the broker for what it was given, so a refusal
-    // below is the permission and not a login that failed.
+    // The credential works at the broker for what it was given, a read of its
+    // own topic, so a refusal below is the permission and not a login that
+    // failed.
     assert_eq!(
-        target
-            .broker_send(&agent.token, &target.tenant, "facts.build")
-            .await?,
+        target.broker_poll(&agent.token, own, "facts.build").await?,
         Outcome::Accepted
     );
-    // Another tenant's stream, a topic of its own tenant it was not given,
-    // and a topic of another kind.
+    // It may not send to the topic it may publish through the server to, to
+    // another tenant's stream, to a topic of its own tenant it was not given,
+    // or to a topic of another kind.
     for (tenant, topic) in [
+        (own, "facts.build"),
         (other.as_str(), "facts.build"),
-        (target.tenant.as_str(), "facts.other"),
-        (target.tenant.as_str(), "alerts"),
+        (own, "facts.other"),
+        (own, "alerts"),
     ] {
         assert_eq!(
             target.broker_send(&agent.token, tenant, topic).await?,
             Outcome::Forbidden,
-            "{tenant} {topic}"
+            "send to {tenant} {topic}"
+        );
+    }
+    // And it may not read what it was not given.
+    for (tenant, topic) in [
+        (other.as_str(), "facts.build"),
+        (own, "facts.other"),
+        (own, "alerts"),
+    ] {
+        assert_eq!(
+            target.broker_poll(&agent.token, tenant, topic).await?,
+            Outcome::Forbidden,
+            "poll {tenant} {topic}"
         );
     }
     // Nothing the broker refused is there.
+    assert_eq!(target.read("facts.build").await?.len(), 1);
     assert_eq!(target.read("facts.other").await?.len(), 1);
     assert_eq!(target.read("alerts").await?.len(), 1);
+    assert_eq!(
+        target
+            .authed(
+                Method::GET,
+                &format!(
+                    "{}/v1/tenants/{other}/topics/facts.build/messages?offset=0",
+                    target.base
+                ),
+                None
+            )
+            .await?
+            .1["messages"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
 
     // The registry of principals is where no credential reaches.
     if let Some(outcome) = target.broker_read_registry(&agent.token).await? {
@@ -337,24 +369,38 @@ async fn a_person_acknowledges_alerts_and_claims_approvals_and_a_connector_publi
     ] {
         assert_eq!(answer.0, StatusCode::FORBIDDEN, "{what}: {}", answer.1);
     }
-    // And at the broker too.
-    assert_eq!(
-        target
-            .broker_send(&connector.token, &target.tenant, "facts.signal")
-            .await?,
-        Outcome::Accepted
-    );
-    for topic in ["facts.other", "alerts"] {
-        assert_eq!(
+    // And at the broker: it publishes through the server and cannot read, send
+    // or do anything else there. The person reads the alerts and nothing it
+    // may not.
+    for topic in ["facts.signal", "facts.other", "alerts"] {
+        for outcome in [
             target
                 .broker_send(&connector.token, &target.tenant, topic)
                 .await?,
-            Outcome::Forbidden,
-            "{topic}"
-        );
+            target
+                .broker_poll(&connector.token, &target.tenant, topic)
+                .await?,
+            target
+                .broker_send(&person.token, &target.tenant, topic)
+                .await?,
+        ] {
+            assert_eq!(outcome, Outcome::Forbidden, "{topic}");
+        }
     }
-    // The seed, the connector's publish, and the one sent to the broker direct.
-    assert_eq!(target.read("facts.signal").await?.len(), 3);
+    assert_eq!(
+        target
+            .broker_poll(&person.token, &target.tenant, "alerts")
+            .await?,
+        Outcome::Accepted
+    );
+    assert_eq!(
+        target
+            .broker_poll(&person.token, &target.tenant, "facts.other")
+            .await?,
+        Outcome::Forbidden
+    );
+    // The seed and the connector's publish.
+    assert_eq!(target.read("facts.signal").await?.len(), 2);
     let types: Vec<String> = target
         .alert_transitions()
         .await?
@@ -712,16 +758,23 @@ async fn a_topic_made_after_the_credential_is_open_to_it_when_a_scope_matches() 
     assert_eq!(status, StatusCode::CREATED, "{body}");
     assert_eq!(agent.pull("later").await?.0, StatusCode::OK);
 
-    // At the broker as well.
+    // At the broker as well: the agent may read the topic made after it, and
+    // the one whose scope does not cover it may not.
     assert_eq!(
         target
-            .broker_send(&agent.token, &target.tenant, "facts.later")
+            .broker_poll(&agent.token, &target.tenant, "facts.later")
             .await?,
         Outcome::Accepted
     );
     assert_eq!(
         target
-            .broker_send(&narrow.token, &target.tenant, "facts.later")
+            .broker_poll(&narrow.token, &target.tenant, "facts.later")
+            .await?,
+        Outcome::Forbidden
+    );
+    assert_eq!(
+        target
+            .broker_send(&agent.token, &target.tenant, "facts.later")
             .await?,
         Outcome::Forbidden
     );
@@ -729,6 +782,177 @@ async fn a_topic_made_after_the_credential_is_open_to_it_when_a_scope_matches() 
         narrow.publish("facts.later").await?.0,
         StatusCode::FORBIDDEN
     );
+    Ok(())
+}
+
+/// What only mansio writes stays only mansio's: a credential that may publish
+/// to every `facts.*` topic still cannot write a transition, a dead letter or a
+/// credential fact, and so cannot make a work item vanish or run twice.
+#[tokio::test]
+async fn a_facts_star_credential_cannot_write_what_only_mansio_writes() -> anyhow::Result<()> {
+    let mut target = Target::start().await?;
+    target.seed(&target.tenant, "facts.build").await?;
+    // Make the topics mansio writes, so that what is refused is refused for
+    // the credential and not for being missing: a claim and its ack make
+    // facts.work, and an acknowledged alert facts.alert.
+    target.seed_queue("builds").await?;
+    let claim = target.claim("builds", "worker", SLACK).await?;
+    target.ack_claim("builds", &claim).await?;
+    let alert = target.alert_publish(&alert()).await?;
+    let (status, _) = target.alert_ack(&alert.envelope.id.to_string()).await?;
+    assert_eq!(status, StatusCode::OK);
+    // The item the forger would like to make vanish.
+    target.seed_queue("builds").await?;
+    let forger = target
+        .issue(
+            "agent",
+            "forger",
+            &scopes(&[("facts.*", &["publish", "subscribe"])]),
+            None,
+        )
+        .await?;
+
+    // What it may write is written, and what mansio writes is refused.
+    let (status, body) = forger.publish("facts.build").await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    for topic in ["facts.work", "facts.alert", "facts.principal", "dead"] {
+        let (status, body) = forger.publish(topic).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{topic}: {body}");
+        // Reading the facts is another matter; `dead` is not under `facts.*`.
+        let (status, _) = forger.poll(topic).await?;
+        if topic == "dead" {
+            assert_eq!(status, StatusCode::FORBIDDEN, "{topic}");
+        } else {
+            assert_ne!(status, StatusCode::FORBIDDEN, "{topic} is readable");
+        }
+    }
+    // Not at the broker either: a credential writes nothing there.
+    for topic in [
+        "facts.work",
+        "facts.alert",
+        "facts.principal",
+        "facts.build",
+    ] {
+        assert_eq!(
+            target
+                .broker_send(&forger.token, &target.tenant, topic)
+                .await?,
+            Outcome::Forbidden,
+            "{topic}"
+        );
+    }
+    // The admin's generic route refuses them too.
+    for topic in ["facts.work", "facts.alert", "facts.principal", "dead"] {
+        let (status, _) = target
+            .authed(
+                Method::POST,
+                &target.messages_uri(topic),
+                Some(&json!({"source": "e2e", "type": "mansio.work.acked"})),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{topic}");
+    }
+    assert!(target.read("dead").await?.is_empty());
+    assert_eq!(target.work_transitions().await?, ["claimed", "acked"]);
+    assert_eq!(target.alert_transitions().await?, ["acknowledged"]);
+
+    // The item is still there to claim, after a restart too.
+    if target.is_local() {
+        target.stop_server().await?;
+        target.start_server().await?;
+    }
+    let claim = target.claim("builds", "worker", SLACK).await?;
+    target.ack_claim("builds", &claim).await?;
+    assert_eq!(
+        target.work_transitions().await?,
+        ["claimed", "acked", "claimed", "acked"]
+    );
+    Ok(())
+}
+
+/// Iggy checks a token when it signs in and not after, so a session opened
+/// before a revocation is a session an Iggy user holds: the revocation deletes
+/// the user, which takes away what it may read, and any token it made for
+/// itself goes with it.
+#[tokio::test]
+async fn a_session_opened_before_a_revocation_is_refused_after_it() -> anyhow::Result<()> {
+    let target = Target::start().await?;
+    target.seed(&target.tenant, "facts.build").await?;
+    let agent = target
+        .issue(
+            "agent",
+            "builder-1",
+            &scopes(&[("facts.build", &["subscribe"])]),
+            None,
+        )
+        .await?;
+    let tenant = target.tenant.as_str();
+    let session = target
+        .broker_session(&agent.token)
+        .await?
+        .context("the credential signs in")?;
+    assert_eq!(
+        session.poll(tenant, "facts.build").await?,
+        Outcome::Accepted
+    );
+    // A user signed in can make tokens for itself, with any expiry.
+    let own = session.mint_token().await;
+
+    let (status, _) = target.revoke(&agent.id).await?;
+    assert_eq!(status, StatusCode::OK);
+
+    // The session that was open is refused: the user is gone.
+    let outcome = session.poll(tenant, "facts.build").await?;
+    assert!(
+        matches!(outcome, Outcome::Forbidden | Outcome::Unauthenticated),
+        "{outcome:?}"
+    );
+    // So is everything made for that user.
+    if let Some(token) = own {
+        assert_eq!(target.broker_login(&token).await?, Outcome::Unauthenticated);
+    }
+    session.close().await;
+    Ok(())
+}
+
+/// A session opened before a credential expires reads until the sweep deletes
+/// the user: the bound is the sweep interval, and only while mansio-server
+/// runs. The server itself refuses the credential at the expiry.
+#[tokio::test]
+async fn a_session_opened_before_an_expiry_is_ended_by_the_sweep() -> anyhow::Result<()> {
+    let target = Target::start().await?;
+    target.seed(&target.tenant, "facts.build").await?;
+    let agent = target
+        .issue_with(
+            "agent",
+            "builder-1",
+            &scopes(&[("facts.build", &["subscribe"])]),
+            None,
+        )
+        .await?;
+    let tenant = target.tenant.as_str();
+    let session = target
+        .broker_session(&agent.token)
+        .await?
+        .context("the credential signs in")?;
+    assert_eq!(
+        session.poll(tenant, "facts.build").await?,
+        Outcome::Accepted
+    );
+
+    let sweep = Duration::from_secs(target.settings.credential_sweep_seconds);
+    let ttl = Duration::from_secs(target.settings.agent_credential_ttl_seconds);
+    target
+        .until(
+            "the sweep to end the session",
+            ttl + sweep * 2 + SLACK,
+            || async {
+                let outcome = session.poll(tenant, "facts.build").await?;
+                Ok(matches!(outcome, Outcome::Forbidden | Outcome::Unauthenticated).then_some(()))
+            },
+        )
+        .await?;
+    session.close().await;
     Ok(())
 }
 

@@ -25,10 +25,10 @@ pub struct Stored {
 
 /// Who a read or a write is for.
 ///
-/// The broker enforces permissions on a credential: what its scopes do not
-/// allow is refused by the broker, however the request was made. Creating
-/// streams, topics and users is the admin identity's alone and has no caller
-/// argument.
+/// The broker enforces permissions on a credential: it may read what its
+/// scopes cover and nothing else, and write nothing, however the request is
+/// made. Creating streams, topics and users is the admin identity's alone and
+/// has no caller argument.
 #[derive(Debug, Clone, Copy)]
 pub enum Caller<'a> {
     /// The server's own identity, which may read and write every topic.
@@ -56,6 +56,15 @@ pub struct Minted {
     /// The credential. The broker does not keep it in a form that can be
     /// shown again.
     pub credential: Credential,
+}
+
+/// A user of the broker, by number and name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerUserInfo {
+    /// The broker's number for it.
+    pub user: BrokerUser,
+    /// Its name.
+    pub name: String,
 }
 
 /// A record the server keeps in the broker where no credential can reach it.
@@ -118,7 +127,9 @@ pub trait Broker: Send + Sync {
     async fn ensure_topic(&self, tenant: &TenantId, topic: &Topic) -> Result<(), BrokerError>;
 
     /// Append the envelope to the topic named in it, as `caller`, and return
-    /// its offset.
+    /// its offset. A credential writes nothing: it is held to reading, and the
+    /// server writes for it as the admin, with the principal stamped from the
+    /// credential.
     ///
     /// `None` means the broker accepted and stored the message but could not
     /// say where it landed. The caller must not publish it again.
@@ -129,9 +140,9 @@ pub trait Broker: Send + Sync {
     /// # Errors
     ///
     /// Returns [`BrokerError::NotFound`] if the tenant or topic does not
-    /// exist, [`BrokerError::Forbidden`] if the credential may not send there,
-    /// [`BrokerError::Unauthenticated`] if it is not valid, or an error if the
-    /// broker cannot be reached or refuses.
+    /// exist, [`BrokerError::Forbidden`] for a credential, which may not send
+    /// anywhere, [`BrokerError::Unauthenticated`] if it is not valid, or an
+    /// error if the broker cannot be reached or refuses.
     async fn publish(
         &self,
         caller: &Caller<'_>,
@@ -215,6 +226,16 @@ pub trait Broker: Send + Sync {
         _grants: &[Grant],
     ) -> Result<(), BrokerError> {
         Err(unsupported("users"))
+    }
+
+    /// Every user the broker has, the server's own and the ones made for
+    /// principals alike. A broker without users has none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the broker cannot be reached or refuses.
+    async fn list_users(&self) -> Result<Vec<BrokerUserInfo>, BrokerError> {
+        Ok(Vec::new())
     }
 
     /// Delete the user and every credential of it, and end its sessions. A

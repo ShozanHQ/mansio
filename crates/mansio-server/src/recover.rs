@@ -181,7 +181,7 @@ fn newest_versions(messages: &[Stored]) -> Vec<(ItemId, &Stored)> {
 
 fn lease_of(data: &WorkFact, now: i64) -> Option<Lease> {
     Some(Lease {
-        id: data.lease_id?,
+        fingerprint: data.lease?,
         holder: data.holder.clone()?,
         consumer: data.consumer.clone()?,
         expires_at: data

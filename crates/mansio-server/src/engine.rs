@@ -42,6 +42,7 @@ use crate::error::ApiError;
 use crate::facts::Facts;
 use crate::recover;
 use crate::settings::WorkSettings;
+pub use crate::state::Holder;
 use crate::state::{Item, Lease, Phase, TenantState, Then, backoff, held_lease};
 
 type Held = OwnedMutexGuard<TenantState>;
@@ -111,6 +112,17 @@ impl Engine {
             tenants: StdMutex::default(),
             discovered: AtomicBool::new(false),
         }
+    }
+
+    /// The tenants the engine holds state for, in order. A tenant is held from
+    /// the first request that reaches the engine, so a refused request must
+    /// not reach it.
+    #[cfg(test)]
+    pub(crate) fn tracked_tenants(&self) -> Vec<TenantId> {
+        let tenants = self.tenants.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut names: Vec<TenantId> = tenants.keys().cloned().collect();
+        names.sort();
+        names
     }
 
     /// The settings the engine runs with.
@@ -194,15 +206,16 @@ impl Engine {
     /// sink, set the record on it, publish it. The caller holds the tenant's
     /// lock, which is what keeps the sink and the topic in the same order.
     ///
-    /// The broker is asked, as the admin identity, to make sure the tenant and
-    /// the topic exist each time; it remembers what it has found, and
-    /// recreates what was deleted. The publish is made as `caller`, so that
-    /// the broker holds a credential to its scopes.
-    async fn append_as(
+    /// Everything is published as the admin identity: a credential never
+    /// writes. The server has already checked the caller's `publish` scope,
+    /// and has set the principal from the credential and whatever else a caller
+    /// may not set. The broker is asked to make sure the tenant and the topic
+    /// exist each time; it remembers what it has found, and recreates what was
+    /// deleted.
+    async fn append(
         &self,
         held: &mut TenantState,
         mut envelope: Envelope,
-        caller: &Caller<'_>,
     ) -> Result<Published, ApiError> {
         self.broker.ensure_tenant(&envelope.tenant).await?;
         self.broker
@@ -213,7 +226,7 @@ impl Engine {
         {
             envelope.record = Some(record);
         }
-        let offset = match self.broker.publish(caller, &envelope).await {
+        let offset = match self.broker.publish(&Caller::Admin, &envelope).await {
             Ok(offset) => offset,
             Err(error) => {
                 if outcome_unknown(&error) {
@@ -229,16 +242,6 @@ impl Engine {
         Ok(Published { offset, envelope })
     }
 
-    /// What the engine publishes itself: transitions and republished items,
-    /// as the admin identity.
-    async fn append(
-        &self,
-        held: &mut TenantState,
-        envelope: Envelope,
-    ) -> Result<Published, ApiError> {
-        self.append_as(held, envelope, &Caller::Admin).await
-    }
-
     /// Record a fact the server makes outside the work and alert engine, such
     /// as the issue of a credential: in the sink, then on its topic, in order
     /// with everything else for the tenant.
@@ -252,31 +255,26 @@ impl Engine {
         self.append(&mut held, fact).await
     }
 
-    /// Publish an envelope to a topic as `caller`: the generic messages route.
+    /// Publish an envelope to a topic: the generic messages route.
     ///
     /// Work goes through [`Engine::work_publish`], and `facts.work`,
-    /// `facts.alert` and `facts.principal` are written by the server alone.
-    /// What the caller is allowed to publish is for the route to decide
-    /// before it gets here, and for the broker to enforce.
+    /// `facts.alert`, `facts.principal` and `dead` are written by the server
+    /// alone. Whether the caller may publish here is for the route to decide
+    /// before it gets here.
     ///
     /// # Errors
     ///
-    /// Returns 400 for those topics, 403 if the broker does not let the
-    /// credential send there, 409 for an alert whose id is already taken, 503
-    /// if the sink or the broker is unavailable, and 502 if the broker
-    /// refuses.
-    pub async fn publish(
-        &self,
-        caller: &Caller<'_>,
-        envelope: Envelope,
-    ) -> Result<Published, ApiError> {
+    /// Returns 400 for those topics, 409 for an alert whose id is already
+    /// taken, 503 if the sink or the broker is unavailable, and 502 if the
+    /// broker refuses.
+    pub async fn publish(&self, envelope: Envelope) -> Result<Published, ApiError> {
         match &envelope.topic {
             Topic::Work(_) => {
                 return Err(ApiError::BadRequest(
                     "work is published with work_publish, not to a work topic directly".to_owned(),
                 ));
             }
-            topic if is_written_by_mansio(topic) => {
+            topic if topic.is_written_by_mansio() => {
                 return Err(ApiError::BadRequest(format!(
                     "{topic} is written by mansio and cannot be published to"
                 )));
@@ -289,7 +287,7 @@ impl Engine {
             self.broker
                 .ensure_topic(&envelope.tenant, &envelope.topic)
                 .await?;
-            let offset = self.broker.publish(caller, &envelope).await?;
+            let offset = self.broker.publish(&Caller::Admin, &envelope).await?;
             return Ok(Published { offset, envelope });
         }
         let mut held = self.lock(&envelope.tenant).await?;
@@ -303,7 +301,7 @@ impl Engine {
                 envelope.id
             )));
         }
-        let stored = self.append_as(&mut held, envelope, caller).await?;
+        let stored = self.append(&mut held, envelope).await?;
         if is_alert {
             // Timed from now, not from the `time` the producer wrote.
             held.alerts
@@ -319,11 +317,7 @@ impl Engine {
     ///
     /// Returns 409 if the queue has an item with the id, open or done, and
     /// the errors of [`Engine::publish`].
-    pub async fn work_publish(
-        &self,
-        caller: &Caller<'_>,
-        envelope: Envelope,
-    ) -> Result<Published, ApiError> {
+    pub async fn work_publish(&self, envelope: Envelope) -> Result<Published, ApiError> {
         let (Topic::Work(queue), Some(item)) = (envelope.topic.clone(), envelope.item_id.clone())
         else {
             return Err(ApiError::Internal);
@@ -334,7 +328,7 @@ impl Engine {
                 "{queue} already has an item with id {item}: an id is not used again, even when the item is done"
             )));
         }
-        let stored = self.append_as(&mut held, envelope, caller).await?;
+        let stored = self.append(&mut held, envelope).await?;
         held.queue_mut(&queue)
             .insert(item, stored.envelope.clone(), Phase::Ready);
         Ok(stored)
@@ -367,14 +361,15 @@ impl Engine {
             return Ok(None);
         };
 
+        let lease_id = LeaseId::generate();
         let lease = Lease {
-            id: LeaseId::generate(),
+            fingerprint: lease_id.fingerprint(),
             holder: principal.clone(),
             consumer: consumer.clone(),
             expires_at: now.saturating_add(millis(self.settings.lease)),
         };
         let mut data = WorkFact::new(queue.clone(), message.id, attempt);
-        data.lease_id = Some(lease.id);
+        data.lease = Some(lease.fingerprint);
         data.holder = Some(lease.holder.clone());
         data.consumer = Some(lease.consumer.clone());
         data.expires_at = Some(timestamp(lease.expires_at)?);
@@ -386,13 +381,15 @@ impl Engine {
         held.queue_mut(queue)
             .set_phase(&id, Phase::Leased(lease.clone()));
         Ok(Some(Claimed {
-            lease_id: lease.id,
+            lease_id,
+            consumer: lease.consumer.clone(),
             expires_at: timestamp(lease.expires_at)?,
             item: message,
         }))
     }
 
-    /// Complete an item. Only the holder, presenting the lease id, may.
+    /// Complete an item. Only the holder, naming the consumer and presenting
+    /// the lease id, may.
     ///
     /// # Errors
     ///
@@ -404,14 +401,14 @@ impl Engine {
         tenant: &TenantId,
         queue: &Segment,
         item: &ItemId,
-        principal: &Principal,
-        lease_id: &LeaseId,
+        holder: Holder<'_>,
     ) -> Result<Published, ApiError> {
         let mut held = self.lock(tenant).await?;
         let now = self.clock.now_millis();
+        let principal = holder.principal;
         let fact = {
             let open = open_item(&held, queue, item)?;
-            let lease = held_lease(open, principal, lease_id, now)?;
+            let lease = held_lease(open, holder, now)?;
             let data = lease_fact(queue, open, lease);
             self.facts
                 .work(tenant, WorkEvent::Acked, principal, now, item, &data)?
@@ -421,8 +418,8 @@ impl Engine {
         Ok(stored)
     }
 
-    /// Give an item back as failed. Only the holder, presenting the lease id,
-    /// may. The item is republished after a backoff, or goes to `dead` if it
+    /// Give an item back as failed. Only the holder, naming the consumer and
+    /// presenting the lease id, may. The item is republished after a backoff, or goes to `dead` if it
     /// has used its attempts.
     ///
     /// # Errors
@@ -433,15 +430,15 @@ impl Engine {
         tenant: &TenantId,
         queue: &Segment,
         item: &ItemId,
-        principal: &Principal,
-        lease_id: &LeaseId,
+        holder: Holder<'_>,
         reason: &str,
     ) -> Result<Published, ApiError> {
         let mut held = self.lock(tenant).await?;
         let now = self.clock.now_millis();
+        let principal = holder.principal;
         let (fact, next, due) = {
             let open = open_item(&held, queue, item)?;
-            let lease = held_lease(open, principal, lease_id, now)?;
+            let lease = held_lease(open, holder, now)?;
             let (next, retry_at) = self.decide(open.attempt(), now);
             let mut data = lease_fact(queue, open, lease);
             data.reason = Some(reason.to_owned());
@@ -762,13 +759,6 @@ impl Engine {
     }
 }
 
-/// Whether the server writes the topic itself, so that nobody else may.
-fn is_written_by_mansio(topic: &Topic) -> bool {
-    *topic == Topic::facts_work()
-        || *topic == Topic::facts_alert()
-        || *topic == Topic::facts_principal()
-}
-
 /// Whether a failed publish may still have stored the message. Only an error
 /// about reaching the broker may: a refusal, a missing topic or an invalid
 /// envelope all come before anything is stored.
@@ -792,7 +782,7 @@ fn open_item<'a>(
 /// The `data` of a fact about an item under a lease.
 fn lease_fact(queue: &Segment, item: &Item, lease: &Lease) -> WorkFact {
     let mut data = WorkFact::new(queue.clone(), item.message.id, item.attempt());
-    data.lease_id = Some(lease.id);
+    data.lease = Some(lease.fingerprint);
     data.holder = Some(lease.holder.clone());
     data.consumer = Some(lease.consumer.clone());
     data.expires_at = Timestamp::from_unix_millis(lease.expires_at).ok();

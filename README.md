@@ -169,21 +169,22 @@ curl -H "Authorization: Bearer $MANSIO_TOKEN" -H 'Content-Type: application/json
 curl -H "Authorization: Bearer $MANSIO_TOKEN" -H 'Content-Type: application/json' \
   -d '{"consumer":"worker-1"}' \
   http://127.0.0.1:7070/v1/tenants/acme/work/builds/pull
-# 200 {"lease_id":"<uuid>","expires_at":"2026-10-26T12:05:00.000Z","item":{...}}
+# 200 {"lease_id":"<uuid>","consumer":"worker-1","expires_at":"2026-10-26T12:05:00.000Z","item":{...}}
 # 204 when nothing can be claimed
 
-# work_ack, or work_fail with a reason, by the holder, with the lease id.
-curl ... -d '{"lease_id":"<uuid>"}' \
+# work_ack, or work_fail with a reason, by the holder, with the consumer name
+# and the lease id.
+curl ... -d '{"lease_id":"<uuid>","consumer":"worker-1"}' \
   http://127.0.0.1:7070/v1/tenants/acme/work/builds/items/<itemid>/ack
-curl ... -d '{"lease_id":"<uuid>","reason":"out of memory"}' \
+curl ... -d '{"lease_id":"<uuid>","consumer":"worker-1","reason":"out of memory"}' \
   http://127.0.0.1:7070/v1/tenants/acme/work/builds/items/<itemid>/fail
 ```
 
 - A claim is a lease of `MANSIO_LEASE_SECONDS`. Nobody else is given the item
   while it holds, and two concurrent pulls never get the same one.
-- Only the holder, which is the principal behind the token plus the lease id
-  (an unguessable UUID), can ack or fail. Another lease id or principal is a
-  403, an item with no live lease (never claimed, expired, waiting for its
+- Only the holder, which is the principal behind the token, the consumer name
+  it pulled under and the lease id (an unguessable UUID), can ack or fail.
+  Another lease id, consumer name or principal is a 403, an item with no live lease (never claimed, expired, waiting for its
   retry) is a 409, an item that is not open (done, dead, unknown) is a 404.
   Nothing changes then. An ack after the lease ended is a 409.
 - A fail, or a lease that ends unanswered, republishes the item to its queue
@@ -217,7 +218,10 @@ curl ... -d '{"lease_id":"<uuid>","reason":"out of memory"}' \
 The transitions are `mansio.work.claimed`, `.acked`, `.failed`, `.expired`,
 `.retried` and `.dead` on `facts.work`, with the item id as `subject`, and
 `data` naming the queue, the message id, the attempt, and as they apply the
-lease id, holder, consumer, expiry, reason and what happens next. Transitions
+lease, holder, consumer, expiry, reason and what happens next. The lease is a
+fingerprint (32 hex digits of a digest of the lease id) and never the id, which
+is the holder's proof: whoever can read `facts.work` can tell which lease a fact
+is about and cannot act under it. Transitions
 nobody asked for (an expiry, a republish, a dead letter) are made by
 `service:mansio-engine`.
 
@@ -293,15 +297,16 @@ whole stream.
 
 | Verb | Lets the principal | On |
 |---|---|---|
-| `publish` | send messages: `messages`, `work_publish`, `alerts_publish` | any topic |
+| `publish` | publish through the server: `messages`, `work_publish`, `alerts_publish` | any topic except `facts.work`, `facts.alert`, `facts.principal` and `dead`, which only mansio writes |
 | `subscribe` | read messages | any topic |
 | `claim` | read messages, `work_pull` from the queue, and `work_ack` and `work_fail` its own leases | `work.<queue>` |
 | `ack` | `alerts_ack` | `alerts` |
 | `approve` | do what `claim` does | `work.approvals` only |
 
 A scope that grants a verb where it cannot apply, such as `claim` on
-`facts.build`, is refused with 400. A credential reaches its tenant and no
-other.
+`facts.build`, or `publish` on a topic only mansio writes, is refused with 400.
+`publish` on `facts.*` or `work.*` leaves those topics out. A credential reaches
+its tenant and no other.
 
 - An `agent` credential always expires: after `ttl_seconds` if the request
   gives it, else after `MANSIO_AGENT_CREDENTIAL_TTL_SECONDS`. Any other kind
@@ -323,23 +328,41 @@ other.
 
 #### What enforces what
 
-The broker enforces who may send to and read which topic. Each principal is a
-user of the broker with permissions on its tenant's stream and on the topics its
-scopes cover, named one by one, and never on the stream as a whole; mansio
-acts for a credential on a connection signed in as that user, so a request the
-scopes do not allow is refused by the broker and answered 403. A topic made
-later is opened to the users whose scopes cover it. The test suite asks the
-broker itself, without mansio-server, and Iggy refuses a credential that sends to
-another tenant's stream.
+**A credential reads; the server writes.** Each principal is a user of the
+broker that may read the topics of its tenant's stream that its scopes cover,
+named one by one, and never the stream as a whole. It may send to nothing, so a
+credential that talks to the broker directly can write nothing: it cannot name
+a principal, an item id or an attempt, or write a fact. A write goes to
+mansio-server, which checks the credential's `publish` scope, sets the
+principal from the credential and everything else a caller may not set, and
+publishes as its own admin identity. mansio reads for a credential on a
+connection signed in as that user, so a read the scopes do not allow is refused
+by the broker and answered 403. A topic made later is opened to the users whose
+scopes cover it, and a stream made later re-checks every user, because Iggy may
+give a new stream the number of a deleted one. The test suite asks the broker
+itself, without mansio-server, and Iggy refuses a credential that sends
+anywhere, or reads another tenant's stream.
 
-mansio enforces what the broker has no word for: that only the holder of a lease
-acks or fails it, that `claim` and `approve` are what let a principal take from
-a queue, that `ack` is what lets it acknowledge an alert, and that only the
-admin credential calls the admin API. It checks a request against the scopes
-before it records or creates anything, so a refused request leaves nothing
-behind. The server acts as an Iggy user of its own that manages users and
-streams and reads and writes topics (`mansio-server provision-admin` makes it;
-see [Settings](#settings)), never as Iggy's root user.
+mansio enforces what the broker has no word for: that a write is a `publish`
+and never to a topic only mansio writes, that only the holder of a lease acks
+or fails it, that `claim` and `approve` are what let a principal take from a
+queue, that `ack` is what lets it acknowledge an alert, and that only the admin
+credential calls the admin API. It checks a request against the scopes before
+it records or creates anything, so a refused request leaves nothing behind and
+a tenant name a request merely carries is not held. The server acts as an Iggy
+user of its own that manages users and streams and reads and writes topics
+(`mansio-server provision-admin` makes it; see [Settings](#settings)), never as
+Iggy's root user.
+
+**How long a revoked or expired credential reads.** Iggy checks a token when it
+signs in and not afterwards. mansio-server refuses a request with an expired or
+revoked credential at once. A session a holder opened with Iggy directly before
+that keeps what it is allowed to read until the user is deleted: at a
+revocation, immediately; at an expiry, by the next sweep, so within
+`MANSIO_CREDENTIAL_SWEEP_SECONDS`, and only while mansio-server runs. A user
+that is signed in can make tokens for itself, including ones that never
+expire; they stop working with the user. When the server starts it deletes the
+Iggy users it made for principals it holds no record of.
 
 ### Order
 

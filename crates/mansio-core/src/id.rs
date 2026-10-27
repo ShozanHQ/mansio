@@ -380,6 +380,78 @@ random_uuid_type!(
     "principal id"
 );
 
+/// Lowercase hex digits of the bytes.
+pub(crate) fn write_hex(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
+    bytes.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+}
+
+/// The bytes written as exactly `2 * N` lowercase hex digits, if they are.
+pub(crate) fn read_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
+    if text.len() != 2 * N || !text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    let mut bytes = [0_u8; N];
+    for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().chunks(2)) {
+        *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(bytes)
+}
+
+/// What the facts record of a lease in place of its id: the first 16 bytes of
+/// a BLAKE3 digest of the id, as 32 lowercase hex digits. The id is the
+/// holder's proof, and every reader of `facts.work` sees the fact, so the fact
+/// can say which lease it is about and cannot be used to act under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LeaseFingerprint([u8; 16]);
+
+impl LeaseFingerprint {
+    /// The bytes, for comparing in constant time.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+impl LeaseId {
+    /// The fingerprint the facts record for this lease.
+    #[must_use]
+    pub fn fingerprint(&self) -> LeaseFingerprint {
+        let digest = blake3::hash(&self.as_u128().to_be_bytes());
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest.as_bytes()[..16]);
+        LeaseFingerprint(bytes)
+    }
+}
+
+impl fmt::Display for LeaseFingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_hex(f, &self.0)
+    }
+}
+
+impl FromStr for LeaseFingerprint {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, ParseError> {
+        read_hex(s)
+            .map(Self)
+            .ok_or_else(|| invalid("lease fingerprint", s, "must be 32 lowercase hex digits"))
+    }
+}
+
+impl Serialize for LeaseFingerprint {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for LeaseFingerprint {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = Cow::<str>::deserialize(deserializer)?;
+        s.parse().map_err(D::Error::custom)
+    }
+}
+
 /// Who acted: a kind and a name, written `kind:name`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Principal {
@@ -516,6 +588,27 @@ mod tests {
         }
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(serde_json::from_str::<LeaseId>(&json).unwrap(), a);
+    }
+
+    #[test]
+    fn a_lease_fingerprint_names_the_lease_without_being_it() {
+        let lease = LeaseId::generate();
+        let fingerprint = lease.fingerprint();
+        assert_eq!(fingerprint, lease.fingerprint());
+        assert_ne!(fingerprint, LeaseId::generate().fingerprint());
+        let text = fingerprint.to_string();
+        assert_eq!(text.len(), 32);
+        assert!(!lease.to_string().replace('-', "").contains(&text));
+        assert_eq!(text.parse::<LeaseFingerprint>().unwrap(), fingerprint);
+        let json = serde_json::to_string(&fingerprint).unwrap();
+        assert_eq!(json, format!("\"{text}\""));
+        assert_eq!(
+            serde_json::from_str::<LeaseFingerprint>(&json).unwrap(),
+            fingerprint
+        );
+        for bad in ["", "abc", &"A".repeat(32), &"g".repeat(32), &"a".repeat(33)] {
+            assert!(bad.parse::<LeaseFingerprint>().is_err(), "{bad:?}");
+        }
     }
 
     #[test]
