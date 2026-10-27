@@ -239,6 +239,9 @@ pub async fn serve(client: Client) -> anyhow::Result<()> {
     let mut calls = JoinSet::new();
     let mut line = Vec::new();
     loop {
+        // Finished calls are collected as they go, so that a server that runs
+        // for days does not keep a result for each.
+        while calls.try_join_next().is_some() {}
         line.clear();
         if input.read_until(b'\n', &mut line).await? == 0 {
             break;

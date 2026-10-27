@@ -235,6 +235,9 @@ pub struct WebhookSettings {
     pub max_attempts: u32,
     /// How long one attempt may take (`MANSIO_WEBHOOK_TIMEOUT_SECONDS`).
     pub timeout: Duration,
+    /// The longest address a webhook may have, in bytes
+    /// (`MANSIO_WEBHOOK_URL_MAX_BYTES`).
+    pub url_max_bytes: usize,
 }
 
 impl Default for WebhookSettings {
@@ -244,6 +247,7 @@ impl Default for WebhookSettings {
             backoff_cap: Duration::from_secs(300),
             max_attempts: 8,
             timeout: Duration::from_secs(10),
+            url_max_bytes: 2048,
         }
     }
 }
@@ -278,6 +282,12 @@ impl WebhookSettings {
         if self.timeout < one {
             return Err(invalid(
                 "MANSIO_WEBHOOK_TIMEOUT_SECONDS",
+                "must be at least 1",
+            ));
+        }
+        if self.url_max_bytes == 0 {
+            return Err(invalid(
+                "MANSIO_WEBHOOK_URL_MAX_BYTES",
                 "must be at least 1",
             ));
         }
@@ -444,6 +454,10 @@ impl Settings {
             max_attempts: env
                 .parse("MANSIO_WEBHOOK_MAX_ATTEMPTS", webhook_defaults.max_attempts)?,
             timeout: env.seconds("MANSIO_WEBHOOK_TIMEOUT_SECONDS", webhook_defaults.timeout)?,
+            url_max_bytes: env.parse(
+                "MANSIO_WEBHOOK_URL_MAX_BYTES",
+                webhook_defaults.url_max_bytes,
+            )?,
         };
         webhooks.validate()?;
 
@@ -829,6 +843,7 @@ mod tests {
         assert_eq!(webhooks.backoff_cap, Duration::from_secs(300));
         assert_eq!(webhooks.max_attempts, 8);
         assert_eq!(webhooks.timeout, Duration::from_secs(10));
+        assert_eq!(webhooks.url_max_bytes, 2048);
         assert_eq!(webhooks.validate(), Ok(()));
     }
 
@@ -844,6 +859,7 @@ mod tests {
             ("MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS", "4"),
             ("MANSIO_WEBHOOK_MAX_ATTEMPTS", "5"),
             ("MANSIO_WEBHOOK_TIMEOUT_SECONDS", "2"),
+            ("MANSIO_WEBHOOK_URL_MAX_BYTES", "512"),
         ])
         .unwrap();
         assert_eq!(
@@ -861,6 +877,7 @@ mod tests {
                 backoff_cap: Duration::from_secs(4),
                 max_attempts: 5,
                 timeout: Duration::from_secs(2),
+                url_max_bytes: 512,
             }
         );
     }
@@ -876,6 +893,8 @@ mod tests {
             ("MANSIO_WEBHOOK_MAX_ATTEMPTS", "0"),
             ("MANSIO_WEBHOOK_TIMEOUT_SECONDS", "0"),
             ("MANSIO_WEBHOOK_TIMEOUT_SECONDS", "-1"),
+            ("MANSIO_WEBHOOK_URL_MAX_BYTES", "0"),
+            ("MANSIO_WEBHOOK_URL_MAX_BYTES", "long"),
         ] {
             let error = settings(&[
                 ("MANSIO_TOKEN", "t"),
