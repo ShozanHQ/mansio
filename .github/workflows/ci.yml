@@ -1,0 +1,100 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2.9.3
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Build
+        run: cargo build --workspace --locked
+      - name: Test
+        run: cargo test --workspace --locked
+
+  deny:
+    name: deny
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
+        with:
+          command: check
+          arguments: --all-features --locked
+
+  hygiene:
+    name: hygiene
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: rustup toolchain install
+      - name: The name of the system that builds mansio appears nowhere
+        run: |
+          # The pattern is built from two halves so that this file does not
+          # contain it either.
+          first=sho
+          second=zan
+          if git grep -i -n -e "${first}${second}"; then
+            echo "::error::the name above must not appear in the code or the docs"
+            exit 1
+          fi
+      - name: Every crate is Apache-2.0
+        run: |
+          metadata=$(cargo metadata --format-version 1 --no-deps --locked)
+          crates=$(jq '.packages | length' <<<"$metadata")
+          if [ "$crates" -lt 5 ]; then
+            echo "::error::expected at least 5 crates, found $crates"
+            exit 1
+          fi
+          others=$(jq -r '.packages[] | select(.license != "Apache-2.0") | .name' <<<"$metadata")
+          if [ -n "$others" ]; then
+            echo "::error::crates not licensed Apache-2.0: $others"
+            exit 1
+          fi
+
+  e2e:
+    name: e2e
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      # Development values for a throwaway stack on the runner.
+      MANSIO_TOKEN: ci-e2e-token
+      MANSIO_E2E_URL: http://127.0.0.1:7070
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2.9.3
+      - name: Start Iggy and mansio-server
+        run: docker compose up --build --wait
+      - name: Publish and poll through Iggy
+        run: cargo test -p mansio-e2e --locked
+      - name: Compose logs
+        if: failure()
+        run: docker compose logs --no-color
+      - name: Stop the stack
+        if: always()
+        run: docker compose down --volumes

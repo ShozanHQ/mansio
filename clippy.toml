@@ -1,0 +1,6 @@
+# Tests may unwrap, expect, panic and print. Everything else is denied by the
+# workspace lints in Cargo.toml.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-print-in-tests = true

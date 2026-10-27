@@ -1,0 +1,21 @@
+[package]
+name = "mansio-e2e"
+description = "End-to-end tests for mansio."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dev-dependencies]
+anyhow.workspace = true
+mansio-core.workspace = true
+mansio-server.workspace = true
+reqwest.workspace = true
+secrecy.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
