@@ -15,16 +15,29 @@
 //! The positions are a projection of the log, read when first needed. Every
 //! commit is a record, written before the position changes, and the log is
 //! never trimmed, so it grows with the number of commits.
+//!
+//! A record that cannot be read (damaged, or written by a newer version of the
+//! format) is skipped with a warning, unlike the records of the principals and
+//! of the webhooks, whose load fails. What a skipped record costs is that a
+//! consumer or a webhook starts from an older position, and so reads or
+//! delivers some messages again: every consumer of this bus already has to
+//! cope with a message twice, as delivery is at least once.
+//!
+//! A commit whose record may or may not have been stored (the broker failed in
+//! a way that does not say) leaves the positions possibly one record behind the
+//! log, so the next use reads the log again before it trusts them.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
 
 use mansio_core::{Broker, ConsumerName, Principal, SystemLog, TenantId, Topic, WebhookId};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::error::ApiError;
+use crate::records;
 
 /// Whose position, and on what.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -104,7 +117,10 @@ pub struct Cursors {
     /// How many records to read at a time when loading.
     page: u32,
     positions: StdMutex<HashMap<Cursor, u64>>,
-    loaded: OnceCell<()>,
+    /// Whether the positions are what the log says, as far as is known.
+    fresh: AtomicBool,
+    /// Held while the log is read, so that it is read by one at a time.
+    reading: Mutex<()>,
     /// Held from the write of a record to the change of the position it sets,
     /// so that the positions end as the log does when commits race.
     writing: Mutex<()>,
@@ -123,7 +139,8 @@ impl Cursors {
             broker,
             page: page.max(1),
             positions: StdMutex::default(),
-            loaded: OnceCell::new(),
+            fresh: AtomicBool::new(false),
+            reading: Mutex::new(()),
             writing: Mutex::new(()),
         }
     }
@@ -134,13 +151,27 @@ impl Cursors {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Read the log, once. The next call tries again if this one failed.
+    /// Read the log, if it has not been read or a commit may have left the
+    /// positions behind it. The next call tries again if this one failed.
     ///
     /// # Errors
     ///
     /// Returns an error if the log cannot be read.
     pub async fn load(&self) -> Result<(), ApiError> {
-        self.loaded.get_or_try_init(|| self.rebuild()).await?;
+        if self.fresh.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let _reading = self.reading.lock().await;
+        if self.fresh.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // Marked fresh before the read, so that a commit that fails while the
+        // log is being read marks it stale again and is not forgotten.
+        self.fresh.store(true, Ordering::Release);
+        if let Err(error) = self.rebuild().await {
+            self.fresh.store(false, Ordering::Release);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -155,7 +186,7 @@ impl Cursors {
             let Some(last) = batch.last() else { break };
             let next = last.offset.saturating_add(1);
             for record in &batch {
-                match serde_json::from_slice::<Entry>(&record.payload) {
+                match records::decode::<Entry>(&record.payload) {
                     Ok(entry) => {
                         let (cursor, at) = entry.cursor();
                         positions.insert(cursor, at);
@@ -188,25 +219,28 @@ impl Cursors {
         Ok(self.positions().get(cursor).copied())
     }
 
-    /// Set where the cursor has got to. The record is written first: a write
-    /// that fails changes nothing.
+    /// Set where the cursor has got to. The record is written first, and the
+    /// position changes once it has been. If the write fails in a way that does
+    /// not say whether the record was stored, the positions are read from the
+    /// log again before they are used.
     ///
     /// # Errors
     ///
     /// Returns 502 or 503 if the log cannot be written.
     pub(crate) async fn set(&self, cursor: Cursor, offset: u64) -> Result<(), ApiError> {
-        self.load().await?;
         let _writing = self.writing.lock().await;
+        // After a commit that may or may not have been stored this reads the
+        // log again, so that "the position is already this" is true of the log.
+        self.load().await?;
         if self.positions().get(&cursor) == Some(&offset) {
             return Ok(());
         }
-        let record = serde_json::to_vec(&Entry::new(&cursor, offset)).map_err(|reason| {
-            tracing::error!(%reason, "a position record did not serialize");
-            ApiError::Internal
-        })?;
-        self.broker
-            .system_append(SystemLog::Cursors, &record)
-            .await?;
+        let record = records::encode(&Entry::new(&cursor, offset))?;
+        if let Err(error) = self.broker.system_append(SystemLog::Cursors, &record).await {
+            // The record may be in the log all the same.
+            self.fresh.store(false, Ordering::Release);
+            return Err(error.into());
+        }
         self.positions().insert(cursor, offset);
         Ok(())
     }
@@ -214,9 +248,138 @@ impl Cursors {
 
 #[cfg(test)]
 mod tests {
-    use mansio_core::MemoryBroker;
+    use std::sync::atomic::AtomicBool;
+
+    use async_trait::async_trait;
+    use mansio_core::{BrokerError, Caller, Envelope, MemoryBroker, Stored, SystemRecord};
 
     use super::*;
+
+    /// A memory broker whose appends to the positions' log fail as told: after
+    /// storing the record, as a connection that drops after the write does, or
+    /// without storing it.
+    #[derive(Default)]
+    struct Unsure {
+        inner: MemoryBroker,
+        store_then_fail: AtomicBool,
+        fail_without_storing: AtomicBool,
+    }
+
+    #[async_trait]
+    impl Broker for Unsure {
+        async fn tenants(&self) -> Result<Vec<TenantId>, BrokerError> {
+            self.inner.tenants().await
+        }
+
+        async fn topics(&self, tenant: &TenantId) -> Result<Vec<Topic>, BrokerError> {
+            self.inner.topics(tenant).await
+        }
+
+        async fn ensure_tenant(&self, tenant: &TenantId) -> Result<(), BrokerError> {
+            self.inner.ensure_tenant(tenant).await
+        }
+
+        async fn ensure_topic(&self, tenant: &TenantId, topic: &Topic) -> Result<(), BrokerError> {
+            self.inner.ensure_topic(tenant, topic).await
+        }
+
+        async fn publish(
+            &self,
+            caller: &Caller<'_>,
+            envelope: &Envelope,
+        ) -> Result<Option<u64>, BrokerError> {
+            self.inner.publish(caller, envelope).await
+        }
+
+        async fn poll(
+            &self,
+            caller: &Caller<'_>,
+            tenant: &TenantId,
+            topic: &Topic,
+            offset: u64,
+            max: u32,
+        ) -> Result<Vec<Stored>, BrokerError> {
+            self.inner.poll(caller, tenant, topic, offset, max).await
+        }
+
+        async fn system_append(&self, log: SystemLog, record: &[u8]) -> Result<(), BrokerError> {
+            if self.fail_without_storing.load(Ordering::SeqCst) {
+                return Err(BrokerError::Unavailable("injected".to_owned()));
+            }
+            self.inner.system_append(log, record).await?;
+            if self.store_then_fail.load(Ordering::SeqCst) {
+                return Err(BrokerError::Unavailable("lost the answer".to_owned()));
+            }
+            Ok(())
+        }
+
+        async fn system_read(
+            &self,
+            log: SystemLog,
+            offset: u64,
+            max: u32,
+        ) -> Result<Vec<SystemRecord>, BrokerError> {
+            self.inner.system_read(log, offset, max).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_commit_whose_record_was_stored_though_it_failed_is_not_trusted_to_have_failed() {
+        let broker = Arc::new(Unsure::default());
+        let cursors = Cursors::new(broker.clone(), 10);
+        let one = named("agent:one", "dash");
+        cursors.set(one.clone(), 3).await.unwrap();
+
+        // The commit of 5 is stored and reported as an error. The consumer is
+        // told so, and goes back to 3.
+        broker.store_then_fail.store(true, Ordering::SeqCst);
+        assert!(cursors.set(one.clone(), 5).await.is_err());
+        broker.store_then_fail.store(false, Ordering::SeqCst);
+        cursors.set(one.clone(), 3).await.unwrap();
+
+        // It is 3 now, in the log as well as in the cache: a server that reads
+        // the log finds 3 and not 5.
+        assert_eq!(cursors.get(&one).await.unwrap(), Some(3));
+        let restarted = Cursors::new(broker.clone(), 10);
+        assert_eq!(restarted.get(&one).await.unwrap(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn a_commit_that_was_not_stored_is_written_by_the_next_one_of_the_same_value() {
+        let broker = Arc::new(Unsure::default());
+        let cursors = Cursors::new(broker.clone(), 10);
+        let one = named("agent:one", "dash");
+        cursors.set(one.clone(), 3).await.unwrap();
+
+        broker.fail_without_storing.store(true, Ordering::SeqCst);
+        assert!(cursors.set(one.clone(), 5).await.is_err());
+        broker.fail_without_storing.store(false, Ordering::SeqCst);
+        // The cache says 3 and so does the log: 5 is written, and once.
+        assert_eq!(cursors.get(&one).await.unwrap(), Some(3));
+        cursors.set(one.clone(), 5).await.unwrap();
+        cursors.set(one.clone(), 5).await.unwrap();
+        let log = broker.system_read(SystemLog::Cursors, 0, 10).await.unwrap();
+        assert_eq!(log.len(), 2, "3 and then 5");
+        assert_eq!(Cursors::new(broker, 10).get(&one).await.unwrap(), Some(5));
+    }
+
+    #[tokio::test]
+    async fn a_record_of_a_newer_version_is_skipped_like_one_that_cannot_be_read() {
+        let broker = Arc::new(MemoryBroker::new());
+        let cursors = Cursors::new(broker.clone(), 10);
+        let one = named("agent:one", "dash");
+        cursors.set(one.clone(), 2).await.unwrap();
+        broker
+            .system_append(
+                SystemLog::Cursors,
+                br#"{"op":"named","v":2,"tenant":"acme","topic":"facts.build","principal":"agent:one","consumer":"dash","offset":9}"#,
+            )
+            .await
+            .unwrap();
+        // The older record is the position, and the load did not fail.
+        let restarted = Cursors::new(broker, 10);
+        assert_eq!(restarted.get(&one).await.unwrap(), Some(2));
+    }
 
     fn named(principal: &str, consumer: &str) -> Cursor {
         Cursor::Named {

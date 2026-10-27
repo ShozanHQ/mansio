@@ -96,6 +96,7 @@ fn local_webhook_settings() -> WebhookSettings {
         backoff_cap: Duration::from_secs(4),
         max_attempts: 3,
         timeout: Duration::from_secs(2),
+        url_max_bytes: 2048,
     }
 }
 

@@ -264,6 +264,8 @@ pub struct EffectiveSettings {
     pub webhook_max_attempts: u32,
     /// `MANSIO_WEBHOOK_TIMEOUT_SECONDS`: how long one attempt may take.
     pub webhook_timeout_seconds: u64,
+    /// `MANSIO_WEBHOOK_URL_MAX_BYTES`: the longest address a webhook may have.
+    pub webhook_url_max_bytes: u64,
 }
 
 #[cfg(test)]
