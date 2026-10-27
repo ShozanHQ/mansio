@@ -175,7 +175,6 @@ impl Queue {
                 _ => None,
             })
             .min_by(|a, b| (a.2.expires_at, a.0).cmp(&(b.2.expires_at, b.0)))
-            .map(|(id, item, lease)| (id, item, lease))
     }
 
     fn take_order(&mut self) -> u64 {

@@ -378,7 +378,9 @@ impl Webhooks {
             .redirect(reqwest::redirect::Policy::none())
             .timeout(settings.timeout)
             .build()
-            .inspect_err(|reason| tracing::error!(%reason, "the webhook HTTP client could not be made"))
+            .inspect_err(
+                |reason| tracing::error!(%reason, "the webhook HTTP client could not be made"),
+            )
             .ok();
         let page = page.max(1);
         Self {
@@ -499,10 +501,9 @@ impl Webhooks {
             if workers.get(id).is_some_and(|task| !task.is_finished()) {
                 continue;
             }
-            let task = tokio::spawn(Arc::clone(&self.delivery).follow(
-                record.webhook.clone(),
-                record.secret.clone(),
-            ));
+            let task = tokio::spawn(
+                Arc::clone(&self.delivery).follow(record.webhook.clone(), record.secret.clone()),
+            );
             workers.insert(*id, task);
         }
         let mut status = self.delivery.status();
@@ -702,9 +703,6 @@ mod tests {
     #[test]
     fn a_webhooks_consumer_is_named_after_it() {
         let id = WebhookId::generate();
-        assert_eq!(
-            consumer_of(id).unwrap().as_str(),
-            format!("webhook-{id}")
-        );
+        assert_eq!(consumer_of(id).unwrap().as_str(), format!("webhook-{id}"));
     }
 }

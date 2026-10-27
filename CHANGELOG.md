@@ -71,8 +71,39 @@ All notable changes to mansio are listed here. The format follows
 - The settings `MANSIO_AGENT_CREDENTIAL_TTL_SECONDS`,
   `MANSIO_CREDENTIAL_RECHECK_SECONDS` and `MANSIO_CREDENTIAL_SWEEP_SECONDS`,
   and `MANSIO_E2E_IGGY_ADDRESS` for the tests that ask Iggy itself.
+- The CLI has a command for every operation, named as the operation with `_`
+  as a space (`publish`, `poll`, `watch`, `work publish | pull | ack | fail`,
+  `alerts publish | ack`, `principals create | list | revoke`,
+  `webhooks create | list | delete`, `consumers get | commit`), `--url` and
+  `--token`, JSON out one object to a line, and no request without a token.
+  `work pull --wait` looks until an item can be claimed. `mansio watch`
+  streams a topic and, with `--consumer`, resumes where it stopped with
+  nothing missed and nothing twice.
+- `mansio mcp`, an MCP server on stdio that offers every command but `watch`
+  as a tool with the same name and the same parameters, and docs for Claude
+  Code and Codex. The CLI and MCP retry a request that failed on the network.
+- Named durable consumers: `consumers_get` and `consumers_commit`, an offset
+  per tenant, topic and name that the broker keeps (`Broker::consumer_offset`,
+  `Broker::commit_offset`).
+- `GET /v1/events`, a topic as server-sent events: `id` is the offset, `event`
+  the envelope's type, `data` the envelope. It resumes after `Last-Event-ID`.
+- Webhooks (`webhooks_create`, `webhooks_list`, `webhooks_delete`, admin only):
+  each envelope of a topic is POSTed in order as CloudEvents JSON with a
+  `mansio-signature` HMAC-SHA256 header, from a durable consumer, retried with
+  a backoff, and recorded as `mansio.webhook.failed` on `facts.webhook` when
+  given up on. Secrets are kept on the server's own `webhooks` log.
+- The settings `MANSIO_STREAM_POLL_MILLIS`, `MANSIO_SSE_KEEPALIVE_SECONDS`,
+  `MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS`, `MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS`,
+  `MANSIO_WEBHOOK_MAX_ATTEMPTS` and `MANSIO_WEBHOOK_TIMEOUT_SECONDS` for the
+  server, and `MANSIO_RETRIES`, `MANSIO_RETRY_BACKOFF_MILLIS` and
+  `MANSIO_POLL_INTERVAL_MILLIS` for the CLI.
 
 ### Changed
+
+- A `work_pull` by a consumer that holds a live lease on the queue returns that
+  lease again instead of claiming another item, so a claim whose answer was
+  lost can be asked for again. A server restarted since the claim cannot say
+  the lease id again, and gives a new one for the same item and expiry.
 
 - A broker error is a 502 only when it is a refusal the broker named before it
   stores anything (not found, unauthorized, an invalid identifier, a message

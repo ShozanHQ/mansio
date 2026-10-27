@@ -10,7 +10,10 @@ async fn get(target: &Target, topic: &str, name: &str) -> anyhow::Result<serde_j
     let (status, body) = target
         .authed(Method::GET, &target.consumer_uri(topic, name), None)
         .await?;
-    anyhow::ensure!(status == StatusCode::OK, "consumers_get answered {status}: {body}");
+    anyhow::ensure!(
+        status == StatusCode::OK,
+        "consumers_get answered {status}: {body}"
+    );
     Ok(body)
 }
 
@@ -110,11 +113,19 @@ async fn a_consumer_needs_the_right_to_read_its_topic() -> anyhow::Result<()> {
     }
     let (status, _) = target.call(Method::GET, &uri, None, None).await?;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(get(&target, "facts.build", "dash").await?["offset"], 1, "the refused commit changed nothing");
+    assert_eq!(
+        get(&target, "facts.build", "dash").await?["offset"],
+        1,
+        "the refused commit changed nothing"
+    );
 
     // A topic nobody has published to has no consumers.
     let (status, _) = target
-        .authed(Method::GET, &target.consumer_uri("facts.nobody", "dash"), None)
+        .authed(
+            Method::GET,
+            &target.consumer_uri("facts.nobody", "dash"),
+            None,
+        )
         .await?;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
@@ -122,9 +133,21 @@ async fn a_consumer_needs_the_right_to_read_its_topic() -> anyhow::Result<()> {
     for (method, address, body) in [
         (Method::POST, commit_uri.clone(), json!({})),
         (Method::POST, commit_uri.clone(), json!({"offset": -1})),
-        (Method::POST, commit_uri.clone(), json!({"offset": 1, "x": 1})),
-        (Method::GET, target.consumer_uri("facts.build", "a b"), json!(null)),
-        (Method::GET, target.consumer_uri("nope", "dash"), json!(null)),
+        (
+            Method::POST,
+            commit_uri.clone(),
+            json!({"offset": 1, "x": 1}),
+        ),
+        (
+            Method::GET,
+            target.consumer_uri("facts.build", "a b"),
+            json!(null),
+        ),
+        (
+            Method::GET,
+            target.consumer_uri("nope", "dash"),
+            json!(null),
+        ),
     ] {
         let body = (!body.is_null()).then_some(&body);
         let (status, _) = target.authed(method, &address, body).await?;

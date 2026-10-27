@@ -8,9 +8,11 @@ broker, and mansio is the contract around it. Open source under Apache-2.0.
 This is an early build. Publishing and polling work, and so do work items
 (claim with a lease, acknowledge, fail, retry with backoff, a dead topic),
 alerts (acknowledge, surface again) and credentials (a principal gets a
-credential that the broker holds to its scopes) over the HTTP API. The CLI and
-MCP commands for them, server-sent events and webhooks are designed in
-[ARCHITECTURE.md](ARCHITECTURE.md) and not built yet.
+credential that the broker holds to its scopes) over the HTTP API. Humans,
+agents and programs consume the same items through the surfaces that fit them:
+a [command line](#the-cli) and an [MCP server](#mcp) for agents, [server-sent
+events](#server-sent-events) for a dashboard, and [signed
+webhooks](#webhooks) for software that will not hold a connection.
 
 ## The contract
 
@@ -105,19 +107,103 @@ publish is also appended to `mansio-sink.jsonl`.
 
 ## The CLI
 
-`mansio` talks to the HTTP API at `MANSIO_URL` with the bearer token in
-`MANSIO_TOKEN`. It prints one JSON envelope per line, and exits non-zero with
-a message on stderr if the server refuses.
+`mansio` is a client of the HTTP API at `MANSIO_URL` (or `--url`) with the
+bearer token in `MANSIO_TOKEN` (or `--token`; a flag wins over the variable).
+Every command prints JSON, one object per line, and exits non-zero with a
+message on stderr if the server refuses. Without a token every command but
+`--help` exits non-zero at once, says so, and sends nothing.
+
+There is one command for each HTTP operation, named as the operation with `_`
+as a space, and each flag is a parameter of the operation, with `-` for `_`.
+`mansio --help` and `mansio work pull --help` list them.
+
+| Command | Prints |
+|---|---|
+| `publish`, `work publish`, `alerts publish` | The envelope as stored. |
+| `poll` | The envelopes from `--offset` on, so the next poll starts at the offset plus the number of lines. |
+| `watch` | The envelopes of a topic as they arrive, until stopped. |
+| `work pull` | The lease: `{"lease_id", "consumer", "expires_at", "item"}`. Nothing, and exit 0, if there is no item. |
+| `work ack`, `work fail`, `alerts ack` | The envelope of the transition. |
+| `principals create` | `{"principal", "credential"}`: the credential is shown this once. |
+| `principals list`, `webhooks list` | One principal, or webhook, a line. |
+| `principals revoke`, `webhooks delete` | The principal, or webhook. |
+| `webhooks create` | `{"webhook", "secret"}`: the signing secret is shown this once. |
+| `consumers get`, `consumers commit` | `{"consumer", "offset", "next"}`. |
+| `mcp` | Nothing: it serves [MCP](#mcp) on stdin and stdout. |
 
 ```sh
-mansio publish --tenant T --topic facts.build --type TYPE --source SOURCE \
-  [--subject S] [--data JSON] [--correlation-id ID] [--causation-id ID] \
-  [--idempotency-key KEY]
-mansio poll --tenant T --topic TOPIC [--offset N] [--count M]
+export MANSIO_URL=http://127.0.0.1:7070 MANSIO_TOKEN=...
+
+mansio publish --tenant acme --topic facts.build --type build.finished \
+  --source ci --data '{"ok":true}' [--subject S] [--correlation-id ID] \
+  [--causation-id ID] [--idempotency-key KEY] [--id UUID]
+
+# A worker: claim, then ack or fail with what the claim printed.
+mansio work pull --tenant acme --queue builds --consumer worker-1 --wait 30
+mansio work ack  --tenant acme --queue builds --item ITEMID \
+  --consumer worker-1 --lease-id LEASEID
+mansio work fail --tenant acme --queue builds --item ITEMID \
+  --consumer worker-1 --lease-id LEASEID --reason "out of memory"
+
+mansio alerts ack --tenant acme --alert ALERTID
+
+# Credentials and webhooks, with the admin token.
+mansio principals create --kind agent --name builder-1 --tenant acme \
+  --scopes '[{"topic":"work.builds","verbs":["claim"]}]' --ttl-seconds 3600
+mansio webhooks create --tenant acme --topic facts.build \
+  --endpoint https://example.com/hook
+mansio webhooks list --tenant acme
 ```
 
-`publish` prints the envelope as stored. `poll` prints the envelopes from
-`--offset` on, so the next poll starts at the offset plus the number of lines.
+- `work pull --wait SECONDS` looks again every `MANSIO_POLL_INTERVAL_MILLIS`
+  until an item can be claimed or the wait ends.
+- `watch --tenant T --topic X --consumer NAME` prints one envelope a line from
+  where the named consumer stopped (its offset is kept by the broker, see
+  [Consumers](#consumers)), and commits each offset after the line has been
+  written and flushed. Stopped and started again with the same consumer, it
+  prints every envelope once: none is missed, and none is printed twice unless
+  the process was killed between the flush and the commit. On SIGINT or
+  SIGTERM it finishes the line it is on, commits it and exits 0.
+  `--from OFFSET` starts at an offset and keeps no place (the default is 0),
+  and `--limit N` stops after N envelopes. A topic nobody has published to is
+  a 404.
+- The CLI and MCP retry on network errors, `MANSIO_RETRIES` times, waiting
+  `MANSIO_RETRY_BACKOFF_MILLIS` and then twice as long each time. A request
+  whose connection could not be made is always sent again. One whose answer
+  may have been lost is sent again only if sending it twice does what
+  sending it once does: a read, `work pull` (a consumer that holds a live
+  lease is given it again, so a claim whose answer is lost does not leave an
+  item leased to nobody) and `consumers commit`. A `publish`, an `ack` and the
+  like are not, so give a `publish`, `work publish` or `alerts publish` an
+  `--id` and send it again yourself if it fails: a 409 then means the first
+  attempt was stored.
+
+## MCP
+
+`mansio mcp` is an [MCP](https://modelcontextprotocol.io) server on stdio, for
+the harness of an agent (Claude Code, Codex and the like) to run. It reads
+`MANSIO_URL` and `MANSIO_TOKEN` as the CLI does, and does not start without a
+token. It offers every command but `watch` (which streams, and a tool call
+cannot) as a tool with the same name as the command, `work_pull` for
+`work pull`, and the parameters of the command as its input, `lease_id` for
+`--lease-id`. A tool does what the command does, by the same code, and returns
+what the command prints; an operation that fails is a result with `isError`,
+so that the model can read the reason and try again. A test lists the commands
+and the tools and fails on any difference beyond `watch` and `mcp`.
+
+| Tool | |
+|---|---|
+| `publish`, `poll` | Publish to a topic; read a topic. |
+| `work_publish`, `work_pull`, `work_ack`, `work_fail` | Work items. `work_pull` takes `wait` seconds. |
+| `alerts_publish`, `alerts_ack` | Alerts. |
+| `consumers_get`, `consumers_commit` | Where a named consumer stands. |
+| `principals_create`, `principals_list`, `principals_revoke` | Credentials, with the admin token. |
+| `webhooks_create`, `webhooks_list`, `webhooks_delete` | Webhooks, with the admin token. |
+
+Configuration for [Claude Code](docs/mcp-claude-code.md) and
+[Codex](docs/mcp-codex.md), each with a first `work_pull` and `work_ack`, is in
+`docs/`. An agent should hold a credential of its own, with the scopes it needs
+and a short life (`principals create`), and not the admin token.
 
 ## The HTTP API
 
@@ -151,7 +237,8 @@ stored: send it again with the same `id`. A 502 or 503 is also logged at `warn`
 with the tenant, the topic and what the broker or the sink said.
 
 `GET /v1/settings` answers with the settings the server runs with, none of
-them secret: the work and credential settings below and the API limits.
+them secret: the work, credential, stream and webhook settings below and the
+API limits.
 
 ### Work items
 
@@ -159,7 +246,8 @@ Iggy is offset-based and has no per-message claim, acknowledgement, redelivery
 or dead letters. mansio builds them, and records every transition as an
 envelope on `facts.work` and in the sink. Work does not go through the generic
 messages route, which refuses `work.<queue>` and the topics mansio writes
-itself: `facts.work`, `facts.alert`, `facts.principal` and `dead`. The
+itself: `facts.work`, `facts.alert`, `facts.principal`, `facts.webhook` and
+`dead`. The
 operations are `work_publish`, `work_pull`, `work_ack` and `work_fail`.
 
 ```sh
@@ -186,6 +274,15 @@ curl ... -d '{"lease_id":"<uuid>","consumer":"worker-1","reason":"out of memory"
 
 - A claim is a lease of `MANSIO_LEASE_SECONDS`. Nobody else is given the item
   while it holds, and two concurrent pulls never get the same one.
+- A pull by a consumer (the principal and the consumer name together) that
+  already holds a live lease on the queue is answered with that lease again,
+  with the same id and expiry, and nothing is recorded: it does not claim
+  another item. So a client whose answer was lost, and that asks again, does
+  not leave an item leased to nobody. To work on several items at once, pull
+  under several consumer names. The facts keep only a fingerprint of a lease
+  id, so a server that was restarted since the claim cannot say the id again:
+  it gives the consumer a new id for the same item and expiry, records that as
+  a second `claimed` fact of the attempt, and the old id stops working.
 - Only the holder, which is the principal behind the token, the consumer name
   it pulled under and the lease id (an unguessable UUID), can ack or fail.
   Another lease id, consumer name or principal is a 403, an item with no live lease (never claimed, expired, waiting for its
@@ -255,6 +352,111 @@ the producer wrote. An alert id is used once: publishing an id the tenant
 already has is a 409, so a resend cannot reopen an acknowledged alert. As for
 work, a client that gets a 503 sends the alert again with the same `id`, and
 a 409 means the first attempt was stored.
+
+### Consumers
+
+A named durable consumer is a name per tenant and topic whose offset the broker
+keeps (an Iggy consumer offset), so it survives a restart of the server and of
+the client. The name is the whole of its identity: anyone who may read the
+topic and uses the name shares the offset. The operations are `consumers_get`
+and `consumers_commit`, and they need the right to read the topic.
+
+```sh
+# consumers_get: 200 {"consumer":"dash","offset":4,"next":5}
+# "offset" is the last one committed and is left out if there is none; "next"
+# is where the consumer reads next, 0 if there is none.
+curl -H "Authorization: Bearer $MANSIO_TOKEN" \
+  http://127.0.0.1:7070/v1/tenants/acme/topics/facts.build/consumers/dash
+
+# consumers_commit: the offset of the last message handled. Any offset may be
+# set, so a consumer can be set back to read again.
+curl -H "Authorization: Bearer $MANSIO_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"offset":4}' \
+  http://127.0.0.1:7070/v1/tenants/acme/topics/facts.build/consumers/dash/commit
+```
+
+A topic nobody has published to has no consumers (404).
+
+### Server-sent events
+
+`GET /v1/events?tenant=T&topic=X` serves the topic as `text/event-stream`, for a
+dashboard. Each event's `id` is the offset of the message, its `event` the
+envelope's `type`, and its `data` the envelope as CloudEvents JSON.
+
+```
+id: 7
+event: build.finished
+data: {"specversion":"1.0","id":"...","type":"build.finished",...}
+```
+
+- The stream starts at the first message, or at `?from=N`, and goes on with
+  what is published later.
+- A client that reconnects sends `Last-Event-ID`, which a browser's
+  `EventSource` does by itself, and is sent the messages after it: nothing is
+  missed and nothing is sent twice. `Last-Event-ID` wins over `?from=`.
+- A quiet stream sends a comment line every `MANSIO_SSE_KEEPALIVE_SECONDS`, so
+  that a proxy does not take the connection for dead.
+- It is authorised as `poll` is, with the caller's credential, and the answer
+  is the status of a refusal (401, 403, 404) before any event. A credential
+  that is revoked or expires while the stream is open ends it at the next read.
+  The browser's `EventSource` cannot send an `Authorization` header: use a
+  client that can, such as `fetch` with a stream reader.
+- The server looks for new messages every `MANSIO_STREAM_POLL_MILLIS`.
+
+### Webhooks
+
+Software that will not hold a connection is sent each envelope of a topic as an
+HTTP POST. The admin credential makes them: `webhooks_create` (a tenant, a
+topic and an `http` or `https` URL), `webhooks_list` and `webhooks_delete`.
+
+```sh
+curl -H "Authorization: Bearer $MANSIO_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"tenant":"acme","topic":"facts.build","url":"https://example.com/hook"}' \
+  http://127.0.0.1:7070/v1/webhooks
+# 201 {"webhook":{"id":"<uuid>",...},"secret":"whsec_..."}   the secret, once
+
+curl -H "Authorization: Bearer $MANSIO_TOKEN" 'http://127.0.0.1:7070/v1/webhooks?tenant=acme'
+# 200 {"webhooks":[{"id":"<uuid>","tenant":"acme","topic":"facts.build",
+#      "url":"https://example.com/hook","created_at":"...",
+#      "last_delivered_offset":7,"last_error":{"at":"...","offset":7,"message":"HTTP 500"}}]}
+#      no secret in it
+
+curl -X DELETE -H "Authorization: Bearer $MANSIO_TOKEN" http://127.0.0.1:7070/v1/webhooks/<id>
+```
+
+A delivery is a POST of one envelope in the CloudEvents JSON format (structured
+mode), `Content-Type: application/cloudevents+json`, with the header
+
+```
+mansio-signature: t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<body>">
+```
+
+The key is the signing secret as text (`whsec_...`), and the body is the bytes
+of the request. [docs/webhooks.md](docs/webhooks.md) verifies it in a few
+lines. The timestamp is the moment of that attempt.
+
+- Each webhook is a durable consumer of its topic, `webhook-<id>`, so it
+  delivers in offset order, one envelope at a time, and a restarted server
+  resumes where the last one stopped. A new webhook starts at the first
+  message the topic holds, and a topic nobody has published to yet is waited
+  for.
+- A 2xx is delivery. Any other answer, no answer within
+  `MANSIO_WEBHOOK_TIMEOUT_SECONDS` and a connection that cannot be made are
+  tried again after `MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS * 2^(attempt-1)`, at
+  most `MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS`. A redirect is not followed.
+  After `MANSIO_WEBHOOK_MAX_ATTEMPTS` attempts the delivery is recorded as
+  `mansio.webhook.failed` on `facts.webhook` (the webhook, the offset, the
+  message id, the attempts and the last error, never the address or the
+  secret) and the webhook moves on to the next envelope.
+- Delivery is at least once. A server that stops between the receiver's answer
+  and the commit of the offset sends that envelope again, so a receiver
+  deduplicates on the envelope's `id`.
+- The listing shows each webhook's `last_delivered_offset` (after a restart,
+  until the next delivery, the offset it last moved past) and its `last_error`,
+  which stays until another delivery fails. It holds no secret.
+- The secrets are kept on the server's own log in the broker, with the
+  principals', where no credential can read. A topic cannot be delivered to
+  its own failures: a webhook for `facts.webhook` is refused.
 
 ### One server per broker
 
@@ -402,6 +604,12 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_BACKOFF_CAP_SECONDS` | `300` | The longest that wait gets. At least the base. |
 | `MANSIO_ALERT_RESURFACE_SECONDS` | `3600` | How long an alert may go unacknowledged before it is surfaced again, and again after each further interval. |
 | `MANSIO_TICK_MILLIS` | `500` | How often the timer looks for leases to expire, items to republish and alerts to surface again. |
+| `MANSIO_STREAM_POLL_MILLIS` | `500` | How often an event stream and a webhook look for new messages once they have caught up. |
+| `MANSIO_SSE_KEEPALIVE_SECONDS` | `15` | How often a quiet event stream sends a comment. |
+| `MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS` | `5` | The wait before a delivery is tried again after its first failed attempt. It doubles with each attempt. |
+| `MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS` | `300` | The longest that wait gets. At least the base. |
+| `MANSIO_WEBHOOK_MAX_ATTEMPTS` | `8` | Attempts at one delivery before it is recorded as failed and the webhook moves on. |
+| `MANSIO_WEBHOOK_TIMEOUT_SECONDS` | `10` | How long one attempt may take. |
 | `MANSIO_IGGY_ADDRESS` | `127.0.0.1:8090` | Iggy's TCP address, `host:port`. |
 | `MANSIO_IGGY_USERNAME` | `mansio` | The Iggy user mansio-server acts as. It manages users and streams and reads and writes topics; it is not Iggy's root user. |
 | `MANSIO_IGGY_PASSWORD` | none, required with `iggy` | Its password. |
@@ -448,20 +656,24 @@ it creates, and leaves the flush thresholds at Iggy's defaults.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MANSIO_URL` | `http://127.0.0.1:7070` | The server to talk to. |
-| `MANSIO_TOKEN` | none, required | The bearer token. |
+| `MANSIO_URL` | `http://127.0.0.1:7070` | The server to talk to. `--url` wins. |
+| `MANSIO_TOKEN` | none, required | The bearer token. `--token` wins. Without one nothing is sent. |
 | `MANSIO_TIMEOUT_SECONDS` | `30` | Time allowed for one request. |
+| `MANSIO_RETRIES` | `3` | How many times a request that failed on the network is tried again. |
+| `MANSIO_RETRY_BACKOFF_MILLIS` | `250` | The wait before the first retry. It doubles with each. |
+| `MANSIO_POLL_INTERVAL_MILLIS` | `500` | How often `watch` and `work pull --wait` look again when there is nothing yet. |
 
 ### Tests and compose
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MANSIO_E2E_URL` | unset | A running server for `mansio-e2e` to use, with `MANSIO_TOKEN` set to its token. Unset starts a server in the test process on the memory broker, with a lease of 2 s, 3 attempts, a backoff from 1 s to 4 s, alerts surfaced every 2 s, and an agent credential that lasts 3 s, is checked every second and swept every second. Against a running server the tests read its settings from `GET /v1/settings`. |
+| `MANSIO_E2E_URL` | unset | A running server for `mansio-e2e` to use, with `MANSIO_TOKEN` set to its token. Unset starts a server in the test process on the memory broker, with a lease of 2 s, 3 attempts, a backoff from 1 s to 4 s, alerts surfaced every 2 s, an agent credential that lasts 3 s, is checked every second and swept every second, streams that look every 50 ms and send a comment every second, and webhooks that retry after 1 s to 4 s, give up after 3 attempts and wait 2 s for an answer. Against a running server the tests read its settings from `GET /v1/settings`. |
 | `MANSIO_E2E_STATE_DIR` | unset | A directory that the first and second passes of the restart and retention tests (see [Develop](#develop)) keep their state in. Required by those tests, which fail without it. |
 | `MANSIO_E2E_SINK_PATH` | unset | The sink file of the running server, as the test process can read it. With it the tests also check the order of the sink; without it they check the topics only. |
 | `MANSIO_E2E_IGGY_ADDRESS` | unset | Iggy's TCP address as the test process reaches it (`127.0.0.1:8090` for `compose.yaml`). With `MANSIO_E2E_URL` set it is required: the credential tests ask Iggy itself, without mansio-server, what a credential may do, and fail if they cannot. Without `MANSIO_E2E_URL` they ask the memory broker. |
+| `MANSIO_E2E_WEBHOOK_HOST` | unset | The name by which mansio-server reaches the webhook receiver that the tests start (`host.docker.internal` for `compose.yaml`, which maps it to the host). With `MANSIO_E2E_URL` set it is required, and the receiver then listens on every interface; the webhook tests fail without it. In process the receiver listens on loopback. |
 | `MANSIO_SINK_DIR` | the `sink` volume | A directory on the host for `compose.yaml` to keep the sink file in, so that a test can read it. |
-| `MANSIO_LEASE_SECONDS`, the other work settings and the credential settings above, `MANSIO_POLL_DEFAULT_COUNT`, `MANSIO_POLL_MAX_COUNT`, `MANSIO_IGGY_SEGMENT_SIZE_BYTES` and `MANSIO_RETENTION_ALERTS_SECONDS` | the defaults | Passed through by `compose.yaml` to mansio-server, so a test run can use short ones. Against a running server the tests read them from `GET /v1/settings`. |
+| `MANSIO_LEASE_SECONDS`, the other work settings and the credential settings above, `MANSIO_POLL_DEFAULT_COUNT`, `MANSIO_POLL_MAX_COUNT`, `MANSIO_IGGY_SEGMENT_SIZE_BYTES`, `MANSIO_RETENTION_ALERTS_SECONDS`, and the stream and webhook settings above | the defaults | Passed through by `compose.yaml` to mansio-server, so a test run can use short ones. Against a running server the tests read them from `GET /v1/settings`. |
 | `MANSIO_HEALTH_START_PERIOD` | `60s` | How long `compose.yaml` lets mansio-server fail its health check after it starts before it counts the failures. A start replays the topics of every tenant before the server answers, and `/healthz` is dark until it has, so a long replay needs a long period. |
 | `IGGY_DATA_MAINTENANCE_MESSAGES_INTERVAL` | `1 m` | How often Iggy's segment cleaner looks for expired segments, read by `compose.yaml` for the `iggy` service. The retention test sets it to seconds. |
 | `IGGY_ROOT_USERNAME`, `IGGY_ROOT_PASSWORD` | `iggy`, `iggy` | Iggy's root user, read by `compose.yaml` for Iggy and `iggy-admin` only. Development defaults. |
@@ -489,9 +701,13 @@ MANSIO_LEASE_SECONDS=2 MANSIO_MAX_ATTEMPTS=3 MANSIO_BACKOFF_BASE_SECONDS=1 \
   MANSIO_BACKOFF_CAP_SECONDS=4 MANSIO_ALERT_RESURFACE_SECONDS=2 \
   MANSIO_TICK_MILLIS=200 MANSIO_AGENT_CREDENTIAL_TTL_SECONDS=5 \
   MANSIO_CREDENTIAL_RECHECK_SECONDS=2 MANSIO_CREDENTIAL_SWEEP_SECONDS=2 \
+  MANSIO_STREAM_POLL_MILLIS=100 MANSIO_SSE_KEEPALIVE_SECONDS=1 \
+  MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS=1 MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS=4 \
+  MANSIO_WEBHOOK_MAX_ATTEMPTS=3 MANSIO_WEBHOOK_TIMEOUT_SECONDS=2 \
   docker compose up --build --wait
 MANSIO_E2E_URL=http://127.0.0.1:7070 MANSIO_TOKEN=mansio-dev-token \
-  MANSIO_E2E_IGGY_ADDRESS=127.0.0.1:8090 cargo test -p mansio-e2e --locked
+  MANSIO_E2E_IGGY_ADDRESS=127.0.0.1:8090 \
+  MANSIO_E2E_WEBHOOK_HOST=host.docker.internal cargo test -p mansio-e2e --locked
 docker compose down --volumes
 ```
 

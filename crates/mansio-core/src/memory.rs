@@ -178,7 +178,9 @@ impl Broker for MemoryBroker {
             .ok_or_else(|| missing_topic(&envelope.tenant, &envelope.topic))?;
         permit_write(&granted, &envelope.topic, &envelope.tenant)?;
         log.messages.push(envelope.clone());
-        Ok(Some(u64::try_from(log.messages.len() - 1).unwrap_or(u64::MAX)))
+        Ok(Some(
+            u64::try_from(log.messages.len() - 1).unwrap_or(u64::MAX),
+        ))
     }
 
     async fn poll(
@@ -909,23 +911,44 @@ mod tests {
     async fn the_system_logs_keep_order_and_pages_and_are_apart() {
         let broker = MemoryBroker::new();
         let principals = SystemLog::Principals;
-        assert!(broker.system_read(principals, 0, 10).await.unwrap().is_empty());
+        assert!(
+            broker
+                .system_read(principals, 0, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         for n in 0..4u8 {
             broker.system_append(principals, &[n]).await.unwrap();
         }
         let page = broker.system_read(principals, 1, 2).await.unwrap();
         let seen: Vec<(u64, Vec<u8>)> = page.into_iter().map(|r| (r.offset, r.payload)).collect();
         assert_eq!(seen, [(1, vec![1]), (2, vec![2])]);
-        assert!(broker.system_read(principals, 4, 10).await.unwrap().is_empty());
+        assert!(
+            broker
+                .system_read(principals, 4, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         // Another log has nothing of the first one's.
         let webhooks = SystemLog::Webhooks;
-        assert!(broker.system_read(webhooks, 0, 10).await.unwrap().is_empty());
+        assert!(
+            broker
+                .system_read(webhooks, 0, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         broker.system_append(webhooks, b"w").await.unwrap();
         let read = broker.system_read(webhooks, 0, 10).await.unwrap();
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].payload, b"w");
-        assert_eq!(broker.system_read(principals, 0, 10).await.unwrap().len(), 4);
+        assert_eq!(
+            broker.system_read(principals, 0, 10).await.unwrap().len(),
+            4
+        );
     }
 
     fn consumer(name: &str) -> ConsumerName {

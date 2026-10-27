@@ -102,11 +102,7 @@ struct Timer {
 }
 
 impl Timer {
-    fn start(
-        engine: Arc<Engine>,
-        credentials: Arc<Credentials>,
-        webhooks: Arc<Webhooks>,
-    ) -> Self {
+    fn start(engine: Arc<Engine>, credentials: Arc<Credentials>, webhooks: Arc<Webhooks>) -> Self {
         Self {
             tasks: vec![
                 tokio::spawn(engine.run()),
@@ -203,7 +199,10 @@ impl Server {
     ///
     /// Returns an error naming the setting if the settings do not fit
     /// together, for example a cap below the base.
-    pub fn with_webhook_settings(mut self, webhooks: WebhookSettings) -> Result<Self, SettingsError> {
+    pub fn with_webhook_settings(
+        mut self,
+        webhooks: WebhookSettings,
+    ) -> Result<Self, SettingsError> {
         webhooks.validate()?;
         self.webhooks = webhooks;
         Ok(self)
@@ -307,10 +306,7 @@ impl Server {
                 "/v1/webhooks",
                 post(webhooks_api::webhooks_create).get(webhooks_api::webhooks_list),
             )
-            .route(
-                "/v1/webhooks/{id}",
-                delete(webhooks_api::webhooks_delete),
-            )
+            .route("/v1/webhooks/{id}", delete(webhooks_api::webhooks_delete))
             .fallback(not_found)
             .layer(DefaultBodyLimit::max(max_body))
             .with_state(Arc::new(state));
@@ -831,6 +827,18 @@ mod tests {
                 Method::POST,
                 "/v1/tenants/acme/alerts/0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3/ack",
             ),
+            (Method::GET, "/v1/events?tenant=acme&topic=alerts"),
+            (Method::GET, "/v1/tenants/acme/topics/alerts/consumers/dash"),
+            (
+                Method::POST,
+                "/v1/tenants/acme/topics/alerts/consumers/dash/commit",
+            ),
+            (Method::POST, "/v1/webhooks"),
+            (Method::GET, "/v1/webhooks"),
+            (
+                Method::DELETE,
+                "/v1/webhooks/0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3",
+            ),
         ];
         for (method, uri) in routes {
             let (status, body) = send(&router, method.clone(), uri, None, "{}").await;
@@ -995,6 +1003,55 @@ mod tests {
         assert_eq!(settings.max_body_bytes, 2048);
         assert_eq!(settings.poll_default_count, 3);
         assert_eq!(settings.poll_max_count, 5);
+        assert_eq!(settings.stream_poll_millis, 500);
+        assert_eq!(settings.sse_keepalive_seconds, 15);
+        assert_eq!(settings.webhook_backoff_base_seconds, 5);
+        assert_eq!(settings.webhook_backoff_cap_seconds, 300);
+        assert_eq!(settings.webhook_max_attempts, 8);
+        assert_eq!(settings.webhook_timeout_seconds, 10);
+    }
+
+    #[tokio::test]
+    async fn stream_and_webhook_settings_that_cannot_work_are_refused() {
+        let _serial = serial().await;
+        let auth = || {
+            Auth::new(
+                SecretString::from(TOKEN.to_owned()),
+                "service:mansio".parse().unwrap(),
+            )
+        };
+        let refused = Server::new(Arc::new(MemoryBroker::new()), auth())
+            .with_stream_settings(StreamSettings {
+                poll: std::time::Duration::ZERO,
+                ..StreamSettings::default()
+            })
+            .err();
+        assert!(matches!(
+            refused,
+            Some(SettingsError::Invalid {
+                name: "MANSIO_STREAM_POLL_MILLIS",
+                ..
+            })
+        ));
+        let refused = Server::new(Arc::new(MemoryBroker::new()), auth())
+            .with_webhook_settings(WebhookSettings {
+                max_attempts: 0,
+                ..WebhookSettings::default()
+            })
+            .err();
+        assert!(matches!(
+            refused,
+            Some(SettingsError::Invalid {
+                name: "MANSIO_WEBHOOK_MAX_ATTEMPTS",
+                ..
+            })
+        ));
+        assert!(
+            Server::new(Arc::new(MemoryBroker::new()), auth())
+                .with_stream_settings(StreamSettings::default())
+                .and_then(|server| server.with_webhook_settings(WebhookSettings::default()))
+                .is_ok()
+        );
     }
 
     #[tokio::test]

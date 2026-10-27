@@ -9,7 +9,7 @@ use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
 use crate::harness::{Outcome, SLACK, Target};
-use crate::receiver::{Reply, Receiver, check_signed};
+use crate::receiver::{Receiver, Reply, check_signed};
 
 fn event(n: u32) -> Value {
     json!({"source": "e2e", "type": format!("e2e.n{n}"), "data": {"n": n}})
@@ -35,7 +35,10 @@ async fn a_delivery_that_fails_twice_arrives_on_the_third_attempt_with_a_valid_s
     let created = target.webhook("facts.build", &receiver.url).await?;
     let secret = created["secret"].as_str().context("the secret")?.to_owned();
     assert!(secret.starts_with("whsec_"), "{secret}");
-    let id = created["webhook"]["id"].as_str().context("the id")?.to_owned();
+    let id = created["webhook"]["id"]
+        .as_str()
+        .context("the id")?
+        .to_owned();
     assert_eq!(created["webhook"]["topic"], "facts.build");
     assert_eq!(created["webhook"]["tenant"], json!(target.tenant));
     assert_eq!(created["webhook"]["url"], json!(receiver.url));
@@ -82,7 +85,10 @@ async fn a_delivery_that_fails_twice_arrives_on_the_third_attempt_with_a_valid_s
     let error = &webhook["last_error"];
     assert_eq!(error["offset"], 0);
     let message = error["message"].as_str().context("an error message")?;
-    assert!(!message.is_empty() && !message.contains(&receiver.url), "{message}");
+    assert!(
+        !message.is_empty() && !message.contains(&receiver.url),
+        "{message}"
+    );
     assert!(!webhook.to_string().contains(&secret));
     assert!(!webhook.to_string().contains("whsec_"));
     assert!(webhook.get("secret").is_none());
@@ -90,6 +96,7 @@ async fn a_delivery_that_fails_twice_arrives_on_the_third_attempt_with_a_valid_s
     // Nothing more is sent for it.
     tokio::time::sleep(target.settle()).await;
     assert_eq!(receiver.requests().len(), 3);
+    target.delete_webhooks().await?;
     Ok(())
 }
 
@@ -122,6 +129,7 @@ async fn envelopes_arrive_in_offset_order_once_each_from_the_first_message() -> 
     for request in &requests {
         check_signed(request, &secret)?;
     }
+    target.delete_webhooks().await?;
     Ok(())
 }
 
@@ -136,7 +144,10 @@ async fn a_delivery_that_fails_every_attempt_is_recorded_and_the_webhook_moves_o
     let first = target.publish("facts.build", &event(0)).await?.envelope;
     let second = target.publish("facts.build", &event(1)).await?.envelope;
     let created = target.webhook("facts.build", &receiver.url).await?;
-    let id = created["webhook"]["id"].as_str().context("the id")?.to_owned();
+    let id = created["webhook"]["id"]
+        .as_str()
+        .context("the id")?
+        .to_owned();
 
     let wait = target.webhook_give_up() + SLACK;
     let requests = receiver
@@ -148,7 +159,10 @@ async fn a_delivery_that_fails_every_attempt_is_recorded_and_the_webhook_moves_o
         .collect::<anyhow::Result<_>>()?;
     let mut expected = vec![first.id.to_string(); attempts as usize];
     expected.push(second.id.to_string());
-    assert_eq!(ids, expected, "the first envelope is tried, then the second");
+    assert_eq!(
+        ids, expected,
+        "the first envelope is tried, then the second"
+    );
 
     // The give-up is a fact, made by the engine, naming what and why.
     let facts = target
@@ -160,7 +174,10 @@ async fn a_delivery_that_fails_every_attempt_is_recorded_and_the_webhook_moves_o
     assert_eq!(facts.len(), 1, "one delivery was given up on");
     let fact = &facts[0];
     assert_eq!(fact.event_type.as_str(), "mansio.webhook.failed");
-    assert_eq!(fact.subject.as_ref().map(ToString::to_string), Some(id.clone()));
+    assert_eq!(
+        fact.subject.as_ref().map(ToString::to_string),
+        Some(id.clone())
+    );
     assert_eq!(fact.principal.to_string(), "service:mansio-engine");
     let data = fact.data.as_ref().context("data")?;
     assert_eq!(data["webhook_id"], json!(id));
@@ -169,7 +186,10 @@ async fn a_delivery_that_fails_every_attempt_is_recorded_and_the_webhook_moves_o
     assert_eq!(data["message_id"], json!(first.id.to_string()));
     assert_eq!(data["attempts"], attempts);
     assert_eq!(data["error"], "HTTP 500");
-    assert!(!data.to_string().contains(&receiver.url), "no address in a fact");
+    assert!(
+        !data.to_string().contains(&receiver.url),
+        "no address in a fact"
+    );
 
     // The webhook moved on: the second envelope was delivered.
     let listed = target
@@ -182,6 +202,7 @@ async fn a_delivery_that_fails_every_attempt_is_recorded_and_the_webhook_moves_o
         })
         .await?;
     assert_eq!(listed[0]["last_error"]["message"], "HTTP 500");
+    target.delete_webhooks().await?;
     Ok(())
 }
 
@@ -207,11 +228,11 @@ async fn webhooks_are_made_listed_and_deleted_by_the_admin_alone() -> anyhow::Re
         .call(Method::POST, &uri, Some(&agent.token), Some(&body))
         .await?;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    let (status, _) = target.call(Method::GET, &uri, Some(&agent.token), None).await?;
-    assert_eq!(status, StatusCode::FORBIDDEN);
     let (status, _) = target
-        .call(Method::POST, &uri, None, Some(&body))
+        .call(Method::GET, &uri, Some(&agent.token), None)
         .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = target.call(Method::POST, &uri, None, Some(&body)).await?;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     // An address or a request that is refused.
@@ -219,7 +240,9 @@ async fn webhooks_are_made_listed_and_deleted_by_the_admin_alone() -> anyhow::Re
         let (status, response) = target.create_webhook("facts.build", url).await?;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{url:?}: {response}");
     }
-    let (status, response) = target.create_webhook("facts.webhook", &receiver.url).await?;
+    let (status, response) = target
+        .create_webhook("facts.webhook", &receiver.url)
+        .await?;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
     for bad in [
         json!({"tenant": target.tenant, "topic": "facts.build"}),
@@ -234,7 +257,10 @@ async fn webhooks_are_made_listed_and_deleted_by_the_admin_alone() -> anyhow::Re
 
     // The admin makes one, and the secret is in that answer and no other.
     let created = target.webhook("facts.build", &receiver.url).await?;
-    let id = created["webhook"]["id"].as_str().context("the id")?.to_owned();
+    let id = created["webhook"]["id"]
+        .as_str()
+        .context("the id")?
+        .to_owned();
     let secret = created["secret"].as_str().context("the secret")?.to_owned();
     let listed = target.webhooks().await?;
     assert_eq!(listed.len(), 1);
@@ -243,7 +269,10 @@ async fn webhooks_are_made_listed_and_deleted_by_the_admin_alone() -> anyhow::Re
     let (status, other) = target
         .authed(Method::GET, &format!("{uri}?tenant=someone-else"), None)
         .await?;
-    assert_eq!((status, other["webhooks"].as_array().map(Vec::len)), (StatusCode::OK, Some(0)));
+    assert_eq!(
+        (status, other["webhooks"].as_array().map(Vec::len)),
+        (StatusCode::OK, Some(0))
+    );
 
     // Where the broker keeps the secrets, no credential reaches.
     if let Some(outcome) = target
@@ -290,6 +319,7 @@ async fn a_webhook_for_a_topic_nobody_has_published_to_waits_for_it() -> anyhow:
     assert!(receiver.requests().is_empty());
     target.publish("facts.later", &event(0)).await?;
     receiver.wait_for(&target, 1, SLACK).await?;
+    target.delete_webhooks().await?;
     Ok(())
 }
 
@@ -307,7 +337,14 @@ async fn a_restarted_server_resumes_a_webhook_where_it_stopped() -> anyhow::Resu
     let secret = created["secret"].as_str().context("the secret")?.to_owned();
     let mut sent = Vec::new();
     for n in 0..2 {
-        sent.push(target.publish("facts.build", &event(n)).await?.envelope.id.to_string());
+        sent.push(
+            target
+                .publish("facts.build", &event(n))
+                .await?
+                .envelope
+                .id
+                .to_string(),
+        );
     }
     receiver.wait_for(&target, 2, SLACK).await?;
     // Wait until the place is kept, so that stopping now loses none.
@@ -325,7 +362,14 @@ async fn a_restarted_server_resumes_a_webhook_where_it_stopped() -> anyhow::Resu
     target.stop_server().await?;
     target.start_server().await?;
     for n in 2..4 {
-        sent.push(target.publish("facts.build", &event(n)).await?.envelope.id.to_string());
+        sent.push(
+            target
+                .publish("facts.build", &event(n))
+                .await?
+                .envelope
+                .id
+                .to_string(),
+        );
     }
     receiver.wait_for(&target, 4, SLACK).await?;
     tokio::time::sleep(target.settle()).await;
@@ -340,5 +384,6 @@ async fn a_restarted_server_resumes_a_webhook_where_it_stopped() -> anyhow::Resu
     }
     // The restarted server still lists it.
     assert_eq!(target.webhooks().await?.len(), 1);
+    target.delete_webhooks().await?;
     Ok(())
 }

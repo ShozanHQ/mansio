@@ -99,6 +99,18 @@ jobs:
       MANSIO_AGENT_CREDENTIAL_TTL_SECONDS: "5"
       MANSIO_CREDENTIAL_RECHECK_SECONDS: "2"
       MANSIO_CREDENTIAL_SWEEP_SECONDS: "2"
+      # Streams look for new messages every 100 ms and send a comment every
+      # second when quiet. A webhook retries after 1 s, 2 s, 4 s, gives up on a
+      # delivery after 3 attempts, and waits 2 s for an answer.
+      MANSIO_STREAM_POLL_MILLIS: "100"
+      MANSIO_SSE_KEEPALIVE_SECONDS: "1"
+      MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS: "1"
+      MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS: "4"
+      MANSIO_WEBHOOK_MAX_ATTEMPTS: "3"
+      MANSIO_WEBHOOK_TIMEOUT_SECONDS: "2"
+      # The name mansio-server, in its container, reaches the webhook receiver
+      # of the tests by. The receiver listens on the runner.
+      MANSIO_E2E_WEBHOOK_HOST: host.docker.internal
       # Iggy's cleaner looks for expired segments this often (a minute by
       # default), for the retention test further down.
       IGGY_DATA_MAINTENANCE_MESSAGES_INTERVAL: 2s
@@ -119,7 +131,7 @@ jobs:
           echo "MANSIO_E2E_STATE_DIR=$RUNNER_TEMP/mansio-state" >> "$GITHUB_ENV"
       - name: Start Iggy, make mansio's Iggy user, and start mansio-server
         run: docker compose up --build --wait
-      - name: Publish, poll, claim, retry, acknowledge and issue credentials through Iggy
+      - name: Publish, poll, claim, retry, acknowledge, stream, deliver webhooks and issue credentials through Iggy
         run: cargo test -p mansio-e2e --locked
       # The two-pass tests: a first pass leaves work and alerts in Iggy, the
       # server is restarted, and a second pass checks what the new server made

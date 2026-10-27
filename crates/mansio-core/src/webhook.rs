@@ -97,7 +97,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn unhex(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 || !text.is_ascii() {
+    if !text.len().is_multiple_of(2) || !text.is_ascii() {
         return None;
     }
     (0..text.len())
@@ -284,7 +284,13 @@ mod tests {
     fn a_changed_body_secret_or_timestamp_does_not_verify() {
         let header = sign(&secret(), 1_000, BODY);
         assert!(!verify(&secret(), &header, b"{}", 1_000, 300));
-        assert!(!verify(&WebhookSecret::new("other"), &header, BODY, 1_000, 300));
+        assert!(!verify(
+            &WebhookSecret::new("other"),
+            &header,
+            BODY,
+            1_000,
+            300
+        ));
         let moved = header.replacen("t=1000", "t=1001", 1);
         assert!(!verify(&secret(), &moved, BODY, 1_000, 300));
     }
@@ -321,7 +327,9 @@ mod tests {
         assert!(!format!("{a:?}").contains("whsec_"));
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(
-            serde_json::from_str::<WebhookSecret>(&json).unwrap().expose(),
+            serde_json::from_str::<WebhookSecret>(&json)
+                .unwrap()
+                .expose(),
             a.expose()
         );
     }
@@ -339,7 +347,12 @@ mod tests {
             status: WebhookStatus::default(),
         };
         let json = serde_json::to_value(&info).unwrap();
-        let mut keys: Vec<&str> = json.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort_unstable();
         assert_eq!(keys, ["created_at", "id", "tenant", "topic", "url"]);
         assert_eq!(serde_json::from_value::<WebhookInfo>(json).unwrap(), info);

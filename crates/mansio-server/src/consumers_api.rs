@@ -20,8 +20,7 @@ use crate::error::ApiError;
 type Target = (TenantId, Topic, ConsumerName);
 
 fn target(path: Result<Path<(String, String, String)>, PathRejection>) -> Result<Target, ApiError> {
-    let Path((tenant, topic, consumer)) =
-        path.map_err(|e| ApiError::BadRequest(e.body_text()))?;
+    let Path((tenant, topic, consumer)) = path.map_err(|e| ApiError::BadRequest(e.body_text()))?;
     Ok((
         parse_part(&tenant)?,
         parse_part(&topic)?,

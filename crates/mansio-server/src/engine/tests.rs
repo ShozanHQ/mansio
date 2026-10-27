@@ -1623,7 +1623,12 @@ async fn a_broker_that_cannot_be_reached_costs_at_most_one_rebuild_per_tick() {
     }
     for n in 0..50 {
         engine
-            .work_pull(&tenant(), &queue(), &agent("a"), &consumer(&format!("w{n}")))
+            .work_pull(
+                &tenant(),
+                &queue(),
+                &agent("a"),
+                &consumer(&format!("w{n}")),
+            )
             .await
             .unwrap()
             .unwrap();

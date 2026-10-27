@@ -608,8 +608,12 @@ impl Target {
         url: &str,
     ) -> anyhow::Result<(StatusCode, Value)> {
         let body = json!({"tenant": self.tenant, "topic": topic, "url": url});
-        self.authed(Method::POST, &format!("{}/v1/webhooks", self.base), Some(&body))
-            .await
+        self.authed(
+            Method::POST,
+            &format!("{}/v1/webhooks", self.base),
+            Some(&body),
+        )
+        .await
     }
 
     /// `webhooks_create`, which must be accepted: the answer with the
@@ -632,6 +636,21 @@ impl Target {
             "webhooks_list answered {status}: {response}"
         );
         Ok(response["webhooks"].as_array().context("a list")?.clone())
+    }
+
+    /// Delete every webhook of this tenant, so that a server that goes on after
+    /// the test does not go on delivering for it.
+    pub async fn delete_webhooks(&self) -> anyhow::Result<()> {
+        for webhook in self.webhooks().await? {
+            let id = webhook["id"].as_str().context("a webhook has an id")?;
+            let uri = format!("{}/v1/webhooks/{id}", self.base);
+            let (status, response) = self.authed(Method::DELETE, &uri, None).await?;
+            ensure!(
+                status == StatusCode::OK,
+                "webhooks_delete answered {status}: {response}"
+            );
+        }
+        Ok(())
     }
 
     /// The wait after attempt `attempt` at a webhook delivery fails, from the

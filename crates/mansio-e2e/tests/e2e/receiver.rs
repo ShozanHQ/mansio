@@ -8,7 +8,7 @@
 //! delivered to has shown nothing.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, ensure};
@@ -77,7 +77,10 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> anyhow::Result<Rece
             break at + 4;
         }
         let n = socket.read(&mut chunk).await?;
-        ensure!(n > 0, "the connection closed before the request was complete");
+        ensure!(
+            n > 0,
+            "the connection closed before the request was complete"
+        );
         buffer.extend_from_slice(&chunk[..n]);
     };
     let head = String::from_utf8_lossy(&buffer[..end]).into_owned();
@@ -139,9 +142,9 @@ impl Receiver {
                     let Ok(request) = read_request(&mut socket).await else {
                         return;
                     };
-                    log.lock().unwrap().push(request);
+                    locked(&log).push(request);
                     let reply = {
-                        let mut script = answers.lock().unwrap();
+                        let mut script = locked(&answers);
                         let otherwise = script.otherwise;
                         script.replies.pop_front().unwrap_or(otherwise)
                     };
@@ -166,7 +169,7 @@ impl Receiver {
 
     /// Everything received so far, in the order it arrived.
     pub fn requests(&self) -> Vec<Received> {
-        self.received.lock().unwrap().clone()
+        locked(&self.received).clone()
     }
 
     /// Wait until at least `count` requests have arrived.
@@ -185,10 +188,18 @@ impl Receiver {
     }
 }
 
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// The signature of a body, worked out here and not by mansio: HMAC-SHA256 of
 /// `<t>.<body>` under the secret's text, in hex.
+#[expect(
+    clippy::expect_used,
+    reason = "HMAC takes a key of any length, so this cannot fail"
+)]
 pub fn signature(secret: &str, timestamp: i64, body: &[u8]) -> String {
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("any key length");
     mac.update(format!("{timestamp}.").as_bytes());
     mac.update(body);
     mac.finalize()
