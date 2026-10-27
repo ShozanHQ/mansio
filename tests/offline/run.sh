@@ -295,7 +295,35 @@ check_untouched() {
   else
     others=$(sequences "$1" | grep -v -x -- '[^ ]* claimed:1 acked:1' || true)
   fi
-  [ -z "$others" ] || fail "items that were not claimed and acknowledged once: $others"
+  if [ -n "$others" ]; then
+    hint=
+    case $others in
+      *expired*) hint=" (an expired lease can also mean a runner so slow that a consumer took more than the lease of $lease s between a claim and its ack)" ;;
+    esac
+    fail "items that were not claimed and acknowledged once: $others$hint"
+  fi
+}
+
+# check_logs NAME...: in the logs of these consumers no ack failed, and say how
+# many pulls did, which a consumer tries again and a passing run would
+# otherwise hide.
+check_logs() {
+  refused=0
+  pulls=0
+  for who in "$@"; do
+    refused=$((refused + $(grep -c -- '^ack of .* failed' "$work/$who.log" || true)))
+    pulls=$((pulls + $(grep -c -- '^pull failed' "$work/$who.log" || true)))
+  done
+  if [ "$refused" -ne 0 ]; then
+    fail "$refused acks failed: $(for who in "$@"; do grep -h -- '^ack of .* failed' "$work/$who.log" || true; done)"
+  fi
+  say "consumer logs: no ack failed, $pulls pulls failed and were tried again"
+}
+
+# epoch TIMESTAMP: the seconds since 1970 of an RFC 3339 time in UTC, as the
+# server writes it, with or without fractions of a second.
+epoch() {
+  printf '%s\n' "$1" | jq -eR 'sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601'
 }
 
 # ---- scenario 1 -------------------------------------------------------------
@@ -323,6 +351,7 @@ check_file "$done_file" "$work/one.published"
 read_facts "$tenant" "$work/one.facts"
 check_untouched "$work/one.facts" ""
 say "facts.work: each item claimed and acknowledged once, as attempt 1"
+check_logs "$name"
 kill_dead "$name" "$pid"
 say "PASS scenario 1"
 
@@ -339,7 +368,7 @@ publish_items "$tenant" "$work/two.published"
 start_consumer "$tenant" "$dying" "$done_file" 1
 pid=$consumer_pid
 wait_for_exit "$pid"
-held=$(sed -n 's/^claimed \([^ ]*\) attempt 1$/\1/p' "$work/$dying.log")
+held=$(sed -n 's/^claimed \([^ ]*\) attempt 1 expires_at .*$/\1/p' "$work/$dying.log")
 case $held in
   '' | *[!A-Za-z0-9._@:+-]*) fail "consumer $dying did not log exactly one claim, but: '$held'" ;;
 esac
@@ -362,6 +391,7 @@ got=$(grep -x -- "$held .*" "$work/two.sequences" || true)
 [ "$got" = "$want" ] || fail "the held item went '$got', not '$want'"
 say "facts.work: $got"
 say "the others were claimed and acknowledged once, as attempt 1"
+check_logs "$dying" "$taking"
 kill_dead "$taking" "$pid"
 say "PASS scenario 2"
 
@@ -377,7 +407,7 @@ publish_items "$tenant" "$work/three.published"
 start_consumer "$tenant" "$name" "$done_file" 1
 pid=$consumer_pid
 wait_for_exit "$pid"
-held=$(sed -n 's/^claimed \([^ ]*\) attempt 1$/\1/p' "$work/$name.log")
+held=$(sed -n 's/^claimed \([^ ]*\) attempt 1 expires_at .*$/\1/p' "$work/$name.log")
 case $held in
   '' | *[!A-Za-z0-9._@:+-]*) fail "consumer $name did not log exactly one claim, but: '$held'" ;;
 esac
@@ -386,18 +416,26 @@ if [ -s "$done_file" ]; then
   fail "the consumer that died acknowledged something"
 fi
 say "consumer $name died holding item $held"
+# The restart must land inside the lease, or there is nothing to be given back.
+expires_at=$(sed -n 's/^claimed [^ ]* attempt 1 expires_at \(.*\)$/\1/p' "$work/$name.log")
+expires=$(epoch "$expires_at") || fail "the claim logged an expires_at that is not a time: '$expires_at'"
+now=$(date +%s)
+if [ "$now" -ge "$expires" ]; then
+  fail "the runner took $((now - expires + lease)) s to restart the consumer, past its lease of $lease s"
+fi
 start_consumer "$tenant" "$name" "$done_file" 0
 pid=$consumer_pid
 say "a new process of $name started, inside the lease of $lease s"
 wait_for_lines "$done_file" "$items" "$pid"
 sleep "$settle"
 # The restarted consumer was given the item it held, not another.
-again=$(grep -c -x -- "claimed $held attempt 1" "$work/$name.log" || true)
-[ "$again" -eq 2 ] || fail "item $held was claimed $again times under $name, not by the dead process and again by the new one"
+again=$(grep -c -- "^claimed $held attempt 1 expires_at " "$work/$name.log" || true)
+[ "$again" -eq 2 ] || fail "item $held was claimed $again times under $name, not by the dead process and again by the new one (or the runner took longer than the lease of $lease s to restart the consumer)"
 check_file "$done_file" "$work/three.published"
 read_facts "$tenant" "$work/three.facts"
 check_untouched "$work/three.facts" ""
 say "facts.work: each item, $held among them, claimed and acknowledged once, as attempt 1, with no expiry"
+check_logs "$name"
 kill_dead "$name" "$pid"
 say "PASS scenario 3"
 
