@@ -452,3 +452,25 @@ async fn a_consumer_named_after_a_webhook_does_not_move_it() -> anyhow::Result<(
     target.delete_webhooks().await?;
     Ok(())
 }
+
+/// The longest address a webhook may have is a setting.
+#[tokio::test]
+async fn the_longest_address_is_the_setting() -> anyhow::Result<()> {
+    let target = Target::start().await?;
+    let max = usize::try_from(target.settings.webhook_url_max_bytes)?;
+    let base = "http://127.0.0.1:9/";
+    let at_the_limit = format!("{base}{}", "a".repeat(max - base.len()));
+    let (status, response) = target.create_webhook("facts.build", &at_the_limit).await?;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    let too_long = format!("{at_the_limit}a");
+    let (status, response) = target.create_webhook("facts.build", &too_long).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(&format!("longer than {max} bytes"))),
+        "{response}"
+    );
+    target.delete_webhooks().await?;
+    Ok(())
+}

@@ -103,10 +103,14 @@ All notable changes to mansio are listed here. The format follows
   `MANSIO_SHUTDOWN_GRACE_SECONDS` for the rest.
 - Webhooks (`webhooks_create`, `webhooks_list`, `webhooks_delete`, admin only):
   each envelope of a topic is POSTed in order as CloudEvents JSON with a
-  `mansio-signature` HMAC-SHA256 header, from a durable consumer, retried with
+  `mansio-signature` HMAC-SHA256 header, from a position the server keeps, retried with
   a backoff, and recorded as `mansio.webhook.failed` on `facts.webhook` when
   given up on. Secrets are kept on the server's own `webhooks` log.
-- The settings `MANSIO_STREAM_POLL_MILLIS`, `MANSIO_SSE_KEEPALIVE_SECONDS`,
+- The registry of webhooks fails loud as the principals' does (records carry a
+  version in `v`; an unreadable one keeps it unloaded, with 503 on the admin
+  API, `"webhooks":"unavailable"` on `/healthz` and no delivery), and a webhook
+  that cannot reach the broker backs off and logs a run of failures once.
+- The settings `MANSIO_WEBHOOK_URL_MAX_BYTES`, `MANSIO_STREAM_POLL_MILLIS`, `MANSIO_SSE_KEEPALIVE_SECONDS`,
   `MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS`, `MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS`,
   `MANSIO_WEBHOOK_MAX_ATTEMPTS`, `MANSIO_WEBHOOK_TIMEOUT_SECONDS` and
   `MANSIO_SHUTDOWN_GRACE_SECONDS` for the server, and `MANSIO_RETRIES`,

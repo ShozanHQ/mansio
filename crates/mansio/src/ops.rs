@@ -28,7 +28,8 @@ pub enum Op {
     Publish,
     /// Read the envelopes in a topic.
     Poll,
-    /// Follow a topic, resuming from a durable consumer.
+    /// Follow a topic, resuming from a named consumer whose position the server
+    /// keeps.
     Watch,
     /// Publish a work item.
     WorkPublish,
@@ -137,7 +138,7 @@ const CONSUMER_HELD: Param = required(
 const CONSUMER_NAMED: Param = required(
     "consumer",
     Kind::Text,
-    "The consumer's name. The broker keeps its offset.",
+    "The consumer's name, one of yours: the server keeps its position.",
 );
 const ENVELOPE: [Param; 8] = [
     required("type", Kind::Text, "What happened (CloudEvents type)."),
@@ -237,7 +238,7 @@ impl Op {
             Op::Publish => "Publish an envelope to a topic and print it as stored.",
             Op::Poll => "Print the envelopes in a topic from an offset, one JSON object per line.",
             Op::Watch => {
-                "Stream the envelopes of a topic as they arrive, one JSON object per line. With --consumer the position is kept by the broker, so a restart resumes at the next envelope; stop with SIGINT or SIGTERM."
+                "Stream the envelopes of a topic as they arrive, one JSON object per line. With --consumer the server keeps the position, so a restart resumes at the next envelope; stop with SIGINT or SIGTERM."
             }
             Op::WorkPublish => {
                 "Publish a work item to a queue and print it as stored. The item is named by its id."
@@ -531,7 +532,7 @@ pub struct WatchArgs {
     pub tenant: TenantId,
     /// The topic to follow.
     pub topic: Topic,
-    /// The named consumer whose position the broker keeps, if any.
+    /// The named consumer whose position the server keeps, if any.
     pub consumer: Option<ConsumerName>,
     /// Where to start without a consumer.
     pub from: u64,
