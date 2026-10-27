@@ -49,6 +49,12 @@ All notable changes to mansio are listed here. The format follows
 - Two-pass end-to-end tests that restart mansio-server between the passes, run
   by the CI `e2e` job against Iggy: a queue longer than a page with a claimed
   item, and an `alerts` topic that retention has trimmed.
+- The offline-consumer test, `tests/offline/run.sh`, run by the CI `offline`
+  job against compose: a consumer killed while idle, and one killed holding a
+  lease, and in both every one of N items is done exactly once. The consumer,
+  `tests/offline/consumer.sh`, is a plain shell loop of `mansio work pull
+  --wait` and `mansio work ack`. The settings `MANSIO_BIN` and
+  `MANSIO_OFFLINE_*` are listed in the README.
 - Credentials. The admin API (`principals_create`, `principals_list`,
   `principals_revoke`: `POST /v1/principals`, `GET /v1/principals?tenant=`,
   `DELETE /v1/principals/{id}`) issues a credential to a principal with scopes
