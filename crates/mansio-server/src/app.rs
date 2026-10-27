@@ -1,7 +1,7 @@
 //! The HTTP application: routes, handlers, and the `Server` builder a host
 //! application uses to run it in-process.
 
-use std::future::Future;
+use std::future::{Future, IntoFuture};
 use std::io;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -9,6 +9,7 @@ use std::sync::Arc;
 use axum::extract::rejection::{BytesRejection, PathRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
@@ -21,6 +22,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
+use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
@@ -28,6 +30,7 @@ use crate::auth::{Auth, Authenticated};
 use crate::clock::{Clock, SystemClock};
 use crate::consumers_api;
 use crate::credentials::Credentials;
+use crate::cursors::Cursors;
 use crate::engine::Engine;
 use crate::error::ApiError;
 use crate::events_api;
@@ -53,9 +56,27 @@ pub struct AppState {
     pub(crate) engine: Arc<Engine>,
     pub(crate) credentials: Arc<Credentials>,
     pub(crate) webhooks: Arc<Webhooks>,
+    pub(crate) cursors: Arc<Cursors>,
     pub(crate) auth: Auth,
     pub(crate) limits: Limits,
     pub(crate) streams: StreamSettings,
+    /// Becomes true when the server is shutting down, which ends every event
+    /// stream.
+    pub(crate) ending: watch::Receiver<bool>,
+}
+
+/// Ends every event stream of a server that is shutting down, so that a
+/// client that is connected to one does not hold the shutdown up.
+/// [`Server::serve`] does it when its shutdown signal comes; a host that
+/// mounts the routes itself calls [`Ender::end`] when it begins to stop.
+#[derive(Debug)]
+pub struct Ender(watch::Sender<bool>);
+
+impl Ender {
+    /// End every event stream.
+    pub fn end(&self) {
+        self.0.send_replace(true);
+    }
 }
 
 /// What [`Server::build`] makes: the routes, and the things that have to be
@@ -69,6 +90,9 @@ pub struct Parts {
     pub credentials: Arc<Credentials>,
     /// Webhooks. Run [`Webhooks::run`] alongside the routes.
     pub webhooks: Arc<Webhooks>,
+    /// Ends the event streams. Call [`Ender::end`] before the host stops
+    /// serving, or its graceful shutdown waits for them for ever.
+    pub ender: Ender,
 }
 
 /// The mansio HTTP server, ready to run.
@@ -237,9 +261,15 @@ impl Server {
             self.auth.principal().clone(),
             self.limits.poll_max_count,
         ));
+        let cursors = Arc::new(Cursors::new(
+            Arc::clone(&self.broker),
+            self.limits.poll_max_count,
+        ));
+        let (ender, ending) = watch::channel(false);
         let webhooks = Arc::new(Webhooks::new(
             Arc::clone(&self.broker),
             Arc::clone(&engine),
+            Arc::clone(&cursors),
             self.clock,
             self.webhooks,
             self.streams,
@@ -250,9 +280,11 @@ impl Server {
             engine: Arc::clone(&engine),
             credentials: Arc::clone(&credentials),
             webhooks: Arc::clone(&webhooks),
+            cursors,
             auth: self.auth,
             limits: self.limits,
             streams: self.streams,
+            ending,
         };
         let router = Router::new()
             .route("/healthz", get(healthz))
@@ -315,6 +347,7 @@ impl Server {
             engine,
             credentials,
             webhooks,
+            ender: Ender(ender),
         }
     }
 
@@ -324,7 +357,9 @@ impl Server {
         self.build().router
     }
 
-    /// Serve on `listener` until `shutdown` completes. Before it accepts a
+    /// Serve on `listener` until `shutdown` completes, then end the event
+    /// streams and wait up to `MANSIO_SHUTDOWN_GRACE_SECONDS` for the requests
+    /// still being served. Before it accepts a
     /// request the engine takes up what the broker holds and the registries of
     /// principals and webhooks are loaded, and while it runs the timer drives
     /// expiries, republishes and alerts, the sweep revokes expired
@@ -339,11 +374,13 @@ impl Server {
         listener: TcpListener,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> io::Result<()> {
+        let grace = self.streams.shutdown_grace;
         let Parts {
             router,
             engine,
             credentials,
             webhooks,
+            ender,
         } = self.build();
         if let Err(error) = engine.recover().await {
             warn!(
@@ -351,12 +388,9 @@ impl Server {
                 "the tenants could not be listed; the timer will try again"
             );
         }
-        if let Err(error) = credentials.load().await {
-            warn!(
-                ?error,
-                "the registry of principals could not be loaded; the next request will try again"
-            );
-        }
+        // If this fails it has logged why at error. Credentials are refused and
+        // `/healthz` says so until a later attempt succeeds.
+        credentials.load().await.ok();
         if let Err(error) = webhooks.load().await {
             warn!(
                 ?error,
@@ -364,16 +398,56 @@ impl Server {
             );
         }
         let timer = Timer::start(engine, credentials, webhooks);
+        // The signal ends the event streams, which would otherwise never let
+        // the graceful shutdown finish, and starts the clock on what is left.
+        let stopping = Arc::new(Notify::new());
+        let signal = {
+            let stopping = Arc::clone(&stopping);
+            async move {
+                shutdown.await;
+                ender.end();
+                stopping.notify_one();
+            }
+        };
         let served = axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown)
-            .await;
+            .with_graceful_shutdown(signal)
+            .into_future();
+        let out_of_time = async {
+            stopping.notified().await;
+            tokio::time::sleep(grace).await;
+        };
+        let served = tokio::select! {
+            served = served => served,
+            () = out_of_time => {
+                warn!(
+                    grace_seconds = grace.as_secs(),
+                    "requests were still being served when the grace for shutdown ran out; stopping anyway"
+                );
+                Ok(())
+            }
+        };
         timer.stop().await;
         served
     }
 }
 
-async fn healthz() -> Json<Value> {
-    Json(json!({ "status": "ok" }))
+/// `200 {"status":"ok"}`, or `503 {"status":"degraded","credentials":"unavailable",..}`
+/// while the registry of principals is not loaded: the server is up, and no
+/// credential is accepted. Asking for it tries the load again when its time
+/// is up, which is what a health check that keeps asking wants.
+async fn healthz(State(state): State<Arc<AppState>>) -> Response {
+    match state.credentials.load().await {
+        Ok(()) => Json(json!({ "status": "ok" })).into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "degraded",
+                "credentials": "unavailable",
+                "message": "the registry of principals is not loaded, so no credential is accepted; see the server log",
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn settings(
@@ -400,6 +474,7 @@ async fn settings(
         credential_sweep_seconds: seconds(credentials.sweep),
         stream_poll_millis: u64::try_from(state.streams.poll.as_millis()).unwrap_or(u64::MAX),
         sse_keepalive_seconds: seconds(state.streams.sse_keepalive),
+        shutdown_grace_seconds: seconds(state.streams.shutdown_grace),
         webhook_backoff_base_seconds: seconds(webhooks.backoff_base),
         webhook_backoff_cap_seconds: seconds(webhooks.backoff_cap),
         webhook_max_attempts: webhooks.max_attempts,
@@ -593,12 +668,13 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request, header};
     use http_body_util::BodyExt;
-    use mansio_core::MemoryBroker;
     use mansio_core::api::ErrorBody;
+    use mansio_core::{MemoryBroker, SystemLog};
     use secrecy::SecretString;
     use tower::ServiceExt;
 
     use super::*;
+    use crate::testing::serial;
 
     const TOKEN: &str = "test-token";
 
@@ -1259,17 +1335,6 @@ mod tests {
         }
     }
 
-    /// Every test in this module holds this lock for its life, and
-    /// `Logs::capture` takes it too. Tracing keeps subscribers and callsite
-    /// interest in process-wide state. A callsite first reached on a thread
-    /// with no subscriber, while another thread's capture is live, is cached
-    /// as never interesting, and its events vanish from that capture.
-    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
-        SERIAL.lock().await
-    }
-
     /// Ends the capture when dropped, then releases the lock. Fields drop in
     /// declaration order, so the subscriber is gone before the next test runs.
     struct CaptureGuard {
@@ -1386,6 +1451,74 @@ mod tests {
             assert!(logged.contains(expected), "{expected} is not in {logged}");
         }
         assert!(!logged.contains("private-payload"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn a_registry_that_cannot_be_loaded_is_logged_with_its_cause_and_healthz_says_so() {
+        let (logs, _guard) = Logs::capture().await;
+        let broker = Arc::new(MemoryBroker::new());
+        broker
+            .system_append(SystemLog::Principals, b"not a record")
+            .await
+            .unwrap();
+        let clock = Arc::new(crate::clock::manual::ManualClock::new(1_792_000_000_000));
+        let router = Server::new(
+            broker,
+            Auth::new(
+                SecretString::from(TOKEN.to_owned()),
+                "service:mansio".parse().unwrap(),
+            ),
+        )
+        .with_clock(clock.clone())
+        .with_credential_settings(CredentialSettings {
+            agent_ttl: std::time::Duration::from_secs(60),
+            recheck: std::time::Duration::from_secs(30),
+            sweep: std::time::Duration::from_secs(10),
+        })
+        .router();
+
+        // The server is up and says it is not well, in a status a health
+        // check fails on. It does not say why: it answers anyone.
+        let (status, body) = send(&router, Method::GET, "/healthz", None, "").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(body["credentials"], "unavailable");
+        assert!(!body.to_string().contains("offset"), "{body}");
+
+        // A credential is refused with a 503, not a 401, however many times it
+        // is shown. The bootstrap token is not a credential and still works.
+        for _ in 0..3 {
+            let (status, body) = send(&router, Method::GET, URI, Some("a-credential"), "").await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(error_code(&body), "unavailable");
+        }
+        let (status, _) = send(&router, Method::POST, URI, Some(TOKEN), MINIMAL).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // One line at error, with the cause, for all of that.
+        let logged = logs.text();
+        let lines = |text: &str| text.matches("could not be loaded").count();
+        assert_eq!(lines(&logged), 1, "{logged}");
+        for expected in ["ERROR", "offset 0", "retry_seconds=30"] {
+            assert!(logged.contains(expected), "{expected} is not in {logged}");
+        }
+
+        // Once the interval has passed the next request tries, and says so.
+        clock.advance(std::time::Duration::from_secs(30));
+        let (status, _) = send(&router, Method::GET, "/healthz", None, "").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(lines(&logs.text()), 2, "{}", logs.text());
+    }
+
+    #[tokio::test]
+    async fn a_registry_that_loaded_leaves_healthz_ok() {
+        let _serial = serial().await;
+        let router = router();
+        let (status, _) = send(&router, Method::GET, URI, Some("a-credential"), "").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, body) = send(&router, Method::GET, "/healthz", None, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"status": "ok"}));
     }
 
     #[tokio::test]

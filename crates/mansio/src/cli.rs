@@ -2,6 +2,7 @@
 //! `mansio webhooks list` and the rest, each flag a parameter.
 
 use clap::{Arg, ArgMatches, Command, value_parser};
+use secrecy::SecretString;
 use serde_json::{Map, Value};
 
 use crate::client::Connection;
@@ -121,7 +122,10 @@ pub fn command() -> Command {
 pub fn connection(matches: &ArgMatches) -> Connection {
     Connection {
         url: matches.get_one::<String>("url").cloned(),
-        token: matches.get_one::<String>("token").cloned(),
+        token: matches
+            .get_one::<String>("token")
+            .cloned()
+            .map(SecretString::from),
     }
 }
 
@@ -161,6 +165,7 @@ pub fn chosen(matches: &ArgMatches) -> anyhow::Result<Chosen> {
 
 #[cfg(test)]
 mod tests {
+    use secrecy::ExposeSecret;
     use serde_json::json;
 
     use super::*;
@@ -261,7 +266,10 @@ mod tests {
             let matches = parse(args).unwrap();
             let connection = connection(&matches);
             assert_eq!(connection.url.as_deref(), Some("http://h:1"));
-            assert_eq!(connection.token.as_deref(), Some("t"));
+            assert_eq!(
+                connection.token.as_ref().map(ExposeSecret::expose_secret),
+                Some("t")
+            );
         }
     }
 
