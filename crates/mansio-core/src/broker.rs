@@ -141,8 +141,11 @@ pub trait Broker: Send + Sync {
     ///
     /// Returns [`BrokerError::NotFound`] if the tenant or topic does not
     /// exist, [`BrokerError::Forbidden`] for a credential, which may not send
-    /// anywhere, [`BrokerError::Unauthenticated`] if it is not valid, or an
-    /// error if the broker cannot be reached or refuses.
+    /// anywhere, [`BrokerError::Unauthenticated`] if it is not valid,
+    /// [`BrokerError::Rejected`] if the broker named a refusal that comes before
+    /// it stores anything (the message was not stored), or
+    /// [`BrokerError::Unavailable`] for any other failure, after which the
+    /// message may have been stored.
     async fn publish(
         &self,
         caller: &Caller<'_>,
@@ -150,9 +153,11 @@ pub trait Broker: Send + Sync {
     ) -> Result<Option<u64>, BrokerError>;
 
     /// Read up to `max` envelopes from `offset` on, in publish order, as
-    /// `caller`. An offset past the end returns nothing. A `max` of 0 reads
-    /// nothing, and still checks that the topic exists and that the caller
-    /// may read it.
+    /// `caller`. An offset past the end returns nothing. An offset below the
+    /// first message the broker still holds, because retention deleted the head
+    /// of the topic, reads from that first message: a reader that starts at 0
+    /// sees what is left. A `max` of 0 reads nothing, and still checks that the
+    /// topic exists and that the caller may read it.
     ///
     /// # Errors
     ///

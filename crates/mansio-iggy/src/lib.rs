@@ -18,6 +18,7 @@ mod sessions;
 pub use broker::{IggyBroker, SYSTEM_STREAM, SYSTEM_TOPIC};
 pub use config::{
     DEFAULT_ADDRESS, DEFAULT_CONNECT_TIMEOUT, DEFAULT_LOCATE_WINDOW, DEFAULT_PRESENCE_RETENTION,
-    DEFAULT_USERNAME, Durability, DurabilityPolicy, IggyConfig, Retention,
+    DEFAULT_USERNAME, Durability, DurabilityPolicy, IggyConfig, MAX_SEGMENT_SIZE_BYTES,
+    MIN_SEGMENT_SIZE_BYTES, Retention, check_segment_size,
 };
 pub use provision::{ProvisionConfig, Provisioned, provision_admin};
