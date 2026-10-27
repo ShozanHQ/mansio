@@ -64,7 +64,9 @@ name: mansio
 
 services:
   iggy:
-    image: apache/iggy:0.9.0
+    # Pinned by digest, with the tag kept to read. Dependabot moves both. The
+    # scheduled workflow also runs the end-to-end suite against apache/iggy:edge.
+    image: apache/iggy:0.9.0@sha256:b35fc2841964f2962a5f164d33b3ae3a9de99a66920defd3cd8a1c039470602d
     restart: unless-stopped
     # What Iggy's io_uring runtime needs, as in Iggy's own compose file.
     cap_add:

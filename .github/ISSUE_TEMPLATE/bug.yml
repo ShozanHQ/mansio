@@ -1,0 +1,53 @@
+name: Bug
+description: mansio does something other than what the README or ARCHITECTURE.md says
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Not a vulnerability, please. Report one privately through
+        [private vulnerability reporting](https://github.com/ShozanHQ/mansio/security/advisories/new).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: What you did and what you saw. Include the request or command, and the answer.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: And where the README or ARCHITECTURE.md says so, if it does.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce it
+      description: The smallest steps that show it, with the settings that matter.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The commit of `main` or the release you ran.
+    validations:
+      required: true
+  - type: dropdown
+    id: broker
+    attributes:
+      label: Broker
+      options:
+        - The in-memory broker (MANSIO_BROKER=memory)
+        - Apache Iggy, through compose
+        - Apache Iggy, run another way
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: The server's log around the failure. Remove tokens, credentials and webhook secrets first.
+      render: text

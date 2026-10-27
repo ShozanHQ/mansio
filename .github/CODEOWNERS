@@ -1,0 +1,36 @@
+# Code owners. A change to a path below needs a review from its owner before it
+# can merge. Only two kinds of path are listed, on purpose:
+#
+#   the rules the project runs under: the workflows and the repository's own
+#   configuration, the dependency policy, the toolchain and lint profile, the
+#   workspace manifest (it holds the workspace lints and the release profile),
+#   and the image and compose definitions;
+#
+#   the security boundary: the code that issues, checks and revokes credentials,
+#   decides what a credential may do, keeps sessions with the broker, makes the
+#   broker's users, and keeps the registry of principals.
+#
+# Everything else gets the ordinary review of any pull request. A path is added
+# here when a mistake in it would change what the project allows, not because
+# it is important.
+
+# The rules
+/.github/              @snowloops
+/deny.toml             @snowloops
+/rust-toolchain.toml   @snowloops
+/clippy.toml           @snowloops
+/Cargo.toml            @snowloops
+/Dockerfile            @snowloops
+/compose.yaml          @snowloops
+
+# The security boundary
+/crates/mansio-core/src/access.rs        @snowloops
+/crates/mansio-core/src/credential.rs    @snowloops
+/crates/mansio-core/src/principal.rs     @snowloops
+/crates/mansio-iggy/src/access.rs        @snowloops
+/crates/mansio-iggy/src/sessions.rs      @snowloops
+/crates/mansio-iggy/src/provision.rs     @snowloops
+/crates/mansio-server/src/auth.rs        @snowloops
+/crates/mansio-server/src/credentials.rs @snowloops
+/crates/mansio-server/src/registry.rs    @snowloops
+/crates/mansio-server/src/records.rs     @snowloops

@@ -1,0 +1,38 @@
+name: Feature
+description: Something mansio should do that it does not
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do and cannot, or can only with work you would rather not do.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you propose
+      description: The behaviour you would like, on the HTTP API, the CLI and the MCP server, which share one set of operations.
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: Done when
+      description: One line for each thing that is true when this is finished. These become the checklist of the pull request.
+      placeholder: |
+        - A consumer can ...
+        - The README says ...
+    validations:
+      required: true
+  - type: textarea
+    id: settings
+    attributes:
+      label: Limits and switches
+      description: Every limit, interval, count or switch is a named setting with a default. Which would this need?
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: What else you considered, including doing it outside mansio.

@@ -1,0 +1,63 @@
+name: scheduled
+
+# Two checks that no change to the repository triggers. A new advisory can
+# fail cargo-deny against a lockfile that has not changed, and Iggy's next
+# build can break the end-to-end suite before mansio has moved. Both run on
+# the default branch, and by hand from the Actions tab.
+
+on:
+  schedule:
+    # Every day, 05:17 UTC: cargo deny.
+    - cron: "17 5 * * *"
+    # Mondays, 05:43 UTC: the end-to-end suite against Iggy's edge build.
+    - cron: "43 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # The deny job of ci.yml, against today's advisory database.
+  deny:
+    # Not named as the required check of ci.yml, so as not to be taken for it.
+    name: cargo deny, daily
+    if: github.event_name != 'schedule' || github.event.schedule == '17 5 * * *'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --all-features --locked
+
+  # The e2e job of ci.yml with the image of Iggy overridden: compose.yaml pins
+  # a release by digest, and this run starts apache/iggy:edge instead. It
+  # reports and never blocks: continue-on-error keeps a failure here from
+  # failing the workflow run. A failure that stays is a reason to look at what
+  # Iggy changed before the next release of it.
+  e2e-edge:
+    name: e2e against Iggy edge
+    if: github.event_name != 'schedule' || github.event.schedule == '43 5 * * 1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Override the image of Iggy in compose.yaml with apache/iggy:edge
+        run: |
+          override="$RUNNER_TEMP/compose.iggy-edge.yaml"
+          printf 'services:\n  iggy:\n    image: apache/iggy:edge\n' > "$override"
+          echo "COMPOSE_FILE=$GITHUB_WORKSPACE/compose.yaml:$override" >> "$GITHUB_ENV"
+      - name: Pull Iggy's edge build and say which one it is
+        run: |
+          docker compose pull iggy
+          docker image inspect --format '{{index .RepoDigests 0}}' apache/iggy:edge
+      - name: Start Iggy and mansio-server, run the end-to-end suite through compose, stop the stack
+        uses: ./.github/actions/e2e
