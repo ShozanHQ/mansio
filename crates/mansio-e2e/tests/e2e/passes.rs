@@ -176,7 +176,7 @@ async fn restart_after(target: &Target, state: &Value) -> anyhow::Result<()> {
     // of a stranger (403), and it has not been forgotten (409).
     assert!(target.pull(QUEUE, AFTER).await?.is_none());
     let stranger = LeaseId::generate().to_string();
-    let (status, body) = target.ack(QUEUE, &held, &stranger).await?;
+    let (status, body) = target.ack(QUEUE, &held, BEFORE, &stranger).await?;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     let late = now_millis()?;
     ensure!(
@@ -270,6 +270,7 @@ async fn a_long_queue_survives_a_restart_across_pages_and_the_lease_still_holds(
             lease: Duration::from_secs(5),
             ..LocalSettings::default().work
         },
+        ..LocalSettings::default()
     };
     let mut target = Target::start_with(settings).await?;
     if !target.is_local() {
