@@ -143,8 +143,12 @@ so do not publish it again. Poll and match on the envelope's `id` to find it.
 
 A refusal is `{"error":{"code":"...","message":"..."}}` with status 400, 401
 (no valid credential), 403 (a valid credential that may not do this, or a lease
-that is not yours), 404, 409, 413, 502 or 503. A 502 or 503 is also logged at
-`warn` with the tenant, the topic and what the broker or the sink said.
+that is not yours), 404, 409, 413, 502 or 503. A 502 is a refusal the broker
+named before it stored anything: nothing was stored. A 503 is every other
+failure of the broker or the sink, including an answer from Iggy that does not
+say whether it applied the request, so a write that gets a 503 may have been
+stored: send it again with the same `id`. A 502 or 503 is also logged at `warn`
+with the tenant, the topic and what the broker or the sink said.
 
 `GET /v1/settings` answers with the settings the server runs with, none of
 them secret: the work and credential settings below and the API limits.
@@ -154,9 +158,9 @@ them secret: the work and credential settings below and the API limits.
 Iggy is offset-based and has no per-message claim, acknowledgement, redelivery
 or dead letters. mansio builds them, and records every transition as an
 envelope on `facts.work` and in the sink. Work does not go through the generic
-messages route, which refuses `work.<queue>`, `facts.work`, `facts.alert` and
-`facts.principal`.
-The operations are `work_publish`, `work_pull`, `work_ack` and `work_fail`.
+messages route, which refuses `work.<queue>` and the topics mansio writes
+itself: `facts.work`, `facts.alert`, `facts.principal` and `dead`. The
+operations are `work_publish`, `work_pull`, `work_ack` and `work_fail`.
 
 ```sh
 # work_publish: the item is named by the id of its message, and starts at attempt 1.
@@ -204,8 +208,8 @@ curl ... -d '{"lease_id":"<uuid>","consumer":"worker-1","reason":"out of memory"
 - A client that gets a 503 from `work_publish` or `alerts_publish` cannot tell
   whether the message was stored. It sends it again with the same `id`: a 409
   then means the first attempt was stored, and there is nothing to resend.
-  Without an `id` the resend is a new item. A 502 is a refusal: nothing was
-  stored.
+  Without an `id` the resend is a new item. A 502 is a refusal the broker
+  named before it stored anything: nothing was stored.
 - A restarted server rebuilds all of this from `work.<queue>`, `facts.work`
   and `dead`, so it drops no item and republishes none twice. A publish that
   fails may still have been stored, so the server rebuilds the tenant from the
@@ -213,7 +217,10 @@ curl ... -d '{"lease_id":"<uuid>","consumer":"worker-1","reason":"out of memory"
   A message in a topic that cannot be read is skipped, with a warning. Keep
   `MANSIO_RETENTION_FACTS_SECONDS` no shorter than `MANSIO_RETENTION_WORK_SECONDS`:
   an item whose facts were deleted while its message was not is claimable
-  again.
+  again. Iggy deletes expired messages a whole segment at a time, and only
+  after the segment has filled and rolled (see `MANSIO_IGGY_SEGMENT_SIZE_BYTES`);
+  Iggy 0.9 answers a read from offset 0 of a topic whose head it has deleted
+  with the first message left, so the rebuild sees everything that remains.
 
 The transitions are `mansio.work.claimed`, `.acked`, `.failed`, `.expired`,
 `.retried` and `.dead` on `facts.work`, with the item id as `subject`, and
@@ -400,6 +407,7 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_IGGY_PASSWORD` | none, required with `iggy` | Its password. |
 | `MANSIO_IGGY_CONNECT_TIMEOUT_SECONDS` | `60` | How long startup waits for Iggy. |
 | `MANSIO_IGGY_LOCATE_WINDOW` | `100` | How many recent messages to search, by message id, when Iggy accepts a publish without saying where it landed. 0 turns the search off. A message that is not found is still answered with 201, without an offset. |
+| `MANSIO_IGGY_SEGMENT_SIZE_BYTES` | `0` | The segment size Iggy gives the topics mansio creates. 0 leaves it to Iggy, which uses 1 GiB. Otherwise a multiple of 512 from 1048576 (1 MiB) to 1073741824. Iggy applies retention to whole segments that have filled and rolled, never to the one it is writing, so this is how coarsely the `MANSIO_RETENTION_*` settings trim a topic. Applied when a topic is created. |
 | `MANSIO_IGGY_DURABILITY` | `persisted` | When Iggy confirms a write to `facts.*`, `work.*`, `alerts` and `dead`: `persisted` or `replicated`. See [Durability](#durability). |
 | `MANSIO_IGGY_PRESENCE_DURABILITY` | `replicated` | The same for `presence`, which is ephemeral. |
 | `MANSIO_RETENTION_FACTS_SECONDS` | `0` | How long Iggy keeps `facts.*` messages. 0 keeps them forever. |
@@ -449,10 +457,13 @@ it creates, and leaves the flush thresholds at Iggy's defaults.
 | Variable | Default | Meaning |
 |---|---|---|
 | `MANSIO_E2E_URL` | unset | A running server for `mansio-e2e` to use, with `MANSIO_TOKEN` set to its token. Unset starts a server in the test process on the memory broker, with a lease of 2 s, 3 attempts, a backoff from 1 s to 4 s, alerts surfaced every 2 s, and an agent credential that lasts 3 s, is checked every second and swept every second. Against a running server the tests read its settings from `GET /v1/settings`. |
+| `MANSIO_E2E_STATE_DIR` | unset | A directory that the first and second passes of the restart and retention tests (see [Develop](#develop)) keep their state in. Required by those tests, which fail without it. |
 | `MANSIO_E2E_SINK_PATH` | unset | The sink file of the running server, as the test process can read it. With it the tests also check the order of the sink; without it they check the topics only. |
 | `MANSIO_E2E_IGGY_ADDRESS` | unset | Iggy's TCP address as the test process reaches it (`127.0.0.1:8090` for `compose.yaml`). With `MANSIO_E2E_URL` set it is required: the credential tests ask Iggy itself, without mansio-server, what a credential may do, and fail if they cannot. Without `MANSIO_E2E_URL` they ask the memory broker. |
 | `MANSIO_SINK_DIR` | the `sink` volume | A directory on the host for `compose.yaml` to keep the sink file in, so that a test can read it. |
-| `MANSIO_LEASE_SECONDS`, the other work settings and the credential settings above | the defaults | Passed through by `compose.yaml` to mansio-server, so a test run can use short ones. Against a running server the tests read them from `GET /v1/settings`. |
+| `MANSIO_LEASE_SECONDS`, the other work settings and the credential settings above, `MANSIO_POLL_DEFAULT_COUNT`, `MANSIO_POLL_MAX_COUNT`, `MANSIO_IGGY_SEGMENT_SIZE_BYTES` and `MANSIO_RETENTION_ALERTS_SECONDS` | the defaults | Passed through by `compose.yaml` to mansio-server, so a test run can use short ones. Against a running server the tests read them from `GET /v1/settings`. |
+| `MANSIO_HEALTH_START_PERIOD` | `60s` | How long `compose.yaml` lets mansio-server fail its health check after it starts before it counts the failures. A start replays the topics of every tenant before the server answers, and `/healthz` is dark until it has, so a long replay needs a long period. |
+| `IGGY_DATA_MAINTENANCE_MESSAGES_INTERVAL` | `1 m` | How often Iggy's segment cleaner looks for expired segments, read by `compose.yaml` for the `iggy` service. The retention test sets it to seconds. |
 | `IGGY_ROOT_USERNAME`, `IGGY_ROOT_PASSWORD` | `iggy`, `iggy` | Iggy's root user, read by `compose.yaml` for Iggy and `iggy-admin` only. Development defaults. |
 | `MANSIO_IGGY_USERNAME`, `MANSIO_IGGY_PASSWORD` | `mansio`, `mansio-dev-admin` | The Iggy user mansio-server acts as, read by `compose.yaml` for `iggy-admin` and mansio-server. Development defaults. |
 | `IGGY_PORT` | `8090` | The port on `127.0.0.1` that `compose.yaml` publishes Iggy's TCP port on. |
@@ -487,6 +498,23 @@ docker compose down --volumes
 The default work and credential settings make a test of a lease, a backoff or an
 expiry take minutes, so set short ones as above. The tests that stop and start
 the server run only against the in-process one.
+
+The tests that need Iggy to hold real messages across a restart come in pairs
+of passes, `restart_first_pass` and `restart_second_pass`, `retention_first_pass`
+and `retention_second_pass` in `crates/mansio-e2e/tests/e2e/passes.rs`. They are
+`#[ignore]`d, so a plain `cargo test` leaves them alone, and they fail, not
+skip, without `MANSIO_E2E_URL` or `MANSIO_E2E_STATE_DIR`. The `e2e` job in
+`.github/workflows/ci.yml` runs them in order: it recreates mansio-server with
+pages of 5, a lease of 30 s, a segment of 1 MiB and alerts kept for 5 s, runs
+the two first passes, restarts mansio-server (`docker compose restart`), and
+runs the two second passes. The restart pair publishes a queue longer than
+`MANSIO_POLL_MAX_COUNT`, claims one item, and after the restart checks that
+the lease still holds, that the item is retried exactly once after it and that
+every other item can be claimed once. The retention pair fills and rolls a
+segment of `alerts`, waits for Iggy to delete it, publishes another alert, and
+after the restart checks that the server's rebuild, which reads from offset 0,
+finds the alerts that are left. The same checks as the restart pair run in one
+process, against the in-process server, on every `cargo test`.
 
 ## Licence
 

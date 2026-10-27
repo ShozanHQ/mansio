@@ -756,6 +756,23 @@ mod tests {
                 URI.replace("facts.build", "work.builds"),
                 MINIMAL.to_owned(),
             ),
+            // The topics the engine writes are not published to: a copy on
+            // `dead` would end an open item.
+            (
+                Method::POST,
+                URI.replace("facts.build", "dead"),
+                MINIMAL.to_owned(),
+            ),
+            (
+                Method::POST,
+                URI.replace("facts.build", "facts.work"),
+                MINIMAL.to_owned(),
+            ),
+            (
+                Method::POST,
+                URI.replace("facts.build", "facts.alert"),
+                MINIMAL.to_owned(),
+            ),
             (
                 Method::POST,
                 item.to_owned(),

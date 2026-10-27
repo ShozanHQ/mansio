@@ -99,6 +99,9 @@ jobs:
       MANSIO_AGENT_CREDENTIAL_TTL_SECONDS: "5"
       MANSIO_CREDENTIAL_RECHECK_SECONDS: "2"
       MANSIO_CREDENTIAL_SWEEP_SECONDS: "2"
+      # Iggy's cleaner looks for expired segments this often (a minute by
+      # default), for the retention test further down.
+      IGGY_DATA_MAINTENANCE_MESSAGES_INTERVAL: 2s
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Install the toolchain pinned in rust-toolchain.toml
@@ -110,10 +113,43 @@ jobs:
           chmod 777 "$RUNNER_TEMP/mansio-sink"
           echo "MANSIO_SINK_DIR=$RUNNER_TEMP/mansio-sink" >> "$GITHUB_ENV"
           echo "MANSIO_E2E_SINK_PATH=$RUNNER_TEMP/mansio-sink/sink.jsonl" >> "$GITHUB_ENV"
+      - name: A directory for what the two-pass tests leave for each other
+        run: |
+          mkdir -p "$RUNNER_TEMP/mansio-state"
+          echo "MANSIO_E2E_STATE_DIR=$RUNNER_TEMP/mansio-state" >> "$GITHUB_ENV"
       - name: Start Iggy, make mansio's Iggy user, and start mansio-server
         run: docker compose up --build --wait
       - name: Publish, poll, claim, retry, acknowledge and issue credentials through Iggy
         run: cargo test -p mansio-e2e --locked
+      # The two-pass tests: a first pass leaves work and alerts in Iggy, the
+      # server is restarted, and a second pass checks what the new server made
+      # of them. They are #[ignore]d and selected by name, and they fail
+      # without a live server and a state directory.
+      - name: A server with pages of 5, a lease of 30 s, and a segment of 1 MiB and alerts kept 5 s
+        env:
+          MANSIO_LEASE_SECONDS: "30"
+          MANSIO_POLL_DEFAULT_COUNT: "5"
+          MANSIO_POLL_MAX_COUNT: "5"
+          MANSIO_IGGY_SEGMENT_SIZE_BYTES: "1048576"
+          MANSIO_RETENTION_ALERTS_SECONDS: "5"
+        run: docker compose up --detach --wait --no-deps --force-recreate mansio-server
+      - name: Retention, first pass (alerts lose their head to Iggy, then another is published)
+        run: cargo test -p mansio-e2e --locked -- --ignored retention_first_pass
+      - name: Restart, first pass (a queue longer than a page, one item claimed)
+        run: cargo test -p mansio-e2e --locked -- --ignored restart_first_pass
+      - name: Restart mansio-server and wait for /healthz
+        run: |
+          docker compose restart mansio-server
+          for _ in $(seq 1 240); do
+            if curl --fail --silent --max-time 2 --output /dev/null "$MANSIO_E2E_URL/healthz"; then
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "::error::mansio-server did not answer /healthz after the restart"
+          exit 1
+      - name: Restart and retention, second pass (the lease holds, the retry happens once, the alerts are known)
+        run: cargo test -p mansio-e2e --locked -- --ignored restart_second_pass retention_second_pass
       - name: Compose logs
         if: failure()
         run: docker compose logs --no-color

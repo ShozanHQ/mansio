@@ -372,6 +372,7 @@ async fn work_is_published_through_work_publish_only() -> anyhow::Result<()> {
         "facts.work",
         "facts.alert",
         "facts.principal",
+        "dead",
     ] {
         let (status, body) = target
             .authed(Method::POST, &target.messages_uri(topic), Some(&job(1)))

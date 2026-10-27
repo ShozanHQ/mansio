@@ -12,6 +12,7 @@ mod alerts;
 mod credentials;
 mod harness;
 mod ordering;
+mod passes;
 mod restart;
 mod work;
 
