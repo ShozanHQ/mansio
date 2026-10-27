@@ -26,3 +26,7 @@ All notable changes to mansio are listed here. The format follows
 - `compose.yaml` and a `Dockerfile` that start Iggy 0.9.0 and mansio-server.
 - CI: format, clippy, test, `cargo-deny`, licence and naming checks, and an
   end-to-end run through Iggy.
+- `MANSIO_IGGY_DURABILITY` and `MANSIO_IGGY_PRESENCE_DURABILITY`, choosing
+  `persisted` or `replicated` for the durable topics and for `presence`.
+- The publish answer's `offset` is optional: left out when Iggy does not say
+  where the message landed and it is not among the recent ones.
