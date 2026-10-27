@@ -58,6 +58,7 @@ pub const SLACK: Duration = Duration::from_secs(15);
 fn local_work_settings() -> WorkSettings {
     WorkSettings {
         lease: Duration::from_secs(2),
+        lease_max: Duration::from_secs(60),
         max_attempts: 3,
         backoff_base: Duration::from_secs(1),
         backoff_cap: Duration::from_secs(4),
@@ -442,6 +443,24 @@ impl Target {
         self.authed(Method::POST, &uri, Some(&body)).await
     }
 
+    /// `work_extend`, answering whatever the server says. Without `seconds`
+    /// the lease runs for the server's lease setting from now.
+    pub async fn extend(
+        &self,
+        queue: &str,
+        item: &str,
+        consumer: &str,
+        lease: &str,
+        seconds: Option<u64>,
+    ) -> anyhow::Result<(StatusCode, Value)> {
+        let uri = self.tenant_uri(&format!("work/{queue}/items/{item}/extend"));
+        let mut body = json!({ "lease_id": lease, "consumer": consumer });
+        if let Some(seconds) = seconds {
+            body["seconds"] = json!(seconds);
+        }
+        self.authed(Method::POST, &uri, Some(&body)).await
+    }
+
     /// `work_fail`, answering whatever the server says.
     pub async fn fail(
         &self,
@@ -470,6 +489,30 @@ impl Target {
         ensure!(
             status == StatusCode::OK,
             "work_ack answered {status}: {response}"
+        );
+        Ok(serde_json::from_value(response)?)
+    }
+
+    /// Extend a claim, which must be accepted: the `extended` fact.
+    pub async fn extend_claim(
+        &self,
+        queue: &str,
+        claim: &Claimed,
+        seconds: Option<u64>,
+    ) -> anyhow::Result<Published> {
+        let item = item_of(claim)?;
+        let (status, response) = self
+            .extend(
+                queue,
+                &item,
+                claim.consumer.as_str(),
+                &claim.lease_id.to_string(),
+                seconds,
+            )
+            .await?;
+        ensure!(
+            status == StatusCode::OK,
+            "work_extend answered {status}: {response}"
         );
         Ok(serde_json::from_value(response)?)
     }
@@ -582,6 +625,11 @@ impl Target {
 
     pub fn lease(&self) -> Duration {
         Duration::from_secs(self.settings.lease_seconds)
+    }
+
+    /// The longest a lease may run from its claim, from the settings.
+    pub fn lease_max(&self) -> Duration {
+        Duration::from_secs(self.settings.lease_max_seconds)
     }
 
     /// One timer tick, and a little for a round trip: how long to wait to
@@ -1123,6 +1171,16 @@ impl Issued {
         self.call(Method::POST, &uri, Some(&body)).await
     }
 
+    /// `work_extend` of a claim that `pull` answered with.
+    pub async fn extend(&self, queue: &str, claim: &Value) -> anyhow::Result<(StatusCode, Value)> {
+        let item = claim["item"]["itemid"]
+            .as_str()
+            .context("a claim names its item")?;
+        let uri = self.tenant_uri(&self.tenant, &format!("work/{queue}/items/{item}/extend"));
+        let body = json!({"lease_id": claim["lease_id"], "consumer": claim["consumer"]});
+        self.call(Method::POST, &uri, Some(&body)).await
+    }
+
     /// `alerts_ack`.
     pub async fn alert_ack(&self, alert: &str) -> anyhow::Result<(StatusCode, Value)> {
         let uri = self.tenant_uri(&self.tenant, &format!("alerts/{alert}/ack"));
@@ -1208,6 +1266,23 @@ pub fn millis(timestamp: &Timestamp) -> anyhow::Result<i64> {
     timestamp
         .unix_millis()
         .context("a timestamp inside the range of milliseconds")
+}
+
+/// Where the lease ends, in milliseconds since the epoch, as an `extended`
+/// fact says.
+pub fn extended_to(fact: &Published) -> anyhow::Result<i64> {
+    ensure!(
+        fact.envelope.event_type.as_str() == "mansio.work.extended",
+        "not an extended fact: {}",
+        fact.envelope.event_type
+    );
+    let ends = fact
+        .envelope
+        .data
+        .as_ref()
+        .and_then(|data| data.get("expires_at"))
+        .context("an extended fact says where the lease ends")?;
+    millis(&serde_json::from_value(ends.clone())?)
 }
 
 /// A work item body with a type and a payload.

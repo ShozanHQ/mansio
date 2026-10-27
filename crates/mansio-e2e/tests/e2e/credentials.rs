@@ -82,6 +82,10 @@ async fn an_agent_credential_publishes_to_its_build_and_claims_from_its_queue_an
     let (status, claim) = agent.pull("builds").await?;
     assert_eq!(status, StatusCode::OK, "{claim}");
     assert_eq!(claim["item"]["topic"], "work.builds");
+    let (status, extended) = agent.extend("builds", &claim).await?;
+    assert_eq!(status, StatusCode::OK, "{extended}");
+    assert_eq!(extended["envelope"]["type"], "mansio.work.extended");
+    assert_eq!(extended["envelope"]["principalname"], "builder-1");
     let (status, acked) = agent.ack("builds", &claim).await?;
     assert_eq!(status, StatusCode::OK, "{acked}");
     assert_eq!(agent.pull("builds").await?.0, StatusCode::NO_CONTENT);
@@ -96,6 +100,7 @@ async fn an_agent_credential_publishes_to_its_build_and_claims_from_its_queue_an
         ("publish to its queue", agent.publish("work.builds").await?),
         ("work_publish", agent.work_publish("builds").await?),
         ("claim elsewhere", agent.pull("reviews").await?),
+        ("extend elsewhere", agent.extend("reviews", &claim).await?),
         ("read elsewhere", agent.poll("work.reviews").await?),
         ("read facts", agent.poll("facts.work").await?),
         (
@@ -135,7 +140,7 @@ async fn an_agent_credential_publishes_to_its_build_and_claims_from_its_queue_an
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     // The refusals changed nothing: one message on its topic, nothing on the
-    // others, and the claim and its ack in the facts under the agent's name.
+    // others, and the claim, its extension and its ack in the facts under the agent's name.
     assert_eq!(target.read("facts.build").await?.len(), 1);
     assert_eq!(target.read("facts.other").await?.len(), 1);
     assert_eq!(target.read("alerts").await?.len(), 1);
@@ -146,7 +151,7 @@ async fn an_agent_credential_publishes_to_its_build_and_claims_from_its_queue_an
             .iter()
             .map(|fact| fact.principal.to_string())
             .collect::<Vec<_>>(),
-        ["agent:builder-1", "agent:builder-1"]
+        ["agent:builder-1", "agent:builder-1", "agent:builder-1"]
     );
     // Identity is the credential's alone: a body cannot say otherwise.
     let uri = target.messages_uri("facts.build");

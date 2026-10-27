@@ -38,8 +38,13 @@ pub(crate) struct Lease {
     pub(crate) id: Option<Remembered>,
     pub(crate) holder: Principal,
     pub(crate) consumer: ConsumerName,
-    /// Milliseconds since the Unix epoch.
+    /// When the lease ends, in milliseconds since the Unix epoch. An extension
+    /// moves it later.
     pub(crate) expires_at: i64,
+    /// When the item was claimed, in milliseconds since the Unix epoch. The
+    /// longest a lease may run is counted from here, however often it is
+    /// extended.
+    pub(crate) claimed_at: i64,
 }
 
 /// What becomes of an item once the fact it owes is recorded.
@@ -383,6 +388,7 @@ mod tests {
             holder: "service:test".parse().unwrap(),
             consumer: "w".parse().unwrap(),
             expires_at: 10,
+            claimed_at: 0,
         };
         queue.set_phase(&a, Phase::Leased(lease));
         assert_eq!(queue.oldest_ready(), Some(&b));
@@ -464,6 +470,7 @@ mod tests {
             holder: holder.clone(),
             consumer: consumer.clone(),
             expires_at: 1000,
+            claimed_at: 0,
         };
         let leased = item(Phase::Leased(lease));
         let who = |principal, consumer, lease_id| Holder {

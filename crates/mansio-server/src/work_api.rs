@@ -1,7 +1,8 @@
 //! The HTTP handlers for work items and alerts: `work_publish`, `work_pull`,
-//! `work_ack`, `work_fail`, `alerts_publish` and `alerts_ack`.
+//! `work_extend`, `work_ack`, `work_fail`, `alerts_publish` and `alerts_ack`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::rejection::{BytesRejection, PathRejection};
@@ -9,7 +10,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use mansio_core::api::{AckRequest, FailRequest, Published, PullRequest};
+use mansio_core::api::{AckRequest, ExtendRequest, FailRequest, Published, PullRequest};
 use mansio_core::{Action, BrokerError, ConsumerName, ItemId, LeaseId, Segment, TenantId, Topic};
 
 use crate::app::{AppState, Origin, build_envelope, parse_body, parse_part, read_body};
@@ -98,6 +99,42 @@ pub(crate) async fn work_pull(
         Some(claimed) => Json(claimed).into_response(),
         None => StatusCode::NO_CONTENT.into_response(),
     })
+}
+
+/// `POST /v1/tenants/{tenant}/work/{queue}/items/{item}/extend`: move the end
+/// of the holder's lease later. 200 with the `extended` fact, whose
+/// `data.expires_at` is the new end.
+pub(crate) async fn work_extend(
+    State(state): State<Arc<AppState>>,
+    Authenticated(actor): Authenticated,
+    path: Result<Path<(String, String, String)>, PathRejection>,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<Published>, ApiError> {
+    let Path((tenant, queue, item)) = path.map_err(|e| path_error(&e))?;
+    let (tenant, queue, item): (TenantId, Segment, ItemId) = (
+        parse_part(&tenant)?,
+        parse_part(&queue)?,
+        parse_part(&item)?,
+    );
+    actor.authorize(Action::Claim, &tenant, &Topic::Work(queue.clone()))?;
+    let request: ExtendRequest = parse_body(&read_body(&state, body)?)?;
+    if request.seconds == Some(0) {
+        return Err(ApiError::BadRequest(
+            "seconds must be at least 1".to_owned(),
+        ));
+    }
+    let published = state
+        .engine
+        .work_extend(
+            &tenant,
+            &queue,
+            &item,
+            holder(&actor, &request.consumer, &request.lease_id),
+            request.seconds.map(Duration::from_secs),
+        )
+        .await
+        .map_err(|error| error.logged(&tenant, &Topic::Work(queue.clone())))?;
+    Ok(Json(published))
 }
 
 /// `POST /v1/tenants/{tenant}/work/{queue}/items/{item}/ack`.

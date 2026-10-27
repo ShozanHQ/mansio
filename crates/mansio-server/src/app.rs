@@ -279,6 +279,10 @@ impl Server {
                 post(work_api::work_pull),
             )
             .route(
+                "/v1/tenants/{tenant}/work/{queue}/items/{item}/extend",
+                post(work_api::work_extend),
+            )
+            .route(
                 "/v1/tenants/{tenant}/work/{queue}/items/{item}/ack",
                 post(work_api::work_ack),
             )
@@ -387,6 +391,7 @@ async fn settings(
     let seconds = |d: std::time::Duration| d.as_secs();
     Json(EffectiveSettings {
         lease_seconds: seconds(work.lease),
+        lease_max_seconds: seconds(work.lease_max),
         max_attempts: work.max_attempts,
         backoff_base_seconds: seconds(work.backoff_base),
         backoff_cap_seconds: seconds(work.backoff_cap),
@@ -995,6 +1000,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let settings: mansio_core::api::EffectiveSettings = serde_json::from_value(body).unwrap();
         assert_eq!(settings.lease_seconds, 300);
+        assert_eq!(settings.lease_max_seconds, 86_400);
         assert_eq!(settings.max_attempts, 5);
         assert_eq!(settings.backoff_base_seconds, 5);
         assert_eq!(settings.backoff_cap_seconds, 300);

@@ -192,6 +192,7 @@ mod parity {
             "poll",
             "work_publish",
             "work_pull",
+            "work_extend",
             "work_ack",
             "work_fail",
             "alerts_publish",
