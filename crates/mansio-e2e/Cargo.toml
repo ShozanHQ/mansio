@@ -10,6 +10,8 @@ publish = false
 
 [dev-dependencies]
 anyhow.workspace = true
+# The in-process server runs over a broker that wraps the memory broker.
+async-trait.workspace = true
 hmac.workspace = true
 iggy.workspace = true
 mansio-core.workspace = true

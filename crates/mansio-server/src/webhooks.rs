@@ -109,6 +109,9 @@ fn not_loaded() -> ApiError {
 struct Loading {
     failures: u32,
     retry_at: Option<i64>,
+    /// What the last failure said, so that a failure with another cause is
+    /// logged again.
+    cause: Option<String>,
 }
 
 /// A run of failures of one thing a task does, in the log and in the wait. The
@@ -569,12 +572,17 @@ impl Webhooks {
                 );
                 loading.retry_at =
                     Some(now.saturating_add(i64::try_from(wait.as_millis()).unwrap_or(i64::MAX)));
-                if loading.failures == 1 {
+                // Logged when a run of failures starts, and again when what
+                // goes wrong changes: a broker that is down and a record that
+                // cannot be read are different things to put right.
+                let said = cause.to_string();
+                if loading.cause.as_deref() != Some(said.as_str()) {
                     tracing::error!(
                         %cause,
                         retry_seconds = wait.as_secs(),
                         "the registry of webhooks could not be loaded; no webhook is delivered until it is"
                     );
+                    loading.cause = Some(said);
                 }
                 Err(not_loaded())
             }
@@ -1046,6 +1054,38 @@ mod tests {
         for expected in ["ERROR", "offset 1", "version 2", "retry_seconds=2"] {
             assert!(logged.contains(expected), "{expected} is not in {logged}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_load_failure_is_logged_again_when_its_cause_changes_and_not_when_it_repeats() {
+        let (logs, _guard) = Logs::capture().await;
+        let rig = rig(Duration::from_secs(2), Duration::from_secs(2));
+        let attempt = || async {
+            rig.clock.advance(Duration::from_secs(2));
+            assert!(is_unavailable(rig.webhooks.load().await));
+        };
+        let said = || logs.text().matches("could not be loaded").count();
+
+        // The broker fails twice: logged once.
+        rig.broker
+            .webhook_log_reads_to_fail
+            .store(2, Ordering::SeqCst);
+        attempt().await;
+        attempt().await;
+        assert_eq!(said(), 1, "{}", logs.text());
+
+        // Then the broker answers, and the log holds a record that cannot be
+        // read: another cause, logged again, and once however often it repeats.
+        rig.broker
+            .system_append(SystemLog::Webhooks, b"not a record")
+            .await
+            .unwrap();
+        attempt().await;
+        assert_eq!(said(), 2, "{}", logs.text());
+        attempt().await;
+        attempt().await;
+        assert_eq!(said(), 2, "{}", logs.text());
+        assert!(logs.text().contains("offset 0"));
     }
 
     #[tokio::test]
