@@ -10,9 +10,13 @@
 //! see itself still takes effect within that time.
 //!
 //! The registry of principals is rebuilt from the server's log in the broker
-//! on first use.
+//! on first use. If it cannot be, because the broker cannot be reached or a
+//! record of the log cannot be read, no credential is accepted (503) and
+//! nothing is deleted or revoked until it can be: a registry that is not known
+//! must not be mistaken for an empty one.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -21,9 +25,9 @@ use mansio_core::{
     Broker, BrokerError, BrokerUser, Credential, Principal, PrincipalEvent, PrincipalFact,
     PrincipalId, PrincipalInfo, PrincipalKind, RevokeReason, TenantId, Timestamp,
 };
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex, OnceCell};
 use tokio::time::MissedTickBehavior;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::auth::Actor;
 use crate::clock::Clock;
@@ -62,6 +66,42 @@ fn is_principal_user(name: &str) -> bool {
     })
 }
 
+/// Why the registry could not be loaded.
+#[derive(Debug)]
+enum LoadError {
+    /// The broker could not be read or asked.
+    Broker(BrokerError),
+    /// A record of the log exists and cannot be read.
+    Unreadable { offset: u64, reason: String },
+}
+
+impl fmt::Display for LoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LoadError::Broker(error) => write!(f, "the broker failed: {error}"),
+            LoadError::Unreadable { offset, reason } => write!(
+                f,
+                "the record at offset {offset} of the registry's log cannot be read: {reason}"
+            ),
+        }
+    }
+}
+
+impl From<BrokerError> for LoadError {
+    fn from(error: BrokerError) -> Self {
+        LoadError::Broker(error)
+    }
+}
+
+/// What a request is told while the registry is not loaded. The cause is in the
+/// server's log, not here, because the caller may not be anyone yet.
+fn not_loaded() -> ApiError {
+    ApiError::Unavailable(
+        "the registry of principals is not loaded, so no credential can be checked; see the server log"
+            .to_owned(),
+    )
+}
+
 /// Credentials: the principals that have one, and who a bearer token is.
 pub struct Credentials {
     broker: Arc<dyn Broker>,
@@ -74,6 +114,10 @@ pub struct Credentials {
     admin: Principal,
     registry: Registry,
     loaded: OnceCell<()>,
+    /// When the last attempt to load the registry failed, in milliseconds
+    /// since the Unix epoch. Held for the whole of an attempt, so that
+    /// requests that arrive during one wait for it and do not start another.
+    failed: Mutex<Option<i64>>,
     /// When the broker last confirmed each principal's credential, in
     /// milliseconds since the Unix epoch.
     checked: StdMutex<HashMap<PrincipalId, i64>>,
@@ -110,6 +154,7 @@ impl Credentials {
             admin,
             registry: Registry::default(),
             loaded: OnceCell::new(),
+            failed: Mutex::new(None),
             checked: StdMutex::default(),
         }
     }
@@ -131,19 +176,53 @@ impl Credentials {
     /// scopes only in memory. A principal the broker cannot find is withdrawn,
     /// and its user is deleted first, as it may be there all the same. A
     /// broker user made for a principal that the log does not know is deleted:
-    /// one whose record could not be read, or that was made just before the
-    /// server stopped.
+    /// one made just before the server stopped. Only a log that was read to
+    /// its end is taken to say who is a principal, so no user is deleted, and
+    /// no principal withdrawn for an unknown reason, while a record cannot be
+    /// read.
+    ///
+    /// A failed attempt is logged at error with its cause, and not tried again
+    /// for `MANSIO_CREDENTIAL_RECHECK_SECONDS`: requests in that time are
+    /// refused at once, so that a log that cannot be read is not read again by
+    /// every request, and the log gets one line an interval, not one a request.
     ///
     /// # Errors
     ///
-    /// Returns an error if the log cannot be read or the broker cannot be
-    /// reached. The next call tries again.
+    /// Returns 503 if the log cannot be read, a record of it cannot be read,
+    /// or the broker cannot be reached.
     pub async fn load(&self) -> Result<(), ApiError> {
-        self.loaded.get_or_try_init(|| self.rebuild()).await?;
-        Ok(())
+        if self.loaded.initialized() {
+            return Ok(());
+        }
+        let mut failed = self.failed.lock().await;
+        if self.loaded.initialized() {
+            return Ok(());
+        }
+        let now = self.clock.now_millis();
+        let wait = millis(self.settings.recheck);
+        if failed.is_some_and(|at| (0..wait).contains(&now.saturating_sub(at))) {
+            return Err(not_loaded());
+        }
+        match self.rebuild().await {
+            Ok(()) => {
+                // Held under `failed`, so no other attempt is racing this one.
+                let _ = self.loaded.set(());
+                *failed = None;
+                Ok(())
+            }
+            Err(cause) => {
+                error!(
+                    %cause,
+                    retry_seconds = self.settings.recheck.as_secs(),
+                    "the registry of principals could not be loaded; credentials are refused until it is"
+                );
+                *failed = Some(now);
+                Err(not_loaded())
+            }
+        }
     }
 
-    async fn rebuild(&self) -> Result<(), ApiError> {
+    async fn rebuild(&self) -> Result<(), LoadError> {
         self.registry.clear();
         let mut offset = 0;
         loop {
@@ -151,14 +230,12 @@ impl Credentials {
             let Some(last) = batch.last() else { break };
             let next = last.offset.saturating_add(1);
             for record in &batch {
-                match Entry::decode(&record.payload) {
-                    Ok(entry) => self.registry.apply(entry),
-                    Err(reason) => warn!(
-                        offset = record.offset,
-                        %reason,
-                        "a registry record could not be read and was left out"
-                    ),
-                }
+                let entry =
+                    Entry::decode(&record.payload).map_err(|reason| LoadError::Unreadable {
+                        offset: record.offset,
+                        reason: reason.to_string(),
+                    })?;
+                self.registry.apply(entry);
             }
             if next <= offset {
                 break;
@@ -184,8 +261,9 @@ impl Credentials {
         Ok(())
     }
 
-    /// Delete the broker users made for principals that no record owns.
-    async fn delete_orphans(&self) -> Result<(), ApiError> {
+    /// Delete the broker users made for principals that no record owns. Called
+    /// only once every record has been read.
+    async fn delete_orphans(&self) -> Result<(), BrokerError> {
         let owned: HashSet<BrokerUser> = self
             .registry
             .all()
@@ -510,11 +588,9 @@ impl Credentials {
     /// Revoke every principal whose credential has expired, and forget the
     /// checks that are older than the recheck.
     pub async fn sweep(&self) {
-        if let Err(error) = self.load().await {
-            warn!(
-                ?error,
-                "the registry could not be loaded; the sweep will try again"
-            );
+        // A registry that cannot be loaded has logged why, and has nothing to
+        // sweep until it can.
+        if self.load().await.is_err() {
             return;
         }
         let now = self.clock.now_millis();
@@ -569,6 +645,9 @@ mod tests {
         fail_create_user: AtomicBool,
         fail_delete_user: AtomicBool,
         fail_system_append: AtomicBool,
+        fail_system_read: AtomicBool,
+        /// How many times the registry's log was read.
+        reads: AtomicUsize,
         /// `set_grants` says the user or its tenant is not found, whatever the
         /// memory broker holds.
         lose_grants: AtomicBool,
@@ -635,6 +714,10 @@ mod tests {
             offset: u64,
             max: u32,
         ) -> Result<Vec<SystemRecord>, BrokerError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            if self.fail_system_read.load(Ordering::SeqCst) {
+                return Err(down());
+            }
             self.inner.system_read(offset, max).await
         }
 
@@ -793,7 +876,11 @@ mod tests {
     }
 
     fn token(issued: &Issued) -> String {
-        issued.credential.expose().to_owned()
+        token_of(&issued.credential)
+    }
+
+    fn token_of(credential: &Credential) -> String {
+        credential.expose().to_owned()
     }
 
     fn is(error: &ApiError, expected: &ApiError) -> bool {
@@ -1085,7 +1172,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_registry_is_rebuilt_from_the_log_and_a_record_that_cannot_be_read_is_left_out() {
+    async fn the_registry_is_rebuilt_from_the_log() {
         let rig = Rig::new();
         let kept = rig.issue("person", "kept", None).await.unwrap();
         let dropped = rig.issue("person", "dropped", None).await.unwrap();
@@ -1093,7 +1180,6 @@ mod tests {
             .revoke(&admin(), dropped.principal.id, RevokeReason::Requested)
             .await
             .unwrap();
-        rig.broker.system_append(b"not a record").await.unwrap();
 
         let restarted = rig.restart().await;
         let actor = restarted
@@ -1114,6 +1200,197 @@ mod tests {
         let error = restarted.issue("person", "kept", None).await.unwrap_err();
         assert!(is(&error, &ApiError::Conflict(String::new())), "{error:?}");
         restarted.issue("person", "dropped", None).await.unwrap();
+    }
+
+    /// A `created` record whose principal cannot be read: its kind is not one.
+    fn unreadable_record_of(user: BrokerUser) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "op": "created",
+            "v": 1,
+            "principal": {
+                "id": PrincipalId::generate().to_string(),
+                "kind": "Not A Kind",
+                "name": "unreadable",
+                "tenant": "acme",
+                "scopes": [],
+                "created_at": "2026-10-26T12:00:00Z",
+            },
+            "user": user.0,
+            "digest": Credential::new("never-issued").digest().to_string(),
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_record_that_cannot_be_read_keeps_the_registry_unloaded_and_deletes_and_revokes_nothing()
+     {
+        // It logs why, which a capture in another test must not lose.
+        let _serial = crate::testing::serial().await;
+        let rig = Rig::new();
+        let kept = rig.issue("person", "kept", None).await.unwrap();
+        // The broker user of the principal whose record cannot be read.
+        let unreadable = rig
+            .broker
+            .inner
+            .create_user(&tenant(), &user_name(PrincipalId::generate()), &[], None)
+            .await
+            .unwrap();
+        rig.broker
+            .system_append(&unreadable_record_of(unreadable.user))
+            .await
+            .unwrap();
+        let facts = rig.facts().await;
+
+        let restarted = rig.restart().await;
+        let credentials = &restarted.credentials;
+        // Every way in is refused with a 503, which is not a 401: nobody is
+        // told their credential is bad.
+        let unavailable = ApiError::Unavailable(String::new());
+        for error in [
+            credentials.load().await.unwrap_err(),
+            credentials.authenticate(&token(&kept)).await.unwrap_err(),
+            credentials.authenticate("any other").await.unwrap_err(),
+            credentials.list(None).await.unwrap_err(),
+            restarted.issue("person", "new", None).await.unwrap_err(),
+            credentials
+                .revoke(&admin(), kept.principal.id, RevokeReason::Requested)
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(is(&error, &unavailable), "{error:?}");
+            // What the caller reads does not say what is in the log.
+            assert!(!format!("{error:?}").contains("offset"), "{error:?}");
+        }
+
+        // Nothing was deleted or revoked for it, here or at the broker.
+        assert!(rig.broker.deleted.lock().unwrap().is_empty());
+        assert!(
+            rig.broker
+                .inner
+                .identify(&unreadable.credential)
+                .await
+                .is_ok()
+        );
+        assert!(rig.broker.inner.identify(&kept.credential).await.is_ok());
+        assert_eq!(rig.facts().await, facts, "no revocation was recorded");
+    }
+
+    #[tokio::test]
+    async fn a_registry_that_could_not_be_loaded_is_tried_again_only_after_the_recheck() {
+        // It logs why, which a capture in another test must not lose.
+        let _serial = crate::testing::serial().await;
+        let rig = Rig::new();
+        let kept = rig.issue("person", "kept", None).await.unwrap();
+        rig.broker.fail_system_read.store(true, Ordering::SeqCst);
+        let restarted = rig.restart().await;
+        let reads = || rig.broker.reads.load(Ordering::SeqCst);
+        let before = reads();
+
+        assert!(restarted.credentials.load().await.is_err());
+        assert_eq!(reads(), before + 1);
+        // Requests in the interval are refused without asking the broker.
+        for _ in 0..3 {
+            let error = restarted
+                .credentials
+                .authenticate(&token(&kept))
+                .await
+                .unwrap_err();
+            assert!(is(&error, &ApiError::Unavailable(String::new())));
+        }
+        assert_eq!(reads(), before + 1);
+
+        // After it the broker is asked once more, and once it answers the
+        // credential is the principal's again.
+        rig.broker.fail_system_read.store(false, Ordering::SeqCst);
+        rig.clock.advance(Duration::from_secs(29));
+        assert!(restarted.credentials.load().await.is_err());
+        assert_eq!(reads(), before + 1);
+        rig.clock.advance(Duration::from_secs(1));
+        let actor = restarted
+            .credentials
+            .authenticate(&token(&kept))
+            .await
+            .unwrap();
+        assert_eq!(actor.principal().to_string(), "person:kept");
+    }
+
+    #[tokio::test]
+    async fn a_principal_stored_by_an_earlier_version_is_kept_whatever_the_rules_are_now() {
+        let rig = Rig::new();
+        let id = PrincipalId::generate();
+        rig.broker.inner.ensure_tenant(&tenant()).await.unwrap();
+        let made = rig
+            .broker
+            .inner
+            .create_user(&tenant(), &user_name(id), &[], None)
+            .await
+            .unwrap();
+        // No version, a field this version does not know, and a scope that
+        // `Grant::new` would refuse today (only mansio publishes to
+        // `facts.work`). Written when it was valid.
+        rig.broker
+            .system_append(
+                &serde_json::to_vec(&json!({
+                    "op": "created",
+                    "principal": {
+                        "id": id.to_string(),
+                        "kind": "service",
+                        "name": "old",
+                        "tenant": "acme",
+                        "scopes": [{"topic": "facts.work", "verbs": ["publish", "subscribe"]}],
+                        "created_at": "2026-10-26T12:00:00Z",
+                        "added_later": 1,
+                    },
+                    "user": made.user.0,
+                    "digest": made.credential.digest().to_string(),
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let restarted = rig.restart().await;
+        let actor = restarted
+            .credentials
+            .authenticate(&token_of(&made.credential))
+            .await
+            .unwrap();
+        assert_eq!(actor.principal().to_string(), "service:old");
+        let listed = restarted.credentials.list(None).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+        // It was told to the broker again, and nothing of it was deleted.
+        let told = rig.broker.told.lock().unwrap().clone();
+        assert_eq!(told.len(), 1);
+        assert_eq!(told[0].0, made.user);
+        assert!(rig.broker.deleted.lock().unwrap().is_empty());
+        // Its scope reads facts.work, and sends nothing to it.
+        let facts_work: Topic = "facts.work".parse().unwrap();
+        assert!(mansio_core::allows(
+            &listed[0].scopes,
+            mansio_core::Action::Poll,
+            &facts_work
+        ));
+        assert!(!mansio_core::allows(
+            &listed[0].scopes,
+            mansio_core::Action::Send,
+            &facts_work
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_record_written_by_a_newer_version_keeps_the_registry_unloaded() {
+        // It logs why, which a capture in another test must not lose.
+        let _serial = crate::testing::serial().await;
+        let rig = Rig::new();
+        rig.issue("person", "kept", None).await.unwrap();
+        rig.broker
+            .system_append(br#"{"op":"revoked","v":2,"id":"x","at":"y"}"#)
+            .await
+            .unwrap();
+        let restarted = rig.restart().await;
+        assert!(restarted.credentials.load().await.is_err());
+        assert!(rig.broker.deleted.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1294,13 +1571,8 @@ mod tests {
                     .unwrap()
             }
         };
-        // A user made just before a crash, whose record was never written, or
-        // whose record cannot be read now.
+        // A user made just before a crash, whose record was never written.
         let orphan = made(user_name(PrincipalId::generate())).await;
-        rig.broker
-            .system_append(br#"{"op":"created","principal":"unreadable"}"#)
-            .await
-            .unwrap();
         // Users that are not the principals': the server's own, and others.
         let admin = made("mansio-admin".to_owned()).await;
         let shaped_wrong = made(format!("mansio-{}", "A".repeat(32))).await;
