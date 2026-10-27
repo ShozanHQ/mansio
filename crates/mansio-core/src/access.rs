@@ -208,6 +208,19 @@ impl Grant {
         Ok(Self { topic, verbs })
     }
 
+    /// A scope read back from where it was kept, without checking it against
+    /// today's rules: it was checked when it was made, and the rules may have
+    /// changed since. Reading it back must not lose the principal that holds
+    /// it. It still allows no more than [`allows`] lets through: a `publish`
+    /// on a topic only mansio writes sends nothing.
+    #[must_use]
+    pub fn from_stored(topic: TopicPattern, verbs: impl IntoIterator<Item = Verb>) -> Self {
+        Self {
+            topic,
+            verbs: verbs.into_iter().collect(),
+        }
+    }
+
     /// The topics the scope covers.
     #[must_use]
     pub fn topic(&self) -> &TopicPattern {
@@ -452,5 +465,17 @@ mod tests {
         // Work is published through work_publish, which publish allows.
         assert!(Grant::new("work.builds".parse().unwrap(), [Verb::Publish]).is_ok());
         assert!(Grant::new("work.*".parse().unwrap(), [Verb::Publish]).is_ok());
+    }
+
+    #[test]
+    fn a_scope_read_back_is_not_checked_again_and_still_sends_nothing_mansio_writes() {
+        // Refused by `Grant::new` today, as it might be by a later rule for a
+        // scope that was fine when it was made.
+        assert!(Grant::new("facts.work".parse().unwrap(), [Verb::Publish]).is_err());
+        assert!(Grant::new("alerts".parse().unwrap(), [Verb::Claim]).is_err());
+        let stored = Grant::from_stored("facts.work".parse().unwrap(), [Verb::Publish]);
+        assert!(!allows(&[stored], Action::Send, &topic("facts.work")));
+        let odd = Grant::from_stored("alerts".parse().unwrap(), [Verb::Claim, Verb::Subscribe]);
+        assert!(allows(&[odd], Action::Poll, &topic("alerts")));
     }
 }

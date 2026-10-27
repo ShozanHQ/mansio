@@ -192,6 +192,10 @@ pub struct StreamSettings {
     /// so that the connection is not taken for dead
     /// (`MANSIO_SSE_KEEPALIVE_SECONDS`).
     pub sse_keepalive: Duration,
+    /// How long a shutdown waits, once it has ended every event stream, for
+    /// the requests still being served to finish before the server stops
+    /// anyway (`MANSIO_SHUTDOWN_GRACE_SECONDS`).
+    pub shutdown_grace: Duration,
 }
 
 impl Default for StreamSettings {
@@ -199,6 +203,7 @@ impl Default for StreamSettings {
         Self {
             poll: Duration::from_millis(500),
             sse_keepalive: Duration::from_secs(15),
+            shutdown_grace: Duration::from_secs(10),
         }
     }
 }
@@ -219,6 +224,9 @@ impl StreamSettings {
         }
         if self.sse_keepalive < Duration::from_secs(1) {
             return Err(invalid("MANSIO_SSE_KEEPALIVE_SECONDS"));
+        }
+        if self.shutdown_grace < Duration::from_secs(1) {
+            return Err(invalid("MANSIO_SHUTDOWN_GRACE_SECONDS"));
         }
         Ok(())
     }
@@ -426,6 +434,10 @@ impl Settings {
             sse_keepalive: env.seconds(
                 "MANSIO_SSE_KEEPALIVE_SECONDS",
                 stream_defaults.sse_keepalive,
+            )?,
+            shutdown_grace: env.seconds(
+                "MANSIO_SHUTDOWN_GRACE_SECONDS",
+                stream_defaults.shutdown_grace,
             )?,
         };
         stream.validate()?;
@@ -840,6 +852,7 @@ mod tests {
         let stream = StreamSettings::default();
         assert_eq!(stream.poll, Duration::from_millis(500));
         assert_eq!(stream.sse_keepalive, Duration::from_secs(15));
+        assert_eq!(stream.shutdown_grace, Duration::from_secs(10));
         assert_eq!(stream.validate(), Ok(()));
         let webhooks = WebhookSettings::default();
         assert_eq!(webhooks.backoff_base, Duration::from_secs(5));
@@ -856,6 +869,7 @@ mod tests {
             ("MANSIO_BROKER", "memory"),
             ("MANSIO_STREAM_POLL_MILLIS", "50"),
             ("MANSIO_SSE_KEEPALIVE_SECONDS", "3"),
+            ("MANSIO_SHUTDOWN_GRACE_SECONDS", "4"),
             ("MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS", "1"),
             ("MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS", "4"),
             ("MANSIO_WEBHOOK_MAX_ATTEMPTS", "5"),
@@ -867,6 +881,7 @@ mod tests {
             StreamSettings {
                 poll: Duration::from_millis(50),
                 sse_keepalive: Duration::from_secs(3),
+                shutdown_grace: Duration::from_secs(4),
             }
         );
         assert_eq!(
@@ -886,6 +901,7 @@ mod tests {
             ("MANSIO_STREAM_POLL_MILLIS", "0"),
             ("MANSIO_STREAM_POLL_MILLIS", "often"),
             ("MANSIO_SSE_KEEPALIVE_SECONDS", "0"),
+            ("MANSIO_SHUTDOWN_GRACE_SECONDS", "0"),
             ("MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS", "0"),
             ("MANSIO_WEBHOOK_MAX_ATTEMPTS", "0"),
             ("MANSIO_WEBHOOK_TIMEOUT_SECONDS", "0"),

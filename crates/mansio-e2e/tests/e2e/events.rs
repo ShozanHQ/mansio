@@ -427,3 +427,73 @@ async fn a_stream_ends_when_its_credential_is_revoked() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// An event stream that is open does not hold a shutdown up: the server ends
+/// it, and the client sees the stream end.
+#[tokio::test]
+async fn a_server_stops_at_once_with_an_event_stream_open() -> anyhow::Result<()> {
+    let mut target = Target::start().await?;
+    if !target.is_local() {
+        return Ok(());
+    }
+    publish_n(&target, "facts.build", 0, 1).await?;
+    let mut stream = Stream::open(&target, "facts.build", "", None).await?;
+    stream.event(SLACK).await?;
+
+    let started = std::time::Instant::now();
+    target.stop_server().await?;
+    let took = started.elapsed();
+    // Not aborted after the time a stop is given, and not after the grace.
+    assert!(
+        took < Duration::from_secs(target.settings.shutdown_grace_seconds),
+        "the server took {took:?} to stop with a stream open"
+    );
+    // The stream ended: the client reads to its end.
+    let ended = tokio::time::timeout(SLACK, async {
+        loop {
+            if stream.next(Duration::from_secs(1)).await.is_err() {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "the stream did not end");
+    Ok(())
+}
+
+/// A request that never finishes does not hold it up for ever either: the
+/// shutdown waits `MANSIO_SHUTDOWN_GRACE_SECONDS` and stops.
+#[tokio::test]
+async fn a_server_stops_after_the_grace_with_a_request_that_never_ends() -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut target = Target::start().await?;
+    if !target.is_local() {
+        return Ok(());
+    }
+    // The head of a request that promises a body, and not the body.
+    let address = target.base.trim_start_matches("http://").to_owned();
+    let mut socket = tokio::net::TcpStream::connect(&address).await?;
+    socket
+        .write_all(
+            format!(
+                "POST /v1/tenants/{}/topics/facts.build/messages HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{{\"source\"",
+                target.tenant, target.token
+            )
+            .as_bytes(),
+        )
+        .await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let grace = Duration::from_secs(target.settings.shutdown_grace_seconds);
+    let started = std::time::Instant::now();
+    target.stop_server().await?;
+    let took = started.elapsed();
+    assert!(took >= grace, "it did not wait the grace: {took:?}");
+    assert!(
+        took < crate::harness::STOP_TIME,
+        "it was aborted, not stopped: {took:?}"
+    );
+    drop(socket);
+    Ok(())
+}

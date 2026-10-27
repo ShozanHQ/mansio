@@ -19,17 +19,10 @@ use crate::broker::{
 use crate::credential::{Credential, CredentialDigest};
 use crate::envelope::Envelope;
 use crate::error::BrokerError;
-use crate::id::{ConsumerName, TenantId};
+use crate::id::TenantId;
 use crate::topic::Topic;
 
-/// A topic's messages, and the offset each named consumer last committed.
-#[derive(Debug, Default)]
-struct Log {
-    messages: Vec<Envelope>,
-    consumers: HashMap<ConsumerName, u64>,
-}
-
-type Topics = HashMap<Topic, Log>;
+type Topics = HashMap<Topic, Vec<Envelope>>;
 
 /// A user the broker made, and what it may reach.
 #[derive(Debug, Clone)]
@@ -177,10 +170,8 @@ impl Broker for MemoryBroker {
             .and_then(|topics| topics.get_mut(&envelope.topic))
             .ok_or_else(|| missing_topic(&envelope.tenant, &envelope.topic))?;
         permit_write(&granted, &envelope.topic, &envelope.tenant)?;
-        log.messages.push(envelope.clone());
-        Ok(Some(
-            u64::try_from(log.messages.len() - 1).unwrap_or(u64::MAX),
-        ))
+        log.push(envelope.clone());
+        Ok(Some(u64::try_from(log.len() - 1).unwrap_or(u64::MAX)))
     }
 
     async fn poll(
@@ -200,7 +191,6 @@ impl Broker for MemoryBroker {
         permit_read(&granted, tenant, topic)?;
         let start = usize::try_from(offset).unwrap_or(usize::MAX);
         let stored = log
-            .messages
             .iter()
             .enumerate()
             .skip(start)
@@ -211,36 +201,6 @@ impl Broker for MemoryBroker {
             })
             .collect();
         Ok(stored)
-    }
-
-    async fn consumer_offset(
-        &self,
-        tenant: &TenantId,
-        topic: &Topic,
-        consumer: &ConsumerName,
-    ) -> Result<Option<u64>, BrokerError> {
-        let tenants = self.lock();
-        let log = tenants
-            .get(tenant)
-            .and_then(|topics| topics.get(topic))
-            .ok_or_else(|| missing_topic(tenant, topic))?;
-        Ok(log.consumers.get(consumer).copied())
-    }
-
-    async fn commit_offset(
-        &self,
-        tenant: &TenantId,
-        topic: &Topic,
-        consumer: &ConsumerName,
-        offset: u64,
-    ) -> Result<(), BrokerError> {
-        let mut tenants = self.lock();
-        let log = tenants
-            .get_mut(tenant)
-            .and_then(|topics| topics.get_mut(topic))
-            .ok_or_else(|| missing_topic(tenant, topic))?;
-        log.consumers.insert(consumer.clone(), offset);
-        Ok(())
     }
 
     async fn system_append(&self, log: SystemLog, record: &[u8]) -> Result<(), BrokerError> {
@@ -949,66 +909,6 @@ mod tests {
             broker.system_read(principals, 0, 10).await.unwrap().len(),
             4
         );
-    }
-
-    fn consumer(name: &str) -> ConsumerName {
-        name.parse().unwrap()
-    }
-
-    #[tokio::test]
-    async fn a_consumer_keeps_the_offset_it_committed_per_topic_and_name() {
-        let broker = two_tenants().await;
-        let acme: TenantId = "acme".parse().unwrap();
-        let (alerts, builds): (Topic, Topic) = (Topic::Alerts, "facts.build".parse().unwrap());
-        let get = |topic: &Topic, name: &str| {
-            let (topic, name) = (topic.clone(), consumer(name));
-            let acme = acme.clone();
-            let broker = &broker;
-            async move { broker.consumer_offset(&acme, &topic, &name).await.unwrap() }
-        };
-
-        assert_eq!(get(&alerts, "a").await, None);
-        broker
-            .commit_offset(&acme, &alerts, &consumer("a"), 4)
-            .await
-            .unwrap();
-        assert_eq!(get(&alerts, "a").await, Some(4));
-        // Zero is an offset like any other, and is not "none".
-        broker
-            .commit_offset(&acme, &alerts, &consumer("b"), 0)
-            .await
-            .unwrap();
-        assert_eq!(get(&alerts, "b").await, Some(0));
-        // Another topic and another name are other consumers.
-        assert_eq!(get(&builds, "a").await, None);
-        // A commit replaces what was there, even with a smaller offset.
-        broker
-            .commit_offset(&acme, &alerts, &consumer("a"), 2)
-            .await
-            .unwrap();
-        assert_eq!(get(&alerts, "a").await, Some(2));
-    }
-
-    #[tokio::test]
-    async fn a_consumer_needs_a_topic() {
-        let broker = two_tenants().await;
-        let acme: TenantId = "acme".parse().unwrap();
-        let name = consumer("watcher");
-        let missing = broker
-            .consumer_offset(&acme, &Topic::Dead, &name)
-            .await
-            .unwrap_err();
-        assert!(matches!(missing, BrokerError::NotFound(_)), "{missing:?}");
-        let missing = broker
-            .commit_offset(&acme, &Topic::Dead, &name, 1)
-            .await
-            .unwrap_err();
-        assert!(matches!(missing, BrokerError::NotFound(_)), "{missing:?}");
-        let nobody: TenantId = "nobody".parse().unwrap();
-        assert!(matches!(
-            broker.consumer_offset(&nobody, &Topic::Alerts, &name).await,
-            Err(BrokerError::NotFound(_))
-        ));
     }
 
     #[tokio::test]
