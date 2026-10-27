@@ -102,6 +102,12 @@ impl Topic {
         Topic::Facts(Segment::known("principal"))
     }
 
+    /// `facts.webhook`: where mansio records a delivery it gave up on.
+    #[must_use]
+    pub fn facts_webhook() -> Self {
+        Topic::Facts(Segment::known("webhook"))
+    }
+
     /// `work.approvals`: the queue of items a person approves.
     #[must_use]
     pub fn work_approvals() -> Self {
@@ -244,6 +250,15 @@ mod tests {
         assert_eq!(
             "facts.alert".parse::<Topic>().unwrap(),
             Topic::facts_alert()
+        );
+    }
+
+    #[test]
+    fn the_webhook_topic_is_facts_webhook() {
+        assert_eq!(Topic::facts_webhook().to_string(), "facts.webhook");
+        assert_eq!(
+            "facts.webhook".parse::<Topic>().unwrap(),
+            Topic::facts_webhook()
         );
     }
 

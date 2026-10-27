@@ -61,8 +61,10 @@ async fn every_transition_appears_on_facts_and_in_the_sink_in_order() -> anyhow:
     target.work_publish(QUEUE, &job(1)).await?;
     let first = target.claim(QUEUE, "worker", SLACK).await?;
     target.fail_claim(QUEUE, &first, "first try").await?;
-    let second = target.claim(QUEUE, "worker", wait).await?;
-    let third = target.claim(QUEUE, "worker", wait).await?; // after the lease
+    // Each claim is by a consumer of its own: one that holds a live lease is
+    // given that lease again, not the next attempt.
+    let second = target.claim(QUEUE, "worker-b", wait).await?;
+    let third = target.claim(QUEUE, "worker-c", wait).await?; // after the lease
     assert_eq!(
         (first.item.attempt, second.item.attempt, third.item.attempt),
         (Some(1), Some(2), Some(3))

@@ -31,7 +31,9 @@ use mansio_core::api::{Claimed, EffectiveSettings, Polled, Published};
 use mansio_core::{
     Broker, BrokerError, Caller, Credential, Envelope, EventId, MemoryBroker, Timestamp,
 };
-use mansio_server::{Auth, CredentialSettings, FileSink, Server, WorkSettings};
+use mansio_server::{
+    Auth, CredentialSettings, FileSink, Server, StreamSettings, WebhookSettings, WorkSettings,
+};
 use reqwest::{Method, StatusCode};
 use secrecy::SecretString;
 use serde_json::{Value, json};
@@ -73,6 +75,26 @@ fn local_credential_settings() -> CredentialSettings {
     }
 }
 
+/// The stream settings of the in-process server: a quick look for new
+/// messages, and a comment every second on a quiet event stream.
+fn local_stream_settings() -> StreamSettings {
+    StreamSettings {
+        poll: Duration::from_millis(50),
+        sse_keepalive: Duration::from_secs(1),
+    }
+}
+
+/// The webhook settings of the in-process server: seconds-scale, so that a
+/// retry, a timeout and giving up take seconds.
+fn local_webhook_settings() -> WebhookSettings {
+    WebhookSettings {
+        backoff_base: Duration::from_secs(1),
+        backoff_cap: Duration::from_secs(4),
+        max_attempts: 3,
+        timeout: Duration::from_secs(2),
+    }
+}
+
 /// A server running in this process. It stops when dropped.
 struct LocalServer {
     base: String,
@@ -92,7 +114,9 @@ impl LocalServer {
         let server = Server::new(broker.clone(), auth)
             .with_sink(Arc::new(FileSink::open(sink).await?))
             .with_work_settings(local_work_settings())?
-            .with_credential_settings(local_credential_settings());
+            .with_credential_settings(local_credential_settings())
+            .with_stream_settings(local_stream_settings())?
+            .with_webhook_settings(local_webhook_settings())?;
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn(server.serve(listener, async move {
             let _ = stopped.await;
@@ -492,6 +516,69 @@ impl Target {
         Duration::from_millis(self.settings.tick_millis.saturating_mul(3) + 300)
     }
 
+    // ---- consumers, webhooks ------------------------------------------------
+
+    /// The address of a named consumer of a topic of this tenant.
+    pub fn consumer_uri(&self, topic: &str, consumer: &str) -> String {
+        format!(
+            "{}/v1/tenants/{}/topics/{topic}/consumers/{consumer}",
+            self.base, self.tenant
+        )
+    }
+
+    /// `webhooks_create` for a topic of this tenant, answering whatever the
+    /// server says.
+    pub async fn create_webhook(
+        &self,
+        topic: &str,
+        url: &str,
+    ) -> anyhow::Result<(StatusCode, Value)> {
+        let body = json!({"tenant": self.tenant, "topic": topic, "url": url});
+        self.authed(Method::POST, &format!("{}/v1/webhooks", self.base), Some(&body))
+            .await
+    }
+
+    /// `webhooks_create`, which must be accepted: the answer with the
+    /// webhook and its secret.
+    pub async fn webhook(&self, topic: &str, url: &str) -> anyhow::Result<Value> {
+        let (status, response) = self.create_webhook(topic, url).await?;
+        ensure!(
+            status == StatusCode::CREATED,
+            "webhooks_create answered {status}: {response}"
+        );
+        Ok(response)
+    }
+
+    /// `webhooks_list` for this tenant.
+    pub async fn webhooks(&self) -> anyhow::Result<Vec<Value>> {
+        let uri = format!("{}/v1/webhooks?tenant={}", self.base, self.tenant);
+        let (status, response) = self.authed(Method::GET, &uri, None).await?;
+        ensure!(
+            status == StatusCode::OK,
+            "webhooks_list answered {status}: {response}"
+        );
+        Ok(response["webhooks"].as_array().context("a list")?.clone())
+    }
+
+    /// The wait after attempt `attempt` at a webhook delivery fails, from the
+    /// settings.
+    pub fn webhook_backoff(&self, attempt: u32) -> Duration {
+        let settings = &self.settings;
+        let doublings = attempt.saturating_sub(1).min(31);
+        Duration::from_secs(settings.webhook_backoff_base_seconds)
+            .saturating_mul(1 << doublings)
+            .min(Duration::from_secs(settings.webhook_backoff_cap_seconds))
+    }
+
+    /// How long a webhook takes to give up on one delivery: every attempt
+    /// that is made after waiting for the one before.
+    pub fn webhook_give_up(&self) -> Duration {
+        (1..self.settings.webhook_max_attempts)
+            .map(|attempt| self.webhook_backoff(attempt))
+            .sum::<Duration>()
+            + Duration::from_secs(self.settings.webhook_timeout_seconds)
+    }
+
     // ---- credentials ------------------------------------------------------
 
     /// `principals_create`, answering whatever the server says.
@@ -664,11 +751,22 @@ impl Target {
         Ok(outcome)
     }
 
-    /// Whether the broker lets the credential read the server's own records,
-    /// where the registry of principals is kept. Only Iggy can be asked: in
-    /// process the records have no reader but the server, and `None` comes
-    /// back.
+    /// Whether the broker lets the credential read the server's own record of
+    /// principals. See [`Target::broker_read_system`].
     pub async fn broker_read_registry(&self, token: &str) -> anyhow::Result<Option<Outcome>> {
+        self.broker_read_system(token, mansio_iggy::SYSTEM_TOPIC)
+            .await
+    }
+
+    /// Whether the broker lets the credential read a log of the server's own
+    /// records: `principals`, or `webhooks`, which holds signing secrets. Only
+    /// Iggy can be asked: in process the records have no reader but the
+    /// server, and `None` comes back.
+    pub async fn broker_read_system(
+        &self,
+        token: &str,
+        topic: &str,
+    ) -> anyhow::Result<Option<Outcome>> {
         if self.local.is_some() {
             return Ok(None);
         }
@@ -679,7 +777,7 @@ impl Target {
                 match client
                     .poll_messages(
                         &iggy::prelude::Identifier::named(mansio_iggy::SYSTEM_STREAM)?,
-                        &iggy::prelude::Identifier::named(mansio_iggy::SYSTEM_TOPIC)?,
+                        &iggy::prelude::Identifier::named(topic)?,
                         Some(0),
                         &iggy::prelude::Consumer::default(),
                         &iggy::prelude::PollingStrategy::offset(0),

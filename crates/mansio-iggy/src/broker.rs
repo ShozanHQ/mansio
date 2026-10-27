@@ -11,14 +11,14 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy::prelude::{
-    AutoLogin, Client, Consumer, Credentials, Durability as IggyDurability, Identifier, IggyClient,
-    IggyClientBuilder, IggyDuration, IggyError, IggyExpiry, IggyMessage, MaxTopicSize,
-    MessageClient, Partitioning, PersonalAccessTokenClient, PollingStrategy, StreamClient,
-    TopicClient, TopicCreateOptions, UserClient, UserStatus,
+    AutoLogin, Client, Consumer, ConsumerOffsetClient, Credentials, Durability as IggyDurability,
+    Identifier, IggyClient, IggyClientBuilder, IggyDuration, IggyError, IggyExpiry, IggyMessage,
+    MaxTopicSize, MessageClient, Partitioning, PersonalAccessTokenClient, PollingStrategy,
+    StreamClient, TopicClient, TopicCreateOptions, UserClient, UserStatus,
 };
 use mansio_core::{
-    Broker, BrokerError, BrokerUser, Caller, Credential, Envelope, EventId, Grant, Minted, Stored,
-    SystemRecord, TenantId, Topic,
+    Broker, BrokerError, BrokerUser, Caller, ConsumerName, Credential, Envelope, EventId, Grant,
+    Minted, Stored, SystemLog, SystemRecord, TenantId, Topic,
 };
 use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use tracing::{info, warn};
@@ -33,6 +33,9 @@ use crate::sessions::{Session, Sessions};
 pub const SYSTEM_STREAM: &str = "mansio.system";
 /// The topic of [`SYSTEM_STREAM`] that holds the registry of principals.
 pub const SYSTEM_TOPIC: &str = "principals";
+/// The topic of [`SYSTEM_STREAM`] that holds the registry of webhooks, and
+/// with it their signing secrets.
+pub const SYSTEM_WEBHOOKS_TOPIC: &str = "webhooks";
 /// What the personal access token of every user mansio makes is called.
 const TOKEN_NAME: &str = "mansio";
 
@@ -476,13 +479,15 @@ impl IggyBroker {
 
     // ---- the server's own records -----------------------------------------
 
-    /// Make the stream and topic for the server's own records, once.
+    /// Make the stream and the topics for the server's own records, once.
     async fn ensure_system(&self) -> Result<(), BrokerError> {
         self.system_ready
             .get_or_try_init(|| async {
                 self.make_stream(SYSTEM_STREAM).await?;
-                self.make_topic(SYSTEM_STREAM, SYSTEM_TOPIC, &system_topic_options())
-                    .await?;
+                for log in SystemLog::ALL {
+                    self.make_topic(SYSTEM_STREAM, log.as_str(), &system_topic_options())
+                        .await?;
+                }
                 Ok::<(), BrokerError>(())
             })
             .await
@@ -592,6 +597,14 @@ fn stream_id(tenant: &TenantId) -> Result<Identifier, BrokerError> {
 
 fn topic_id(topic: &Topic) -> Result<Identifier, BrokerError> {
     Identifier::named(&topic.to_string()).map_err(map_iggy)
+}
+
+/// A named consumer. Iggy turns the name into the number it keeps the
+/// consumer's offset under.
+fn named_consumer(consumer: &ConsumerName) -> Result<Consumer, BrokerError> {
+    Ok(Consumer::new(
+        Identifier::named(consumer.as_str()).map_err(map_iggy)?,
+    ))
 }
 
 /// A user by its number, which no other user can share.
@@ -760,7 +773,60 @@ impl Broker for IggyBroker {
         }
     }
 
-    async fn system_append(&self, record: &[u8]) -> Result<(), BrokerError> {
+    async fn consumer_offset(
+        &self,
+        caller: &Caller<'_>,
+        tenant: &TenantId,
+        topic: &Topic,
+        consumer: &ConsumerName,
+    ) -> Result<Option<u64>, BrokerError> {
+        let client = self.client_for(caller).await?;
+        let stored = client
+            .get_consumer_offset(
+                &named_consumer(consumer)?,
+                &stream_id(tenant)?,
+                &topic_id(topic)?,
+                Some(PARTITION),
+            )
+            .await;
+        let result = match stored {
+            Ok(info) => Ok(info.map(|info| info.stored_offset)),
+            // A consumer that has stored nothing is not an error.
+            Err(IggyError::ConsumerOffsetNotFound(_)) => Ok(None),
+            Err(error) => self.settle(caller, Err(error)).await,
+        };
+        match caller {
+            Caller::Admin => self.ensured.forget_if_missing(tenant, result),
+            Caller::Credential(_) => result,
+        }
+    }
+
+    async fn commit_offset(
+        &self,
+        caller: &Caller<'_>,
+        tenant: &TenantId,
+        topic: &Topic,
+        consumer: &ConsumerName,
+        offset: u64,
+    ) -> Result<(), BrokerError> {
+        let client = self.client_for(caller).await?;
+        let stored = client
+            .store_consumer_offset(
+                &named_consumer(consumer)?,
+                &stream_id(tenant)?,
+                &topic_id(topic)?,
+                Some(PARTITION),
+                offset,
+            )
+            .await;
+        let result = self.settle(caller, stored).await;
+        match caller {
+            Caller::Admin => self.ensured.forget_if_missing(tenant, result),
+            Caller::Credential(_) => result,
+        }
+    }
+
+    async fn system_append(&self, log: SystemLog, record: &[u8]) -> Result<(), BrokerError> {
         self.ensure_system().await?;
         let mut message = IggyMessage::builder()
             .payload(Bytes::copy_from_slice(record))
@@ -769,7 +835,7 @@ impl Broker for IggyBroker {
         self.client
             .send_messages(
                 &Identifier::named(SYSTEM_STREAM).map_err(map_iggy)?,
-                &Identifier::named(SYSTEM_TOPIC).map_err(map_iggy)?,
+                &Identifier::named(log.as_str()).map_err(map_iggy)?,
                 &Partitioning::partition_id(PARTITION),
                 std::slice::from_mut(&mut message),
             )
@@ -778,7 +844,12 @@ impl Broker for IggyBroker {
         Ok(())
     }
 
-    async fn system_read(&self, offset: u64, max: u32) -> Result<Vec<SystemRecord>, BrokerError> {
+    async fn system_read(
+        &self,
+        log: SystemLog,
+        offset: u64,
+        max: u32,
+    ) -> Result<Vec<SystemRecord>, BrokerError> {
         if max == 0 {
             return Ok(Vec::new());
         }
@@ -787,7 +858,7 @@ impl Broker for IggyBroker {
             .client
             .poll_messages(
                 &Identifier::named(SYSTEM_STREAM).map_err(map_iggy)?,
-                &Identifier::named(SYSTEM_TOPIC).map_err(map_iggy)?,
+                &Identifier::named(log.as_str()).map_err(map_iggy)?,
                 Some(PARTITION),
                 &Consumer::default(),
                 &PollingStrategy::offset(offset),
@@ -1041,6 +1112,9 @@ mod tests {
     fn the_stream_of_the_servers_own_records_cannot_be_a_tenant() {
         assert!(SYSTEM_STREAM.parse::<TenantId>().is_err());
         assert!(SYSTEM_TOPIC.parse::<Topic>().is_err());
+        assert!(SYSTEM_WEBHOOKS_TOPIC.parse::<Topic>().is_err());
+        assert_eq!(SystemLog::Principals.as_str(), SYSTEM_TOPIC);
+        assert_eq!(SystemLog::Webhooks.as_str(), SYSTEM_WEBHOOKS_TOPIC);
         assert!(user_id(BrokerUser(7)).is_ok());
     }
 

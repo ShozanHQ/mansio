@@ -10,7 +10,7 @@ use crate::access::Grant;
 use crate::credential::Credential;
 use crate::envelope::Envelope;
 use crate::error::BrokerError;
-use crate::id::TenantId;
+use crate::id::{ConsumerName, TenantId};
 use crate::topic::Topic;
 
 /// An envelope as the broker holds it.
@@ -56,6 +56,30 @@ pub struct Minted {
     /// The credential. The broker does not keep it in a form that can be
     /// shown again.
     pub credential: Credential,
+}
+
+/// One of the logs the server keeps in the broker where no credential can
+/// reach it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SystemLog {
+    /// The registry of principals and their credentials' digests.
+    Principals,
+    /// The registry of webhooks, which holds their signing secrets.
+    Webhooks,
+}
+
+impl SystemLog {
+    /// Every log.
+    pub const ALL: [SystemLog; 2] = [SystemLog::Principals, SystemLog::Webhooks];
+
+    /// The name of the log: the topic it lives in.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SystemLog::Principals => "principals",
+            SystemLog::Webhooks => "webhooks",
+        }
+    }
 }
 
 /// A record the server keeps in the broker where no credential can reach it.
@@ -159,25 +183,71 @@ pub trait Broker: Send + Sync {
         max: u32,
     ) -> Result<Vec<Stored>, BrokerError>;
 
-    /// Append a record to the server's own log, which no credential can read
-    /// or write: the registry of principals lives there.
+    /// Append a record to one of the server's own logs, which no credential
+    /// can read or write: the registries of principals and of webhooks live
+    /// there.
     ///
     /// # Errors
     ///
     /// Returns an error if the broker cannot be reached, refuses, or has no
     /// such log.
-    async fn system_append(&self, _record: &[u8]) -> Result<(), BrokerError> {
+    async fn system_append(&self, _log: SystemLog, _record: &[u8]) -> Result<(), BrokerError> {
         Err(unsupported("system records"))
     }
 
-    /// Up to `max` records of the server's own log from `offset` on, in
-    /// order.
+    /// Up to `max` records of one of the server's own logs from `offset` on,
+    /// in order.
     ///
     /// # Errors
     ///
     /// As [`Broker::system_append`].
-    async fn system_read(&self, _offset: u64, _max: u32) -> Result<Vec<SystemRecord>, BrokerError> {
+    async fn system_read(
+        &self,
+        _log: SystemLog,
+        _offset: u64,
+        _max: u32,
+    ) -> Result<Vec<SystemRecord>, BrokerError> {
         Err(unsupported("system records"))
+    }
+
+    /// The offset of the last message the named consumer committed on the
+    /// topic, as `caller`, or `None` if it has committed none. The broker
+    /// keeps it, so it survives a restart of the server. A consumer belongs
+    /// to a tenant and a topic, and its name is the whole of its identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::NotFound`] if the tenant or topic does not
+    /// exist, [`BrokerError::Forbidden`] if the credential may not read the
+    /// topic, [`BrokerError::Unauthenticated`] if it is not valid, or an
+    /// error if the broker cannot be reached, refuses, or keeps no consumer
+    /// offsets.
+    async fn consumer_offset(
+        &self,
+        _caller: &Caller<'_>,
+        _tenant: &TenantId,
+        _topic: &Topic,
+        _consumer: &ConsumerName,
+    ) -> Result<Option<u64>, BrokerError> {
+        Err(unsupported("consumer offsets"))
+    }
+
+    /// Store `offset` as the last message the named consumer has handled on
+    /// the topic, as `caller`, replacing what it was. Any offset may be
+    /// stored, so a consumer can be set back to read again.
+    ///
+    /// # Errors
+    ///
+    /// As [`Broker::consumer_offset`].
+    async fn commit_offset(
+        &self,
+        _caller: &Caller<'_>,
+        _tenant: &TenantId,
+        _topic: &Topic,
+        _consumer: &ConsumerName,
+        _offset: u64,
+    ) -> Result<(), BrokerError> {
+        Err(unsupported("consumer offsets"))
     }
 
     /// Make a user called `name` that may reach only `tenant`, and only what

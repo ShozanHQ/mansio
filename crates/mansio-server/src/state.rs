@@ -132,6 +132,32 @@ impl Queue {
         self.ready.first().map(|(_, id)| id)
     }
 
+    /// The item `holder` holds under the consumer name `consumer`, if its
+    /// lease is still live at `now`, with that lease. If there are several,
+    /// the one whose lease ends first. This looks through the open items, which
+    /// costs no more than the broker write that a claim makes.
+    pub(crate) fn held_by(
+        &self,
+        holder: &Principal,
+        consumer: &ConsumerName,
+        now: i64,
+    ) -> Option<(&Item, &Lease)> {
+        self.items
+            .iter()
+            .filter_map(|(id, item)| match &item.phase {
+                Phase::Leased(lease)
+                    if lease.holder == *holder
+                        && lease.consumer == *consumer
+                        && lease.expires_at > now =>
+                {
+                    Some((id, item, lease))
+                }
+                _ => None,
+            })
+            .min_by(|a, b| (a.2.expires_at, a.0).cmp(&(b.2.expires_at, b.0)))
+            .map(|(_, item, lease)| (item, lease))
+    }
+
     fn take_order(&mut self) -> u64 {
         let order = self.next_order;
         self.next_order = self.next_order.saturating_add(1);

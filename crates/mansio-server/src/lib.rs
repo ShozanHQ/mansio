@@ -10,6 +10,10 @@
 //! and alerts with acknowledgement. Every transition is recorded in the sink
 //! and published to `facts.work` or `facts.alert`.
 //!
+//! [`Webhooks`] deliver the envelopes of a topic, signed, to the addresses
+//! the admin API registered, and `GET /v1/events` serves a topic as
+//! server-sent events.
+//!
 //! [`Credentials`] issue and withdraw the credentials of principals, each a
 //! user of the broker with permissions on its tenant's stream and the topics its
 //! scopes cover, and say who a bearer token is. The admin API for them is in
@@ -18,9 +22,11 @@
 mod app;
 mod auth;
 mod clock;
+mod consumers_api;
 mod credentials;
 mod engine;
 mod error;
+mod events_api;
 mod facts;
 mod principals_api;
 mod recover;
@@ -28,6 +34,9 @@ mod registry;
 mod settings;
 mod sink;
 mod state;
+mod tail;
+mod webhooks;
+mod webhooks_api;
 mod work_api;
 
 pub use app::{AppState, Parts, Server};
@@ -38,6 +47,7 @@ pub use engine::Engine;
 pub use error::ApiError;
 pub use settings::{
     Backend, CredentialSettings, DEFAULT_LISTEN, DEFAULT_SINK_PATH, DEFAULT_TOKEN_PRINCIPAL,
-    Limits, Settings, SettingsError, WorkSettings,
+    Limits, Settings, SettingsError, StreamSettings, WebhookSettings, WorkSettings,
 };
 pub use sink::FileSink;
+pub use webhooks::Webhooks;

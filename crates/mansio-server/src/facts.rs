@@ -6,7 +6,7 @@ use std::str::FromStr;
 use mansio_core::{
     AlertEvent, AlertFact, CausationId, DataContentType, Envelope, EventId, EventType, ItemId,
     Principal, PrincipalEvent, PrincipalFact, Segment, Source, Subject, TenantId, Timestamp, Topic,
-    WorkEvent, WorkFact,
+    WebhookEvent, WebhookFact, WorkEvent, WorkFact,
 };
 use tracing::error;
 
@@ -201,6 +201,31 @@ impl Facts {
         Ok(envelope)
     }
 
+    /// A change to a webhook, on `facts.webhook`, with the webhook id as its
+    /// subject. The engine is who made it: nobody asked.
+    pub(crate) fn webhook(
+        &self,
+        tenant: &TenantId,
+        event: WebhookEvent,
+        at: i64,
+        data: &WebhookFact,
+    ) -> Result<Envelope, ApiError> {
+        let value = serde_json::to_value(data).map_err(|reason| {
+            error!(%reason, "a webhook fact did not serialize");
+            ApiError::Internal
+        })?;
+        let mut envelope = self.envelope(
+            tenant,
+            Topic::facts_webhook(),
+            event.event_type(),
+            &self.engine,
+            at,
+            &data.webhook_id.to_string(),
+        )?;
+        envelope.data = Some(value);
+        Ok(envelope)
+    }
+
     /// The next attempt of an item: the same message with a new id, one more
     /// attempt and the old message as its cause, published by the engine.
     pub(crate) fn retry_message(&self, current: &Envelope, at: i64) -> Result<Envelope, ApiError> {
@@ -324,6 +349,29 @@ mod tests {
         assert_eq!(fact.subject.as_ref().unwrap().as_str(), info.id.to_string());
         assert_eq!(fact.principal, by);
         let back: PrincipalFact = serde_json::from_value(fact.data.unwrap()).unwrap();
+        assert_eq!(back, data);
+    }
+
+    #[test]
+    fn a_webhook_fact_names_the_webhook_and_what_it_gave_up_on() {
+        let facts = Facts::new();
+        let tenant: TenantId = "acme".parse().unwrap();
+        let data = WebhookFact {
+            webhook_id: mansio_core::WebhookId::generate(),
+            topic: "facts.build".parse().unwrap(),
+            offset: 7,
+            message_id: EventId::generate(),
+            attempts: 5,
+            error: "HTTP 500".to_owned(),
+        };
+        let fact = facts
+            .webhook(&tenant, WebhookEvent::Failed, 0, &data)
+            .unwrap();
+        assert_eq!(fact.topic.to_string(), "facts.webhook");
+        assert_eq!(fact.event_type.as_str(), "mansio.webhook.failed");
+        assert_eq!(fact.subject.as_ref().unwrap().as_str(), data.webhook_id.to_string());
+        assert_eq!(fact.principal.to_string(), ENGINE_PRINCIPAL);
+        let back: WebhookFact = serde_json::from_value(fact.data.unwrap()).unwrap();
         assert_eq!(back, data);
     }
 

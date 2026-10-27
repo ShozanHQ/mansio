@@ -345,6 +345,12 @@ impl Engine {
     /// Claim the oldest claimable item of a queue for `principal`, under the
     /// name `consumer`. `None` if nothing can be claimed.
     ///
+    /// A consumer (the principal and the name together) that already holds a
+    /// live lease on the queue is given that lease again, with the same id and
+    /// expiry, and nothing is recorded. So a client whose answer was lost, and
+    /// that asks again, does not leave an item leased to nobody. To work on
+    /// several items at once, pull under several names.
+    ///
     /// # Errors
     ///
     /// Returns an error if the claim could not be recorded. The item is then
@@ -358,6 +364,17 @@ impl Engine {
     ) -> Result<Option<Claimed>, ApiError> {
         let mut held = self.lock(tenant).await?;
         let now = self.clock.now_millis();
+        if let Some((item, lease)) = held
+            .queues
+            .get(queue)
+            .and_then(|q| q.held_by(principal, consumer, now))
+        {
+            return Ok(Some(Claimed {
+                lease_id: lease.id,
+                expires_at: timestamp(lease.expires_at)?,
+                item: item.message.clone(),
+            }));
+        }
         let Some((id, message, attempt)) = held
             .queues
             .get(queue)
@@ -767,6 +784,7 @@ fn is_written_by_mansio(topic: &Topic) -> bool {
     *topic == Topic::facts_work()
         || *topic == Topic::facts_alert()
         || *topic == Topic::facts_principal()
+        || *topic == Topic::facts_webhook()
 }
 
 /// Whether a failed publish may still have stored the message. Only an error

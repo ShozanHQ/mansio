@@ -13,14 +13,21 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 
 use crate::access::{Action, Grant, allows};
-use crate::broker::{Broker, BrokerUser, Caller, Minted, Stored, SystemRecord};
+use crate::broker::{Broker, BrokerUser, Caller, Minted, Stored, SystemLog, SystemRecord};
 use crate::credential::{Credential, CredentialDigest};
 use crate::envelope::Envelope;
 use crate::error::BrokerError;
-use crate::id::TenantId;
+use crate::id::{ConsumerName, TenantId};
 use crate::topic::Topic;
 
-type Topics = HashMap<Topic, Vec<Envelope>>;
+/// A topic's messages, and the offset each named consumer last committed.
+#[derive(Debug, Default)]
+struct Log {
+    messages: Vec<Envelope>,
+    consumers: HashMap<ConsumerName, u64>,
+}
+
+type Topics = HashMap<Topic, Log>;
 
 /// A user the broker made, and what it may reach.
 #[derive(Debug, Clone)]
@@ -67,7 +74,7 @@ type Granted = Option<User>;
 #[derive(Debug, Default)]
 pub struct MemoryBroker {
     tenants: Mutex<HashMap<TenantId, Topics>>,
-    system: Mutex<Vec<Vec<u8>>>,
+    system: Mutex<HashMap<SystemLog, Vec<Vec<u8>>>>,
     users: Mutex<Users>,
 }
 
@@ -165,8 +172,8 @@ impl Broker for MemoryBroker {
             .and_then(|topics| topics.get_mut(&envelope.topic))
             .ok_or_else(|| missing_topic(&envelope.tenant, &envelope.topic))?;
         permit(&granted, Action::Send, &envelope.tenant, &envelope.topic)?;
-        log.push(envelope.clone());
-        Ok(Some(u64::try_from(log.len() - 1).unwrap_or(u64::MAX)))
+        log.messages.push(envelope.clone());
+        Ok(Some(u64::try_from(log.messages.len() - 1).unwrap_or(u64::MAX)))
     }
 
     async fn poll(
@@ -186,6 +193,7 @@ impl Broker for MemoryBroker {
         permit(&granted, Action::Poll, tenant, topic)?;
         let start = usize::try_from(offset).unwrap_or(usize::MAX);
         let stored = log
+            .messages
             .iter()
             .enumerate()
             .skip(start)
@@ -198,17 +206,62 @@ impl Broker for MemoryBroker {
         Ok(stored)
     }
 
-    async fn system_append(&self, record: &[u8]) -> Result<(), BrokerError> {
+    async fn consumer_offset(
+        &self,
+        caller: &Caller<'_>,
+        tenant: &TenantId,
+        topic: &Topic,
+        consumer: &ConsumerName,
+    ) -> Result<Option<u64>, BrokerError> {
+        let granted = self.granted(caller)?;
+        let tenants = self.lock();
+        let log = tenants
+            .get(tenant)
+            .and_then(|topics| topics.get(topic))
+            .ok_or_else(|| missing_topic(tenant, topic))?;
+        permit(&granted, Action::Poll, tenant, topic)?;
+        Ok(log.consumers.get(consumer).copied())
+    }
+
+    async fn commit_offset(
+        &self,
+        caller: &Caller<'_>,
+        tenant: &TenantId,
+        topic: &Topic,
+        consumer: &ConsumerName,
+        offset: u64,
+    ) -> Result<(), BrokerError> {
+        let granted = self.granted(caller)?;
+        let mut tenants = self.lock();
+        let log = tenants
+            .get_mut(tenant)
+            .and_then(|topics| topics.get_mut(topic))
+            .ok_or_else(|| missing_topic(tenant, topic))?;
+        permit(&granted, Action::Poll, tenant, topic)?;
+        log.consumers.insert(consumer.clone(), offset);
+        Ok(())
+    }
+
+    async fn system_append(&self, log: SystemLog, record: &[u8]) -> Result<(), BrokerError> {
         self.system
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .entry(log)
+            .or_default()
             .push(record.to_vec());
         Ok(())
     }
 
-    async fn system_read(&self, offset: u64, max: u32) -> Result<Vec<SystemRecord>, BrokerError> {
+    async fn system_read(
+        &self,
+        log: SystemLog,
+        offset: u64,
+        max: u32,
+    ) -> Result<Vec<SystemRecord>, BrokerError> {
         let system = self.system.lock().unwrap_or_else(PoisonError::into_inner);
         Ok(system
+            .get(&log)
+            .map_or(&[][..], Vec::as_slice)
             .iter()
             .enumerate()
             .skip(usize::try_from(offset).unwrap_or(usize::MAX))
@@ -831,15 +884,127 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_system_log_keeps_order_and_pages() {
+    async fn the_system_logs_keep_order_and_pages_and_are_apart() {
         let broker = MemoryBroker::new();
-        assert!(broker.system_read(0, 10).await.unwrap().is_empty());
+        let principals = SystemLog::Principals;
+        assert!(broker.system_read(principals, 0, 10).await.unwrap().is_empty());
         for n in 0..4u8 {
-            broker.system_append(&[n]).await.unwrap();
+            broker.system_append(principals, &[n]).await.unwrap();
         }
-        let page = broker.system_read(1, 2).await.unwrap();
+        let page = broker.system_read(principals, 1, 2).await.unwrap();
         let seen: Vec<(u64, Vec<u8>)> = page.into_iter().map(|r| (r.offset, r.payload)).collect();
         assert_eq!(seen, [(1, vec![1]), (2, vec![2])]);
-        assert!(broker.system_read(4, 10).await.unwrap().is_empty());
+        assert!(broker.system_read(principals, 4, 10).await.unwrap().is_empty());
+
+        // Another log has nothing of the first one's.
+        let webhooks = SystemLog::Webhooks;
+        assert!(broker.system_read(webhooks, 0, 10).await.unwrap().is_empty());
+        broker.system_append(webhooks, b"w").await.unwrap();
+        let read = broker.system_read(webhooks, 0, 10).await.unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].payload, b"w");
+        assert_eq!(broker.system_read(principals, 0, 10).await.unwrap().len(), 4);
+    }
+
+    fn consumer(name: &str) -> ConsumerName {
+        name.parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_consumer_keeps_the_offset_it_committed_per_topic_and_name() {
+        let broker = two_tenants().await;
+        let acme: TenantId = "acme".parse().unwrap();
+        let (alerts, builds): (Topic, Topic) = (Topic::Alerts, "facts.build".parse().unwrap());
+        let get = |topic: &Topic, name: &str| {
+            let (topic, name) = (topic.clone(), consumer(name));
+            let acme = acme.clone();
+            let broker = &broker;
+            async move {
+                broker
+                    .consumer_offset(&Caller::Admin, &acme, &topic, &name)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        assert_eq!(get(&alerts, "a").await, None);
+        broker
+            .commit_offset(&Caller::Admin, &acme, &alerts, &consumer("a"), 4)
+            .await
+            .unwrap();
+        assert_eq!(get(&alerts, "a").await, Some(4));
+        // Zero is an offset like any other, and is not "none".
+        broker
+            .commit_offset(&Caller::Admin, &acme, &alerts, &consumer("b"), 0)
+            .await
+            .unwrap();
+        assert_eq!(get(&alerts, "b").await, Some(0));
+        // Another topic and another name are other consumers.
+        assert_eq!(get(&builds, "a").await, None);
+        // A commit replaces what was there, even with a smaller offset.
+        broker
+            .commit_offset(&Caller::Admin, &acme, &alerts, &consumer("a"), 2)
+            .await
+            .unwrap();
+        assert_eq!(get(&alerts, "a").await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn a_consumer_needs_a_topic_and_the_right_to_read_it() {
+        use crate::Verb;
+        let broker = two_tenants().await;
+        let acme: TenantId = "acme".parse().unwrap();
+        let name = consumer("watcher");
+        let missing = broker
+            .consumer_offset(&Caller::Admin, &acme, &Topic::Dead, &name)
+            .await
+            .unwrap_err();
+        assert!(matches!(missing, BrokerError::NotFound(_)), "{missing:?}");
+        let missing = broker
+            .commit_offset(&Caller::Admin, &acme, &Topic::Dead, &name, 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(missing, BrokerError::NotFound(_)), "{missing:?}");
+
+        let reader = user(&broker, "acme", &[grant("alerts", &[Verb::Subscribe])], None).await;
+        let writer = user(&broker, "acme", &[grant("alerts", &[Verb::Publish])], None).await;
+        let (read, write) = (
+            Caller::Credential(&reader.credential),
+            Caller::Credential(&writer.credential),
+        );
+        broker
+            .commit_offset(&read, &acme, &Topic::Alerts, &name, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            broker
+                .consumer_offset(&read, &acme, &Topic::Alerts, &name)
+                .await
+                .unwrap(),
+            Some(3)
+        );
+        // A credential that may not read the topic may not move a consumer on
+        // it or see where one is, and another tenant's credential neither.
+        assert!(matches!(
+            broker.commit_offset(&write, &acme, &Topic::Alerts, &name, 9).await,
+            Err(BrokerError::Forbidden(_))
+        ));
+        assert!(matches!(
+            broker.consumer_offset(&write, &acme, &Topic::Alerts, &name).await,
+            Err(BrokerError::Forbidden(_))
+        ));
+        let other: TenantId = "other".parse().unwrap();
+        assert!(matches!(
+            broker.consumer_offset(&read, &other, &Topic::Alerts, &name).await,
+            Err(BrokerError::Forbidden(_))
+        ));
+        assert_eq!(
+            broker
+                .consumer_offset(&Caller::Admin, &acme, &Topic::Alerts, &name)
+                .await
+                .unwrap(),
+            Some(3),
+            "the refused commit changed nothing"
+        );
     }
 }

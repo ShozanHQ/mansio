@@ -204,6 +204,8 @@ struct Rig {
     sink: Arc<LogSink>,
     clock: Arc<ManualClock>,
     engine: Arc<Engine>,
+    /// How many pulls have been made, so that each can be a consumer of its own.
+    pulls: AtomicU64,
 }
 
 impl Rig {
@@ -230,6 +232,7 @@ impl Rig {
             sink,
             clock,
             engine,
+            pulls: AtomicU64::new(0),
         }
     }
 
@@ -260,9 +263,17 @@ impl Rig {
         id.to_string().parse().unwrap()
     }
 
+    /// A pull by `who` under a consumer name nobody has used yet, so that it
+    /// is a claim of its own: `w1`, `w2` and so on.
     async fn pull(&self, who: &str) -> Option<Claimed> {
+        let n = self.pulls.fetch_add(1, Ordering::SeqCst) + 1;
+        self.pull_as(who, &format!("w{n}")).await
+    }
+
+    /// A pull by `who` under the consumer name given.
+    async fn pull_as(&self, who: &str, name: &str) -> Option<Claimed> {
         self.engine
-            .work_pull(&tenant(), &queue(), &agent(who), &consumer("w1"))
+            .work_pull(&tenant(), &queue(), &agent(who), &consumer(name))
             .await
             .unwrap()
     }
@@ -351,6 +362,69 @@ async fn a_claim_hands_out_the_oldest_item_and_hides_it_from_everyone_else() {
     assert_eq!(claimed["lease_id"], one.lease_id.to_string());
     assert_eq!(claimed["message_id"], one.item.id.to_string());
     assert_eq!(facts[0].principal, agent("one"));
+}
+
+#[tokio::test]
+async fn a_consumer_that_holds_a_live_lease_is_given_that_lease_again() {
+    let rig = Rig::new();
+    let first = rig.publish_item("first").await;
+    let second = rig.publish_item("second").await;
+
+    let claim = rig.pull_as("one", "worker").await.unwrap();
+    assert_eq!(claim.item.item_id, Some(first.clone()));
+    let facts = rig.sink.all().len();
+
+    // The answer was lost and the client asks again: the same lease, not the
+    // next item, and nothing is recorded.
+    rig.clock.advance(Duration::from_secs(3));
+    let again = rig.pull_as("one", "worker").await.unwrap();
+    assert_eq!(again, claim, "the lease keeps its id and its expiry");
+    assert_eq!(rig.sink.all().len(), facts);
+    assert_eq!(rig.transitions().await, ["claimed"]);
+
+    // A lease is held by a principal and a consumer name together. Another
+    // name gets the next item, and another principal under the same name
+    // finds nothing left.
+    let other_name = rig.pull_as("one", "worker-2").await.unwrap();
+    assert_eq!(other_name.item.item_id, Some(second));
+    assert!(rig.pull_as("two", "worker").await.is_none());
+    assert_eq!(rig.pull_as("one", "worker").await.unwrap(), claim);
+
+    // Finished, the lease is not given again: the next pull claims anew.
+    rig.ack("one", &first, &claim.lease_id).await.unwrap();
+    let third = rig.publish_item("third").await;
+    let next = rig.pull_as("one", "worker").await.unwrap();
+    assert_eq!(next.item.item_id, Some(third));
+    assert_ne!(next.lease_id, claim.lease_id);
+}
+
+#[tokio::test]
+async fn a_lease_that_has_run_out_is_not_given_again() {
+    let rig = Rig::new();
+    let item = rig.publish_item("job").await;
+    let claim = rig.pull_as("one", "worker").await.unwrap();
+
+    // The lease ended and the timer has not noticed yet.
+    rig.clock.advance(Duration::from_secs(10));
+    assert!(rig.pull_as("one", "worker").await.is_none());
+
+    // After the backoff the item is claimed anew, under a lease of its own.
+    rig.engine.tick().await;
+    rig.pass(2).await;
+    let again = rig.pull_as("one", "worker").await.unwrap();
+    assert_eq!(again.item.item_id, Some(item));
+    assert_eq!(again.item.attempt, Some(2));
+    assert_ne!(again.lease_id, claim.lease_id);
+}
+
+#[tokio::test]
+async fn a_restarted_server_gives_a_consumer_the_lease_it_held() {
+    let rig = Rig::new();
+    rig.publish_item("first").await;
+    rig.publish_item("second").await;
+    let claim = rig.pull_as("one", "worker").await.unwrap();
+    let rig = rig.restart().await;
+    assert_eq!(rig.pull_as("one", "worker").await.unwrap(), claim);
 }
 
 #[tokio::test]
@@ -1483,9 +1557,9 @@ async fn a_broker_that_cannot_be_reached_costs_at_most_one_rebuild_per_tick() {
             .await
             .unwrap();
     }
-    for _ in 0..50 {
+    for n in 0..50 {
         engine
-            .work_pull(&tenant(), &queue(), &agent("a"), &consumer("w"))
+            .work_pull(&tenant(), &queue(), &agent("a"), &consumer(&format!("w{n}")))
             .await
             .unwrap()
             .unwrap();
@@ -1514,7 +1588,12 @@ async fn a_broker_that_cannot_be_reached_costs_at_most_one_rebuild_per_tick() {
     engine.tick().await;
     let mut claimed = 0;
     while engine
-        .work_pull(&tenant(), &queue(), &agent("b"), &consumer("w"))
+        .work_pull(
+            &tenant(),
+            &queue(),
+            &agent("b"),
+            &consumer(&format!("w{claimed}")),
+        )
         .await
         .unwrap()
         .is_some()
@@ -1604,7 +1683,12 @@ async fn stepping_over_an_unreadable_message_does_not_read_the_page_again() {
     let claimed = {
         let mut n = 0;
         while reader
-            .work_pull(&tenant(), &queue(), &agent("a"), &consumer("w"))
+            .work_pull(
+                &tenant(),
+                &queue(),
+                &agent("a"),
+                &consumer(&format!("w{n}")),
+            )
             .await
             .unwrap()
             .is_some()

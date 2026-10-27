@@ -379,6 +379,12 @@ random_uuid_type!(
     PrincipalId,
     "principal id"
 );
+random_uuid_type!(
+    /// The id of a webhook. It names the webhook in the API and its consumer
+    /// in the broker, and is not a secret.
+    WebhookId,
+    "webhook id"
+);
 
 /// Who acted: a kind and a name, written `kind:name`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -516,6 +522,16 @@ mod tests {
         }
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(serde_json::from_str::<LeaseId>(&json).unwrap(), a);
+    }
+
+    #[test]
+    fn webhook_ids_are_random_canonical_uuids() {
+        let a = WebhookId::generate();
+        assert_ne!(a, WebhookId::generate());
+        assert_eq!(a.to_string().parse::<WebhookId>().unwrap(), a);
+        assert!("webhook".parse::<WebhookId>().is_err());
+        // A consumer called after a webhook is a valid consumer name.
+        assert!(format!("webhook-{a}").parse::<ConsumerName>().is_ok());
     }
 
     #[test]
