@@ -35,24 +35,40 @@ pub(crate) mod manual {
 
     use super::Clock;
 
-    /// A clock that moves only when told to.
+    /// A clock that moves only when told to, or, made with
+    /// [`ManualClock::ticking`], by a millisecond each time it is read: the
+    /// way the system clock moves between two reads.
     #[derive(Debug)]
-    pub(crate) struct ManualClock(AtomicI64);
+    pub(crate) struct ManualClock {
+        now: AtomicI64,
+        per_read: i64,
+    }
 
     impl ManualClock {
         pub(crate) fn new(start_millis: i64) -> Self {
-            Self(AtomicI64::new(start_millis))
+            Self {
+                now: AtomicI64::new(start_millis),
+                per_read: 0,
+            }
+        }
+
+        /// A clock that is a millisecond later at every read.
+        pub(crate) fn ticking(start_millis: i64) -> Self {
+            Self {
+                now: AtomicI64::new(start_millis),
+                per_read: 1,
+            }
         }
 
         pub(crate) fn advance(&self, by: Duration) {
             let millis = i64::try_from(by.as_millis()).unwrap_or(i64::MAX);
-            self.0.fetch_add(millis, Ordering::SeqCst);
+            self.now.fetch_add(millis, Ordering::SeqCst);
         }
     }
 
     impl Clock for ManualClock {
         fn now_millis(&self) -> i64 {
-            self.0.load(Ordering::SeqCst)
+            self.now.fetch_add(self.per_read, Ordering::SeqCst)
         }
     }
 }

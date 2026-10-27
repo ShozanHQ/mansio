@@ -2303,3 +2303,42 @@ async fn an_extension_that_was_stored_but_errored_still_extends_the_lease() {
     assert!(rig.pull("two").await.is_none());
     rig.ack("one", &item, &claim.lease_id).await.unwrap();
 }
+
+/// The longest lease is counted from the claim, and a restart finds the claim
+/// in the `claimed` fact. A clock that moves between two reads must not put
+/// the fact a millisecond after the moment the lease says it began.
+#[tokio::test]
+async fn a_fresh_claim_is_recorded_at_the_moment_its_lease_began_and_the_cap_survives_a_restart() {
+    let rig = Rig::over(
+        Arc::default(),
+        Arc::default(),
+        Arc::new(ManualClock::ticking(START)),
+    );
+    let item = rig.publish_item("job").await;
+    let claim = rig.pull_as("one", "worker").await.unwrap();
+    let claimed_at = claim.expires_at.unix_millis().unwrap() - 10_000;
+
+    let facts = rig.read(&Topic::facts_work()).await;
+    assert_eq!(
+        facts[0].time.as_ref().and_then(Timestamp::unix_millis),
+        Some(claimed_at),
+        "the claimed fact is timed at the claim"
+    );
+
+    let rig = rig.restart().await;
+    let capped = rig
+        .extend("one", &item, &claim.lease_id, Some(1_000_000))
+        .await
+        .unwrap();
+    assert_eq!(ends_at(&capped.envelope), claimed_at + 120_000);
+
+    // A lease read back and given a new id is recorded again, and the cap
+    // still counts from the first claim.
+    let rig = rig.restart().await;
+    let again = rig.pull_as("one", "worker").await.unwrap();
+    let capped = rig
+        .extend("one", &item, &again.lease_id, Some(1_000_000))
+        .await
+        .unwrap();
+    assert_eq!(ends_at(&capped.envelope), claimed_at + 120_000);
+}
