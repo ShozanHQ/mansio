@@ -31,13 +31,17 @@ tool_timeout_sec = 120
 ```
 
 `mansio` has to be on the `PATH` (`cargo install --path crates/mansio`), or
-`command` has to be its full path. If your version of Codex has no `env_vars`,
-set the server's variables under `[mcp_servers.mansio.env]` instead, for the
-address, and start Codex from a shell that has `MANSIO_TOKEN`:
+`command` has to be its full path. Codex starts a stdio server with a small
+default environment plus what the table names, so a variable the server needs
+has to be named: `env_vars` passes it on from the environment Codex runs in,
+and `env` sets one to a value written in the file, which is fine for the
+address and not for the token. If your version of Codex has no `env_vars`, set
+the token in the file instead, in a configuration that only you can read:
 
 ```toml
 [mcp_servers.mansio.env]
 MANSIO_URL = "http://127.0.0.1:7070"
+MANSIO_TOKEN = "..."
 ```
 
 The tools are the commands of `mansio`, with the same names and parameters:

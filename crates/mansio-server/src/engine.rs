@@ -163,7 +163,7 @@ impl Engine {
             Err(BrokerError::NotFound(_)) => Vec::new(),
             Err(error) => return Err(error.into()),
         };
-        let logs = recover::read_logs(self.broker.as_ref(), tenant, &topics, self.page).await?;
+        let logs = recover::read_logs(&self.broker, tenant, &topics, self.page).await?;
         let rebuilt = recover::replay(tenant, &logs, &self.facts, self.clock.now_millis())?;
         let items: usize = rebuilt.queues.values().map(crate::state::Queue::len).sum();
         info!(%tenant, items, alerts = rebuilt.alerts.len(), "state rebuilt");

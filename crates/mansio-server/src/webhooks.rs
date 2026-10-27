@@ -4,8 +4,9 @@
 //! A webhook is registered by the admin API and kept in a log in the broker
 //! that no credential can reach ([`mansio_core::SystemLog::Webhooks`]), which
 //! is also the only place its signing secret is kept. Each webhook has a task
-//! that follows its topic as a durable consumer of the broker, so a restarted
-//! server resumes where the last one stopped, and delivers in offset order,
+//! that follows its topic from a position the server keeps (see
+//! [`crate::cursors`]), so a restarted server resumes where the last one
+//! stopped, and delivers in offset order,
 //! one envelope at a time. A delivery that the receiver does not accept with
 //! a 2xx, or does not answer in time, is tried again after a doubling
 //! backoff. Past `MANSIO_WEBHOOK_MAX_ATTEMPTS` it is recorded as
@@ -22,9 +23,8 @@ use std::time::Duration;
 use mansio_core::api::{CreateWebhook, WebhookCreated};
 use mansio_core::webhook::{CONTENT_TYPE, SIGNATURE_HEADER, sign};
 use mansio_core::{
-    Broker, BrokerError, Caller, ConsumerName, Stored, SystemLog, TenantId, Timestamp, Topic,
-    Webhook, WebhookError, WebhookEvent, WebhookFact, WebhookId, WebhookInfo, WebhookSecret,
-    WebhookStatus,
+    Broker, BrokerError, Caller, Stored, SystemLog, TenantId, Timestamp, Topic, Webhook,
+    WebhookError, WebhookEvent, WebhookFact, WebhookId, WebhookInfo, WebhookSecret, WebhookStatus,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::OnceCell;
@@ -32,6 +32,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::clock::Clock;
+use crate::cursors::{Cursor, Cursors};
 use crate::engine::Engine;
 use crate::error::ApiError;
 use crate::facts::Facts;
@@ -71,14 +72,6 @@ struct Record {
     secret: WebhookSecret,
 }
 
-/// The consumer a webhook follows its topic as.
-fn consumer_of(id: WebhookId) -> Result<ConsumerName, ApiError> {
-    format!("webhook-{id}").parse().map_err(|reason| {
-        tracing::error!(%reason, "a webhook consumer name did not parse");
-        ApiError::Internal
-    })
-}
-
 /// What a failed request says, without the address it was sent to: an address
 /// can carry a secret of the receiver's own.
 fn describe(error: &reqwest::Error, timeout: Duration) -> String {
@@ -111,6 +104,7 @@ fn check_url(url: &str) -> Result<(), ApiError> {
 struct Delivery {
     broker: Arc<dyn Broker>,
     engine: Arc<Engine>,
+    cursors: Arc<Cursors>,
     clock: Arc<dyn Clock>,
     facts: Facts,
     /// `None` if the client could not be built, in which case every attempt
@@ -144,27 +138,20 @@ impl Delivery {
     }
 
     /// Follow the webhook's topic for as long as the task lives: start where
-    /// the broker says the webhook's consumer stopped, and deliver what comes
-    /// in order.
+    /// its position says it stopped, and deliver what comes in order.
     async fn follow(self: Arc<Self>, webhook: Webhook, secret: WebhookSecret) {
-        let Ok(consumer) = consumer_of(webhook.id) else {
-            return;
-        };
         let poll = self.stream.poll;
+        let cursor = Cursor::Webhook(webhook.id);
         let start = loop {
-            match self
-                .broker
-                .consumer_offset(&webhook.tenant, &webhook.topic, &consumer)
-                .await
-            {
+            match self.cursors.get(&cursor).await {
                 Ok(Some(committed)) => {
                     self.delivered(webhook.id, committed);
                     break committed.saturating_add(1);
                 }
-                // Nothing committed, or no topic yet: from the first message.
-                Ok(None) | Err(BrokerError::NotFound(_)) => break 0,
+                // Nothing committed: from the first message.
+                Ok(None) => break 0,
                 Err(error) => {
-                    warn!(webhook = %webhook.id, %error, "where the webhook stopped could not be read");
+                    warn!(webhook = %webhook.id, ?error, "where the webhook stopped could not be read");
                     tokio::time::sleep(poll).await;
                 }
             }
@@ -181,7 +168,7 @@ impl Delivery {
                 Ok(batch) if batch.is_empty() => tokio::time::sleep(poll).await,
                 Ok(batch) => {
                     for stored in batch {
-                        self.deliver(&webhook, &secret, &consumer, &stored).await;
+                        self.deliver(&webhook, &secret, &stored).await;
                     }
                 }
                 // The topic is made by the first publish to it, which may
@@ -197,13 +184,7 @@ impl Delivery {
 
     /// Deliver one envelope: try until the receiver accepts it or the
     /// attempts are used, then move past it either way.
-    async fn deliver(
-        &self,
-        webhook: &Webhook,
-        secret: &WebhookSecret,
-        consumer: &ConsumerName,
-        stored: &Stored,
-    ) {
+    async fn deliver(&self, webhook: &Webhook, secret: &WebhookSecret, stored: &Stored) {
         let outcome = match stored.envelope.to_json_vec() {
             Ok(body) => self.attempts(webhook, secret, stored, &body).await,
             Err(error) => Err((1, format!("the envelope cannot be written: {error}"))),
@@ -212,13 +193,13 @@ impl Delivery {
             self.record_failure(webhook, stored, *attempts, error).await;
         }
         let committed = self
-            .broker
-            .commit_offset(&webhook.tenant, &webhook.topic, consumer, stored.offset)
+            .cursors
+            .set(Cursor::Webhook(webhook.id), stored.offset)
             .await;
         if let Err(error) = committed {
             // The next commit covers this one; a stop before it sends this
             // envelope again.
-            warn!(webhook = %webhook.id, offset = stored.offset, %error, "the webhook's offset could not be stored");
+            warn!(webhook = %webhook.id, offset = stored.offset, ?error, "the webhook's position could not be stored");
         }
         if outcome.is_ok() {
             self.delivered(webhook.id, stored.offset);
@@ -367,6 +348,7 @@ impl Webhooks {
     pub(crate) fn new(
         broker: Arc<dyn Broker>,
         engine: Arc<Engine>,
+        cursors: Arc<Cursors>,
         clock: Arc<dyn Clock>,
         settings: WebhookSettings,
         stream: StreamSettings,
@@ -389,6 +371,7 @@ impl Webhooks {
             delivery: Arc::new(Delivery {
                 broker,
                 engine,
+                cursors,
                 clock,
                 facts: Facts::new(),
                 http,
@@ -698,11 +681,5 @@ mod tests {
         let created = Entry::Created { webhook, secret };
         let text = String::from_utf8(created.encode().unwrap()).unwrap();
         assert!(text.contains(r#""op":"created""#), "{text}");
-    }
-
-    #[test]
-    fn a_webhooks_consumer_is_named_after_it() {
-        let id = WebhookId::generate();
-        assert_eq!(consumer_of(id).unwrap().as_str(), format!("webhook-{id}"));
     }
 }
