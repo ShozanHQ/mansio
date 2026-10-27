@@ -250,7 +250,7 @@ impl Op {
                 "Claim the oldest claimable item of a queue under a lease and print the lease id, the consumer, the expiry and the item. Prints nothing if there is none. A consumer that holds a live lease is given it again, so asking again after a lost answer is safe."
             }
             Op::WorkExtend => {
-                "Move the end of the lease of an item you claimed later, so that work that takes longer than the lease keeps its item. Prints the extended fact: its data.expires_at is the new end. A lease is never shortened and never runs past the server's longest lease from the claim. Safe to repeat."
+                "Move the end of the lease of an item you claimed later, so that work that takes longer than the lease keeps its item. Prints the extended fact: its data.expires_at is the new end. A lease is never shortened and never runs past the server's longest lease from the claim. Safe to repeat. A caller that works in blocking calls cannot extend during one: before a step that may outlast the lease, extend with seconds at least as long as the step is expected to take, and extend again between steps."
             }
             Op::WorkAck => {
                 "Complete an item you claimed, naming the consumer and presenting the lease."
