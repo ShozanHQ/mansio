@@ -79,21 +79,25 @@ async fn read_all(
 ) -> Result<Vec<Stored>, BrokerError> {
     let mut all = Vec::new();
     let mut offset = 0;
-    let mut width = page;
+    // Messages before this offset are read one at a time: the page that
+    // failed has a message in it that cannot be read.
+    let mut one_by_one_until = 0_u64;
     loop {
+        let width = if offset < one_by_one_until { 1 } else { page };
         let batch = match broker.poll(tenant, topic, offset, width).await {
             Ok(batch) => batch,
             Err(BrokerError::NotFound(_)) => break,
             // A page with a message in it that is not an envelope fails as a
-            // whole. Read one at a time to find which, and step over it.
+            // whole. Read it again one message at a time to find which, and
+            // step over that one. The rest of the page is read the same way,
+            // and the next page whole.
             Err(BrokerError::Corrupt(_)) if width > 1 => {
-                width = 1;
+                one_by_one_until = offset.saturating_add(u64::from(page));
                 continue;
             }
             Err(BrokerError::Corrupt(why)) => {
                 warn!(%tenant, %topic, offset, %why, "a message that cannot be read is skipped");
                 offset = offset.saturating_add(1);
-                width = page;
                 continue;
             }
             Err(error) => return Err(error),
@@ -104,7 +108,6 @@ async fn read_all(
             break;
         }
         offset = next;
-        width = page;
         all.extend(batch);
     }
     Ok(all)

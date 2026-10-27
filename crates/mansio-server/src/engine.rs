@@ -23,7 +23,7 @@
 //! recorded, and the item stays unclaimable until it is. A server that stops
 //! in between finds the same thing on restart.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::Duration;
@@ -155,8 +155,17 @@ impl Engine {
         let rebuilt = recover::replay(tenant, &logs, &self.facts, self.clock.now_millis())?;
         let items: usize = rebuilt.queues.values().map(crate::state::Queue::len).sum();
         info!(%tenant, items, alerts = rebuilt.alerts.len(), "state rebuilt");
+        // An alert the state already holds keeps the time it was accepted or
+        // last surfaced, unless the log says later: the log only has the
+        // producer's time for one that was never surfaced.
+        let mut alerts = rebuilt.alerts;
+        for (alert, at) in &mut alerts {
+            if let Some(known) = state.alerts.get(alert) {
+                *at = (*at).max(*known);
+            }
+        }
         state.queues = rebuilt.queues;
-        state.alerts = rebuilt.alerts;
+        state.alerts = alerts;
         state.acknowledged_alerts = rebuilt.acknowledged_alerts;
         state.loaded = true;
         Ok(())
@@ -204,11 +213,13 @@ impl Engine {
         let offset = match self.broker.publish(&envelope).await {
             Ok(offset) => offset,
             Err(error) => {
-                // An error does not say the message was not stored: the
-                // connection may have dropped after the write. The state no
-                // longer matches the logs, so the next use rebuilds it from
-                // them, which finds the message if it is there.
-                held.loaded = false;
+                if outcome_unknown(&error) {
+                    // The connection may have dropped after the write. The
+                    // state no longer matches the logs, so the next use
+                    // rebuilds it from them, which finds the message if it
+                    // is there.
+                    held.loaded = false;
+                }
                 return Err(error.into());
             }
         };
@@ -518,9 +529,8 @@ impl Engine {
 
     /// Everything that is due in a tenant at `now`, in the order to do it:
     /// leases that ran out, oldest first, then items whose backoff is over or
-    /// that owe a fact, then alerts to surface again. Except what is in
-    /// `skip`.
-    fn due(&self, held: &TenantState, now: i64, skip: &HashSet<Task>) -> Vec<Task> {
+    /// that owe a fact, then alerts to surface again.
+    fn due(&self, held: &TenantState, now: i64) -> Vec<Task> {
         let mut due: Vec<(u8, i64, Task)> = Vec::new();
         for (queue, items) in &held.queues {
             for (id, item) in items.iter() {
@@ -544,7 +554,6 @@ impl Engine {
                 due.push((2, *surfaced_at, Task::Resurface(*alert)));
             }
         }
-        due.retain(|(_, _, task)| !skip.contains(task));
         due.sort();
         due.into_iter().map(|(_, _, task)| task).collect()
     }
@@ -552,29 +561,18 @@ impl Engine {
     /// Do what is due in a tenant.
     ///
     /// A task that fails is logged and left for the next tick; it does not
-    /// hold up the others. If the failure leaves the state out of step with
-    /// the logs (a publish that may have been stored), the state is rebuilt
-    /// before going on.
+    /// hold up the others. If the failure leaves the outcome of a publish
+    /// unknown, the state no longer matches the logs, and the pass ends: the
+    /// next tick rebuilds the state before it does anything. So a broker that
+    /// cannot be reached costs one rebuild per tick, however many tasks are
+    /// due.
     async fn process_due(&self, held: &mut TenantState, tenant: &TenantId, now: i64) {
-        let mut failed: HashSet<Task> = HashSet::new();
-        loop {
-            let mut stale = false;
-            for task in self.due(held, now, &failed) {
-                if let Err(error) = self.do_task(held, tenant, &task, now).await {
-                    warn!(%tenant, ?task, ?error, "the timer could not finish a task");
-                    failed.insert(task);
-                    if !held.loaded {
-                        stale = true;
-                        break;
-                    }
+        for task in self.due(held, now) {
+            if let Err(error) = self.do_task(held, tenant, &task, now).await {
+                warn!(%tenant, ?task, ?error, "the timer could not finish a task");
+                if !held.loaded {
+                    return;
                 }
-            }
-            if !stale {
-                return;
-            }
-            if let Err(error) = self.load(tenant, held).await {
-                warn!(%tenant, ?error, "the state could not be rebuilt");
-                return;
             }
         }
     }
@@ -725,6 +723,13 @@ impl Engine {
         }
         Ok(())
     }
+}
+
+/// Whether a failed publish may still have stored the message. Only an error
+/// about reaching the broker may: a refusal, a missing topic or an invalid
+/// envelope all come before anything is stored.
+fn outcome_unknown(error: &BrokerError) -> bool {
+    matches!(error, BrokerError::Unavailable(_))
 }
 
 /// The open item, or 404.
