@@ -387,3 +387,68 @@ async fn a_restarted_server_resumes_a_webhook_where_it_stopped() -> anyhow::Resu
     target.delete_webhooks().await?;
     Ok(())
 }
+
+/// A webhook's position is the server's own: it is not reachable through the
+/// consumers API, so a credential that reads the topic cannot move a webhook
+/// by committing a consumer named after it, and what an admin commits under
+/// that name is a consumer of the admin's and nothing more.
+#[tokio::test]
+async fn a_consumer_named_after_a_webhook_does_not_move_it() -> anyhow::Result<()> {
+    let mut target = Target::start().await?;
+    if !target.is_local() {
+        return Ok(());
+    }
+    let receiver = Receiver::start(&target, []).await?;
+    for n in 0..3 {
+        target.publish("facts.build", &event(n)).await?;
+    }
+    let created = target.webhook("facts.build", &receiver.url).await?;
+    let id = created["webhook"]["id"]
+        .as_str()
+        .context("the id")?
+        .to_owned();
+    receiver.wait_for(&target, 3, SLACK).await?;
+    target
+        .until("all three to be kept", SLACK, || async {
+            Ok(target
+                .webhooks()
+                .await?
+                .iter()
+                .any(|webhook| webhook["last_delivered_offset"] == 2)
+                .then_some(()))
+        })
+        .await?;
+
+    // The consumer a webhook is named after is any other consumer's name.
+    let reader = target
+        .issue(
+            "person",
+            "reader",
+            &json!([{"topic": "facts.build", "verbs": ["subscribe"]}]),
+            None,
+        )
+        .await?;
+    let name = format!("webhook-{id}");
+    for token in [&reader.token, &target.token] {
+        let uri = format!("{}/commit", target.consumer_uri("facts.build", &name));
+        let (status, _) = target
+            .call(Method::POST, &uri, Some(token), Some(&json!({"offset": 0})))
+            .await?;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // A restarted server resumes the webhook after the third, not the first.
+    target.stop_server().await?;
+    target.start_server().await?;
+    target.publish("facts.build", &event(3)).await?;
+    receiver.wait_for(&target, 4, SLACK).await?;
+    tokio::time::sleep(target.settle()).await;
+    let got: Vec<String> = receiver
+        .requests()
+        .iter()
+        .map(|request| delivered_id(&request.body))
+        .collect::<anyhow::Result<_>>()?;
+    assert_eq!(got.len(), 4, "{got:?}: nothing was delivered twice");
+    target.delete_webhooks().await?;
+    Ok(())
+}

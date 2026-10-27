@@ -233,6 +233,9 @@ pub struct EffectiveSettings {
     /// `MANSIO_SSE_KEEPALIVE_SECONDS`: how often an event stream sends a
     /// comment to keep the connection open.
     pub sse_keepalive_seconds: u64,
+    /// `MANSIO_SHUTDOWN_GRACE_SECONDS`: how long a shutdown waits for the
+    /// requests still being served once the event streams are ended.
+    pub shutdown_grace_seconds: u64,
     /// `MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS`: the wait after a delivery's
     /// first failed attempt.
     pub webhook_backoff_base_seconds: u64,

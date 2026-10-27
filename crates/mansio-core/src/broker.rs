@@ -10,7 +10,7 @@ use crate::access::Grant;
 use crate::credential::Credential;
 use crate::envelope::Envelope;
 use crate::error::BrokerError;
-use crate::id::{ConsumerName, TenantId};
+use crate::id::TenantId;
 use crate::topic::Topic;
 
 /// An envelope as the broker holds it.
@@ -66,11 +66,19 @@ pub enum SystemLog {
     Principals,
     /// The registry of webhooks, which holds their signing secrets.
     Webhooks,
+    /// Where every named consumer and every webhook has got to. A consumer's
+    /// position is kept here and not in the broker's own consumer offsets,
+    /// which any credential that may read a topic could move.
+    Cursors,
 }
 
 impl SystemLog {
     /// Every log.
-    pub const ALL: [SystemLog; 2] = [SystemLog::Principals, SystemLog::Webhooks];
+    pub const ALL: [SystemLog; 3] = [
+        SystemLog::Principals,
+        SystemLog::Webhooks,
+        SystemLog::Cursors,
+    ];
 
     /// The name of the log: the topic it lives in.
     #[must_use]
@@ -78,6 +86,7 @@ impl SystemLog {
         match self {
             SystemLog::Principals => "principals",
             SystemLog::Webhooks => "webhooks",
+            SystemLog::Cursors => "cursors",
         }
     }
 }
@@ -224,48 +233,6 @@ pub trait Broker: Send + Sync {
         _max: u32,
     ) -> Result<Vec<SystemRecord>, BrokerError> {
         Err(unsupported("system records"))
-    }
-
-    /// The offset of the last message the named consumer committed on the
-    /// topic, or `None` if it has committed none. The broker keeps it, so it
-    /// survives a restart of the server. A consumer belongs to a tenant and a
-    /// topic, and its name is the whole of its identity.
-    ///
-    /// This is the admin identity's, like listing: the server first reads the
-    /// topic as the caller, so that the broker holds the caller to its right to
-    /// read it, and only then asks for the consumer.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::NotFound`] if the tenant or topic does not
-    /// exist, or an error if the broker cannot be reached, refuses, or keeps
-    /// no consumer offsets.
-    async fn consumer_offset(
-        &self,
-        _tenant: &TenantId,
-        _topic: &Topic,
-        _consumer: &ConsumerName,
-    ) -> Result<Option<u64>, BrokerError> {
-        Err(unsupported("consumer offsets"))
-    }
-
-    /// Store `offset` as the last message the named consumer has handled on
-    /// the topic, replacing what it was. Any offset may be stored, so a
-    /// consumer can be set back to read again. Like every write it is the
-    /// admin identity's.
-    ///
-    /// # Errors
-    ///
-    /// As [`Broker::consumer_offset`]; a failure other than a refusal that
-    /// comes first may have stored the offset.
-    async fn commit_offset(
-        &self,
-        _tenant: &TenantId,
-        _topic: &Topic,
-        _consumer: &ConsumerName,
-        _offset: u64,
-    ) -> Result<(), BrokerError> {
-        Err(unsupported("consumer offsets"))
     }
 
     /// Make a user called `name` that may reach only `tenant`, and only what

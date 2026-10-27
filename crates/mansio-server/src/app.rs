@@ -1,7 +1,7 @@
 //! The HTTP application: routes, handlers, and the `Server` builder a host
 //! application uses to run it in-process.
 
-use std::future::Future;
+use std::future::{Future, IntoFuture};
 use std::io;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -21,6 +21,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
+use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
@@ -28,6 +29,7 @@ use crate::auth::{Auth, Authenticated};
 use crate::clock::{Clock, SystemClock};
 use crate::consumers_api;
 use crate::credentials::Credentials;
+use crate::cursors::Cursors;
 use crate::engine::Engine;
 use crate::error::ApiError;
 use crate::events_api;
@@ -53,9 +55,27 @@ pub struct AppState {
     pub(crate) engine: Arc<Engine>,
     pub(crate) credentials: Arc<Credentials>,
     pub(crate) webhooks: Arc<Webhooks>,
+    pub(crate) cursors: Arc<Cursors>,
     pub(crate) auth: Auth,
     pub(crate) limits: Limits,
     pub(crate) streams: StreamSettings,
+    /// Becomes true when the server is shutting down, which ends every event
+    /// stream.
+    pub(crate) ending: watch::Receiver<bool>,
+}
+
+/// Ends every event stream of a server that is shutting down, so that a
+/// client that is connected to one does not hold the shutdown up.
+/// [`Server::serve`] does it when its shutdown signal comes; a host that
+/// mounts the routes itself calls [`Ender::end`] when it begins to stop.
+#[derive(Debug)]
+pub struct Ender(watch::Sender<bool>);
+
+impl Ender {
+    /// End every event stream.
+    pub fn end(&self) {
+        self.0.send_replace(true);
+    }
 }
 
 /// What [`Server::build`] makes: the routes, and the things that have to be
@@ -69,6 +89,9 @@ pub struct Parts {
     pub credentials: Arc<Credentials>,
     /// Webhooks. Run [`Webhooks::run`] alongside the routes.
     pub webhooks: Arc<Webhooks>,
+    /// Ends the event streams. Call [`Ender::end`] before the host stops
+    /// serving, or its graceful shutdown waits for them for ever.
+    pub ender: Ender,
 }
 
 /// The mansio HTTP server, ready to run.
@@ -237,9 +260,15 @@ impl Server {
             self.auth.principal().clone(),
             self.limits.poll_max_count,
         ));
+        let cursors = Arc::new(Cursors::new(
+            Arc::clone(&self.broker),
+            self.limits.poll_max_count,
+        ));
+        let (ender, ending) = watch::channel(false);
         let webhooks = Arc::new(Webhooks::new(
             Arc::clone(&self.broker),
             Arc::clone(&engine),
+            Arc::clone(&cursors),
             self.clock,
             self.webhooks,
             self.streams,
@@ -250,9 +279,11 @@ impl Server {
             engine: Arc::clone(&engine),
             credentials: Arc::clone(&credentials),
             webhooks: Arc::clone(&webhooks),
+            cursors,
             auth: self.auth,
             limits: self.limits,
             streams: self.streams,
+            ending,
         };
         let router = Router::new()
             .route("/healthz", get(healthz))
@@ -315,6 +346,7 @@ impl Server {
             engine,
             credentials,
             webhooks,
+            ender: Ender(ender),
         }
     }
 
@@ -324,7 +356,9 @@ impl Server {
         self.build().router
     }
 
-    /// Serve on `listener` until `shutdown` completes. Before it accepts a
+    /// Serve on `listener` until `shutdown` completes, then end the event
+    /// streams and wait up to `MANSIO_SHUTDOWN_GRACE_SECONDS` for the requests
+    /// still being served. Before it accepts a
     /// request the engine takes up what the broker holds and the registries of
     /// principals and webhooks are loaded, and while it runs the timer drives
     /// expiries, republishes and alerts, the sweep revokes expired
@@ -339,11 +373,13 @@ impl Server {
         listener: TcpListener,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> io::Result<()> {
+        let grace = self.streams.shutdown_grace;
         let Parts {
             router,
             engine,
             credentials,
             webhooks,
+            ender,
         } = self.build();
         if let Err(error) = engine.recover().await {
             warn!(
@@ -364,9 +400,34 @@ impl Server {
             );
         }
         let timer = Timer::start(engine, credentials, webhooks);
+        // The signal ends the event streams, which would otherwise never let
+        // the graceful shutdown finish, and starts the clock on what is left.
+        let stopping = Arc::new(Notify::new());
+        let signal = {
+            let stopping = Arc::clone(&stopping);
+            async move {
+                shutdown.await;
+                ender.end();
+                stopping.notify_one();
+            }
+        };
         let served = axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown)
-            .await;
+            .with_graceful_shutdown(signal)
+            .into_future();
+        let out_of_time = async {
+            stopping.notified().await;
+            tokio::time::sleep(grace).await;
+        };
+        let served = tokio::select! {
+            served = served => served,
+            () = out_of_time => {
+                warn!(
+                    grace_seconds = grace.as_secs(),
+                    "requests were still being served when the grace for shutdown ran out; stopping anyway"
+                );
+                Ok(())
+            }
+        };
         timer.stop().await;
         served
     }
@@ -400,6 +461,7 @@ async fn settings(
         credential_sweep_seconds: seconds(credentials.sweep),
         stream_poll_millis: u64::try_from(state.streams.poll.as_millis()).unwrap_or(u64::MAX),
         sse_keepalive_seconds: seconds(state.streams.sse_keepalive),
+        shutdown_grace_seconds: seconds(state.streams.shutdown_grace),
         webhook_backoff_base_seconds: seconds(webhooks.backoff_base),
         webhook_backoff_cap_seconds: seconds(webhooks.backoff_cap),
         webhook_max_attempts: webhooks.max_attempts,
