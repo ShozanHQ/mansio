@@ -714,23 +714,39 @@ async fn a_consumer_that_extends_every_half_lease_keeps_its_item_for_many_leases
         "the test holds the item for five leases"
     );
 
+    // Extend on a schedule of half leases from the start, so that a slow
+    // answer does not push the next extension later. Hold it for five leases
+    // of wall time, however many extensions that takes on this machine.
     let started = Instant::now();
+    let half = lease / 2;
     let mut end = millis(&claim.expires_at)?;
-    let mut extensions = 0;
-    while started.elapsed() < lease * 5 {
-        tokio::time::sleep(lease / 2).await;
+    let mut extensions = 0_u32;
+    let mut held = Duration::ZERO;
+    while held < lease * 5 {
+        extensions += 1;
+        tokio::time::sleep_until(tokio::time::Instant::from_std(started + half * extensions)).await;
         let extended = extended_to(&target.extend_claim(QUEUE, &claim, None).await?)?;
         assert!(extended > end, "the end moved from {end} to {extended}");
         end = extended;
-        extensions += 1;
+        held = started.elapsed();
         // Nobody else is given it, whatever they ask.
         assert!(target.pull(QUEUE, "other").await?.is_none());
     }
-    assert!(extensions >= 9, "{extensions} extensions in five leases");
+    // Each extension reaches a lease from the time it is made, so holding the
+    // item for a stretch of time takes a count of them that the stretch
+    // fixes: the claim covers the first lease and the rest are extensions.
+    let leases_held = held.as_millis() / lease.as_millis();
+    assert!(
+        u128::from(extensions) + 1 >= leases_held,
+        "{extensions} extensions held it for {held:?}, which is {leases_held} leases"
+    );
 
     target.ack_claim(QUEUE, &claim).await?;
     let mut expected = vec!["claimed"];
-    expected.extend(std::iter::repeat_n("extended", extensions));
+    expected.extend(std::iter::repeat_n(
+        "extended",
+        usize::try_from(extensions)?,
+    ));
     expected.push("acked");
     assert_eq!(target.work_transitions().await?, expected);
     assert_eq!(

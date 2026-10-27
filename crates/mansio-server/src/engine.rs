@@ -370,7 +370,7 @@ impl Engine {
             .map(|(id, item, lease)| (id.clone(), item.message.clone(), lease.clone()));
         if let Some((id, message, lease)) = existing {
             return self
-                .give_again(&mut held, tenant, queue, id, message, lease)
+                .give_again(&mut held, tenant, queue, id, message, lease, now)
                 .await
                 .map(Some);
         }
@@ -392,7 +392,7 @@ impl Engine {
             expires_at: now.saturating_add(millis(self.settings.lease)),
             claimed_at: now,
         };
-        self.record_claim(&mut held, tenant, queue, &id, &message, &lease)
+        self.record_claim(&mut held, tenant, queue, &id, &message, &lease, now)
             .await?;
         held.queue_mut(queue)
             .set_phase(&id, Phase::Leased(lease.clone()));
@@ -404,7 +404,11 @@ impl Engine {
         }))
     }
 
-    /// Record that `lease` is held on the item, as a `claimed` fact.
+    /// Record that `lease` is held on the item, as a `claimed` fact made at
+    /// `now`. The caller reads the clock once and passes it here, so that the
+    /// fact of a fresh claim is timed at the moment the lease says it was
+    /// claimed: a replay counts the longest lease from that fact.
+    #[expect(clippy::too_many_arguments, reason = "a fact needs all of them")]
     async fn record_claim(
         &self,
         held: &mut TenantState,
@@ -413,8 +417,8 @@ impl Engine {
         item: &ItemId,
         message: &Envelope,
         lease: &Lease,
+        now: i64,
     ) -> Result<(), ApiError> {
-        let now = self.clock.now_millis();
         let mut data = WorkFact::new(queue.clone(), message.id, message.attempt.unwrap_or(1));
         data.lease = Some(lease.fingerprint);
         data.holder = Some(lease.holder.clone());
@@ -427,7 +431,12 @@ impl Engine {
         Ok(())
     }
 
-    /// The lease a consumer already holds, handed to it again.
+    /// The lease a consumer already holds, handed to it again. `now` is the
+    /// time of the pull.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the state, the item and the lease"
+    )]
     async fn give_again(
         &self,
         held: &mut TenantState,
@@ -436,6 +445,7 @@ impl Engine {
         item: ItemId,
         message: Envelope,
         lease: Lease,
+        now: i64,
     ) -> Result<Claimed, ApiError> {
         let expires_at = timestamp(lease.expires_at)?;
         if let Some(Remembered(lease_id)) = lease.id {
@@ -454,7 +464,7 @@ impl Engine {
             id: Some(Remembered(lease_id)),
             ..lease
         };
-        self.record_claim(held, tenant, queue, &item, &message, &renewed)
+        self.record_claim(held, tenant, queue, &item, &message, &renewed, now)
             .await?;
         held.queue_mut(queue)
             .set_phase(&item, Phase::Leased(renewed.clone()));

@@ -13,9 +13,10 @@
 //! a second pass fails without its first.
 //!
 //! - `restart_first_pass` and `restart_second_pass`: a queue longer than
-//!   `MANSIO_POLL_MAX_COUNT`, one item claimed before the restart. After it
-//!   the lease still holds, the item is retried exactly once, and every other
-//!   item can be claimed once.
+//!   `MANSIO_POLL_MAX_COUNT`, one item claimed before the restart and its lease
+//!   extended to twice the lease setting. After it the lease still holds, past
+//!   the end it first had, until the end it was extended to; the item is then
+//!   retried exactly once, and every other item can be claimed once.
 //! - `retention_first_pass` and `retention_second_pass`: an `alerts` topic on a
 //!   short retention loses its head to Iggy's cleaner, and an alert is
 //!   published after that. After the restart the server's rebuild, which
@@ -34,7 +35,7 @@ use mansio_server::Limits;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
-use crate::harness::{LocalSettings, SLACK, Target, item_of, job, millis, type_names};
+use crate::harness::{LocalSettings, SLACK, Target, extended_to, item_of, job, millis, type_names};
 
 const QUEUE: &str = "builds";
 /// The consumer name before and after the restart.
@@ -105,8 +106,9 @@ fn now_millis() -> anyhow::Result<i64> {
 
 // ---- the restart passes --------------------------------------------------------
 
-/// Publish a queue longer than a page of the server's, and claim the oldest
-/// item. Returns what the second pass needs.
+/// Publish a queue longer than a page of the server's, claim the oldest item
+/// and extend its lease to twice the lease setting from now. Returns what the
+/// second pass needs.
 async fn restart_before(target: &Target) -> anyhow::Result<Value> {
     let page = target.settings.poll_max_count;
     ensure!(
@@ -125,12 +127,25 @@ async fn restart_before(target: &Target) -> anyhow::Result<Value> {
         held == items[0],
         "the oldest item should be claimed first, not {held}"
     );
+    ensure!(
+        target.lease_max() >= target.lease() * 2,
+        "MANSIO_LEASE_MAX_SECONDS is below twice MANSIO_LEASE_SECONDS: the lease cannot be extended"
+    );
+    let extended = target
+        .extend_claim(QUEUE, &claim, Some(target.lease().as_secs() * 2))
+        .await?;
+    let extended_end = extended_to(&extended)?;
+    ensure!(
+        extended_end > millis(&claim.expires_at)?,
+        "the extension should end the lease later than the claim did"
+    );
     Ok(json!({
         "tenant": target.tenant,
         "items": items,
         "held": held,
         "lease_id": claim.lease_id.to_string(),
         "expires_at": millis(&claim.expires_at)?,
+        "extended_to": extended_end,
     }))
 }
 
@@ -143,15 +158,18 @@ fn item_of_published(published: &mansio_core::api::Published) -> anyhow::Result<
         .to_string())
 }
 
-/// The server has been restarted: the lease taken before it still holds, the
-/// item is retried exactly once after it, and every other item is claimable
-/// once.
+/// The server has been restarted: the lease taken before it still holds, past
+/// the end it first had and until the end it was extended to, the item is
+/// retried exactly once after that, and every other item is claimable once.
 async fn restart_after(target: &Target, state: &Value) -> anyhow::Result<()> {
     let items = texts(state, "items")?;
     let held = text(state, "held")?.to_owned();
-    let expires_at = state["expires_at"]
+    let first_end = state["expires_at"]
         .as_i64()
         .context("expires_at in the state of the first pass")?;
+    let expires_at = state["extended_to"]
+        .as_i64()
+        .context("extended_to in the state of the first pass")?;
 
     // Every other item is claimable once, oldest first, as before the restart:
     // the server read the queue back from the topic, past its first page. Each
@@ -181,22 +199,54 @@ async fn restart_after(target: &Target, state: &Value) -> anyhow::Result<()> {
     let late = now_millis()?;
     ensure!(
         late < expires_at,
-        "the lease taken before the restart ended {} ms before these checks were done: raise MANSIO_LEASE_SECONDS in the step",
+        "the lease taken before the restart and extended ended {} ms before these checks were done: raise MANSIO_LEASE_SECONDS in the step",
         late - expires_at
     );
 
-    // After the lease and the backoff the item is claimed again, as attempt 2.
+    // The lease was extended, and the new server read that back: past the end
+    // it first had, the item is still invisible, and the holder is told the
+    // end it was extended to. It is given a new id, as a lease read back from
+    // the facts has to be, and the old one stops working.
+    if late < first_end {
+        tokio::time::sleep(Duration::from_millis(u64::try_from(first_end - late)?)).await;
+    }
+    tokio::time::sleep(target.settle()).await;
+    ensure!(
+        now_millis()? > first_end && now_millis()? < expires_at,
+        "the checks of a lease past its first end and before its extended end need a lease of several seconds (MANSIO_LEASE_SECONDS in the step)"
+    );
+    assert!(target.pull(QUEUE, AFTER).await?.is_none());
+    let held_again = target
+        .pull(QUEUE, BEFORE)
+        .await?
+        .context("the lease the holder still has")?;
+    assert_eq!(item_of(&held_again)?, held);
+    assert_eq!(millis(&held_again.expires_at)?, expires_at);
+    assert_ne!(held_again.lease_id.to_string(), text(state, "lease_id")?);
+    let (status, body) = target
+        .ack(QUEUE, &held, BEFORE, text(state, "lease_id")?)
+        .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "the old id: {body}");
+    let late = now_millis()?;
+    ensure!(
+        late < expires_at,
+        "the extended lease ended during the checks"
+    );
+
+    // After the extended end and the backoff the item is claimed again, as
+    // attempt 2.
     let remaining = Duration::from_millis(u64::try_from(expires_at - late)?);
     let retried = target
         .claim(QUEUE, AFTER, remaining + target.backoff(1) + SLACK)
         .await?;
     ensure!(
         now_millis()? >= expires_at,
-        "the item was claimed again before its lease ended"
+        "the item was claimed again before its extended lease ended"
     );
     assert_eq!(item_of(&retried)?, held);
     assert_eq!(retried.item.attempt, Some(2));
     assert_ne!(retried.lease_id.to_string(), text(state, "lease_id")?);
+    assert_ne!(retried.lease_id, held_again.lease_id);
     target.ack_claim(QUEUE, &retried).await?;
 
     // Exactly once: nothing is left to claim, however long the server looks.
@@ -205,8 +255,9 @@ async fn restart_after(target: &Target, state: &Value) -> anyhow::Result<()> {
     assert!(target.pull(QUEUE, AFTER).await?.is_none());
 
     // The topics say the same. Each item was claimed and acknowledged; the
-    // one that was under the lease expired, was retried once and was claimed
-    // and acknowledged again.
+    // one that was under the lease was extended, given a new lease id after the
+    // restart, expired, was retried once and was claimed and acknowledged
+    // again.
     let facts = target.read("facts.work").await?;
     for item in &items {
         let about: Vec<Envelope> = facts
@@ -217,7 +268,9 @@ async fn restart_after(target: &Target, state: &Value) -> anyhow::Result<()> {
             .cloned()
             .collect();
         let expected: &[&str] = if *item == held {
-            &["claimed", "expired", "retried", "claimed", "acked"]
+            &[
+                "claimed", "extended", "claimed", "expired", "retried", "claimed", "acked",
+            ]
         } else {
             &["claimed", "acked"]
         };
@@ -225,7 +278,7 @@ async fn restart_after(target: &Target, state: &Value) -> anyhow::Result<()> {
     }
     assert_eq!(
         facts.len(),
-        5 + 2 * (items.len() - 1),
+        7 + 2 * (items.len() - 1),
         "no other transition"
     );
     let queue = target.read("work.builds").await?;

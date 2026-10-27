@@ -825,6 +825,7 @@ mod tests {
             (Method::GET, "/v1/settings"),
             (Method::POST, "/v1/tenants/acme/work/builds/items"),
             (Method::POST, "/v1/tenants/acme/work/builds/pull"),
+            (Method::POST, "/v1/tenants/acme/work/builds/items/i/extend"),
             (Method::POST, "/v1/tenants/acme/work/builds/items/i/ack"),
             (Method::POST, "/v1/tenants/acme/work/builds/items/i/fail"),
             (Method::POST, "/v1/tenants/acme/alerts"),
@@ -917,6 +918,44 @@ mod tests {
                 Method::POST,
                 "/v1/tenants/acme/work/builds/pull".to_owned(),
                 r#"{"consumer":"w","x":1}"#.to_owned(),
+            ),
+            // An extension carries a consumer and a lease id, and may carry a
+            // number of seconds of at least 1.
+            (Method::POST, format!("{item}/i/extend"), "{}".to_owned()),
+            (
+                Method::POST,
+                format!("{item}/i/extend"),
+                r#"{"lease_id":"nope","consumer":"w"}"#.to_owned(),
+            ),
+            (
+                Method::POST,
+                format!("{item}/i/extend"),
+                format!(r#"{{"lease_id":"{lease}"}}"#),
+            ),
+            (
+                Method::POST,
+                format!("{item}/i/extend"),
+                format!(r#"{{"lease_id":"{lease}","consumer":"a b"}}"#),
+            ),
+            (
+                Method::POST,
+                format!("{item}/i/extend"),
+                format!(r#"{{"lease_id":"{lease}","consumer":"w","seconds":0}}"#),
+            ),
+            (
+                Method::POST,
+                format!("{item}/i/extend"),
+                format!(r#"{{"lease_id":"{lease}","consumer":"w","seconds":-1}}"#),
+            ),
+            (
+                Method::POST,
+                format!("{item}/i/extend"),
+                format!(r#"{{"lease_id":"{lease}","consumer":"w","seconds":"soon"}}"#),
+            ),
+            (
+                Method::POST,
+                format!("{item}/i/extend"),
+                format!(r#"{{"lease_id":"{lease}","consumer":"w","until":"noon"}}"#),
             ),
             // An ack and a fail carry a consumer and a lease id, and a fail a
             // reason.
@@ -1459,6 +1498,11 @@ mod tests {
                     Method::POST,
                     format!("{base}/work/builds/pull"),
                     r#"{"consumer":"w"}"#.to_owned(),
+                ),
+                (
+                    Method::POST,
+                    format!("{base}/work/builds/items/i/extend"),
+                    format!(r#"{{"lease_id":"{lease}","consumer":"w"}}"#),
                 ),
                 (
                     Method::POST,

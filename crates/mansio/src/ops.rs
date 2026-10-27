@@ -797,47 +797,22 @@ pub async fn run(
             Ok(vec![member(answered(reply, "work_publish")?, "envelope")?])
         }
         Op::WorkPull => work_pull(client, &args).await,
-        Op::WorkExtend | Op::WorkAck | Op::WorkFail => {
-            let tenant: TenantId = args.parse("tenant")?;
-            let queue: Segment = args.parse("queue")?;
-            let item = args.text("item").context("item is required")?;
-            let lease: mansio_core::LeaseId = args.parse("lease_id")?;
-            let consumer: ConsumerName = args.parse("consumer")?;
-            let mut body = json!({ "lease_id": lease, "consumer": consumer });
-            let (verb, replay) = match op {
-                // An extension done twice leaves the lease running to the
-                // later of the two ends, as once would: safe to send again.
-                Op::WorkExtend => {
-                    if let Some(seconds) = args.int("seconds") {
-                        body["seconds"] = json!(seconds);
-                    }
-                    ("extend", Replay::Safe)
-                }
-                Op::WorkAck => ("ack", Replay::Unsafe),
-                _ => {
-                    body["reason"] = json!(args.text("reason").context("reason is required")?);
-                    ("fail", Replay::Unsafe)
-                }
-            };
-            let reply = client
-                .call(
-                    Method::POST,
-                    &[
-                        "v1",
-                        "tenants",
-                        tenant.as_str(),
-                        "work",
-                        queue.as_str(),
-                        "items",
-                        item,
-                        verb,
-                    ],
-                    &[],
-                    Some(&body),
-                    replay,
-                )
-                .await?;
-            Ok(vec![member(answered(reply, &op.name())?, "envelope")?])
+        // An extension done twice leaves the lease running to the later of the
+        // two ends, as once would: it is safe to send again. An ack and a fail
+        // are not.
+        Op::WorkExtend => {
+            let seconds: Vec<(&str, Value)> = args
+                .int("seconds")
+                .map(|seconds| ("seconds", json!(seconds)))
+                .into_iter()
+                .collect();
+            lease_call(client, op, &args, "extend", &seconds, Replay::Safe).await
+        }
+        Op::WorkAck => lease_call(client, op, &args, "ack", &[], Replay::Unsafe).await,
+        Op::WorkFail => {
+            let reason = args.text("reason").context("reason is required")?;
+            let reason = [("reason", json!(reason))];
+            lease_call(client, op, &args, "fail", &reason, Replay::Unsafe).await
         }
         Op::AlertsPublish => {
             let tenant: TenantId = args.parse("tenant")?;
@@ -992,6 +967,47 @@ pub async fn run(
             .await?,
         ]),
     }
+}
+
+/// `work_extend`, `work_ack` and `work_fail`: a call on an item under a lease,
+/// naming the consumer and presenting the lease id, with whatever else the
+/// operation sends in `extra`. It prints the envelope of the transition.
+async fn lease_call(
+    client: &Client,
+    op: Op,
+    args: &Args<'_>,
+    verb: &str,
+    extra: &[(&str, Value)],
+    replay: Replay,
+) -> anyhow::Result<Vec<Value>> {
+    let tenant: TenantId = args.parse("tenant")?;
+    let queue: Segment = args.parse("queue")?;
+    let item = args.text("item").context("item is required")?;
+    let lease: mansio_core::LeaseId = args.parse("lease_id")?;
+    let consumer: ConsumerName = args.parse("consumer")?;
+    let mut body = json!({ "lease_id": lease, "consumer": consumer });
+    for (name, value) in extra {
+        body[*name] = value.clone();
+    }
+    let reply = client
+        .call(
+            Method::POST,
+            &[
+                "v1",
+                "tenants",
+                tenant.as_str(),
+                "work",
+                queue.as_str(),
+                "items",
+                item,
+                verb,
+            ],
+            &[],
+            Some(&body),
+            replay,
+        )
+        .await?;
+    Ok(vec![member(answered(reply, &op.name())?, "envelope")?])
 }
 
 /// `work_pull`, looking again every poll interval until an item is claimed or
