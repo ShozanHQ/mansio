@@ -1,11 +1,15 @@
 //! The standalone mansio server.
+//!
+//! `mansio-server` serves. `mansio-server provision-admin` makes the Iggy
+//! user the server acts as, using the root credentials from the environment
+//! once, so that the server itself is never given them.
 
 use std::io::IsTerminal;
 use std::sync::Arc;
 
 use anyhow::Context;
 use mansio_core::{Broker, MemoryBroker, NoSink, Sink};
-use mansio_iggy::IggyBroker;
+use mansio_iggy::{IggyBroker, Provisioned, provision_admin};
 use mansio_server::{Auth, Backend, FileSink, Server, Settings};
 use tokio::net::TcpListener;
 use tracing::info;
@@ -20,6 +24,28 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    match std::env::args().nth(1).as_deref() {
+        None => serve().await,
+        Some("provision-admin") => provision().await,
+        Some(other) => anyhow::bail!("unknown command {other:?}; the only one is provision-admin"),
+    }
+}
+
+/// Make the Iggy user the server acts as, or set its permissions again.
+async fn provision() -> anyhow::Result<()> {
+    let config = Settings::provision_from_env().context("reading settings")?;
+    let user = config.admin_username.clone();
+    let done = provision_admin(config)
+        .await
+        .context("making the Iggy admin user")?;
+    match done {
+        Provisioned::Created => info!(%user, "made the Iggy admin user"),
+        Provisioned::Updated => info!(%user, "the Iggy admin user exists; its permissions are set"),
+    }
+    Ok(())
+}
+
+async fn serve() -> anyhow::Result<()> {
     let settings = Settings::from_env().context("reading settings")?;
 
     let broker_name = settings.broker.name();
@@ -55,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
         .with_sink(sink)
         .with_limits(settings.limits)
         .with_work_settings(settings.work)
+        .with_credential_settings(settings.credentials)
         .serve(listener, shutdown_signal())
         .await
         .context("serving")?;

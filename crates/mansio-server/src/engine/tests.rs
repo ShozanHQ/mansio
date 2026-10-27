@@ -76,7 +76,11 @@ impl Broker for FlakyBroker {
         self.inner.ensure_topic(tenant, topic).await
     }
 
-    async fn publish(&self, envelope: &Envelope) -> Result<Option<u64>, BrokerError> {
+    async fn publish(
+        &self,
+        caller: &Caller<'_>,
+        envelope: &Envelope,
+    ) -> Result<Option<u64>, BrokerError> {
         let refused = {
             let failing = self.failing.lock().unwrap();
             failing.contains(&envelope.topic.to_string())
@@ -85,17 +89,18 @@ impl Broker for FlakyBroker {
         if refused {
             return Err(BrokerError::Unavailable("injected".to_owned()));
         }
-        self.inner.publish(envelope).await
+        self.inner.publish(caller, envelope).await
     }
 
     async fn poll(
         &self,
+        caller: &Caller<'_>,
         tenant: &TenantId,
         topic: &Topic,
         offset: u64,
         max: u32,
     ) -> Result<Vec<Stored>, BrokerError> {
-        self.inner.poll(tenant, topic, offset, max).await
+        self.inner.poll(caller, tenant, topic, offset, max).await
     }
 }
 
@@ -209,7 +214,10 @@ impl Rig {
         message.attempt = Some(1);
         message.subject = Some(name.parse().unwrap());
         message.data = Some(json!({"name": name}));
-        self.engine.work_publish(message).await.unwrap();
+        self.engine
+            .work_publish(&Caller::Admin, message)
+            .await
+            .unwrap();
         item
     }
 
@@ -233,7 +241,11 @@ impl Rig {
     }
 
     async fn read(&self, topic: &Topic) -> Vec<Envelope> {
-        match self.broker.poll(&tenant(), topic, 0, 1000).await {
+        match self
+            .broker
+            .poll(&Caller::Admin, &tenant(), topic, 0, 1000)
+            .await
+        {
             Ok(stored) => stored.into_iter().map(|s| s.envelope).collect(),
             Err(BrokerError::NotFound(_)) => Vec::new(),
             Err(error) => panic!("{error}"),
@@ -554,7 +566,7 @@ async fn publishing_work_through_the_generic_route_is_refused() {
         message.topic = topic.parse().unwrap();
         assert!(
             matches!(
-                rig.engine.publish(message.clone()).await,
+                rig.engine.publish(&Caller::Admin, message.clone()).await,
                 Err(ApiError::BadRequest(_))
             ),
             "{topic}"
@@ -562,7 +574,7 @@ async fn publishing_work_through_the_generic_route_is_refused() {
     }
     assert!(rig.sink.all().is_empty());
     message.topic = "facts.build".parse().unwrap();
-    assert!(rig.engine.publish(message).await.is_ok());
+    assert!(rig.engine.publish(&Caller::Admin, message).await.is_ok());
 }
 
 #[tokio::test]
@@ -572,7 +584,11 @@ async fn an_item_id_that_is_still_open_cannot_be_published_again() {
     let published = rig.read(&Topic::Work(queue())).await;
     let again = published[0].clone();
     assert_eq!(again.item_id, Some(item));
-    let error = rig.engine.work_publish(again).await.unwrap_err();
+    let error = rig
+        .engine
+        .work_publish(&Caller::Admin, again)
+        .await
+        .unwrap_err();
     assert!(matches!(error, ApiError::Conflict(_)));
     assert_eq!(rig.read(&Topic::Work(queue())).await.len(), 1);
 }
@@ -588,7 +604,7 @@ async fn publish_alert(rig: &Rig) -> EventId {
         agent("monitor"),
     );
     alert.time = Some(Timestamp::from_unix_millis(rig.clock.now_millis()).unwrap());
-    rig.engine.publish(alert).await.unwrap();
+    rig.engine.publish(&Caller::Admin, alert).await.unwrap();
     id
 }
 
@@ -928,7 +944,7 @@ async fn concurrent_publishes_reach_the_sink_in_the_order_they_reach_the_topic()
                 agent("one"),
             );
             message.data = Some(json!({"n": n}));
-            engine.publish(message).await.unwrap();
+            engine.publish(&Caller::Admin, message).await.unwrap();
         }));
     }
     for publish in publishes {

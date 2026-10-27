@@ -9,8 +9,8 @@ use secrecy::SecretString;
 
 /// Default Iggy TCP address.
 pub const DEFAULT_ADDRESS: &str = "127.0.0.1:8090";
-/// Default Iggy user, the root user of a development server.
-pub const DEFAULT_USERNAME: &str = "iggy";
+/// Default Iggy user: the admin user made for mansio, not the root user.
+pub const DEFAULT_USERNAME: &str = "mansio";
 /// Default time to wait for Iggy at startup.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Default number of recent messages searched for a publish that Iggy
@@ -133,7 +133,8 @@ impl Default for DurabilityPolicy {
 pub struct IggyConfig {
     /// `host:port` of Iggy's TCP listener.
     pub address: String,
-    /// The admin user mansio acts as.
+    /// The admin user mansio acts as. It manages users and streams and
+    /// reads and writes every topic, and is not the root user.
     pub username: String,
     /// Its password.
     pub password: SecretString,

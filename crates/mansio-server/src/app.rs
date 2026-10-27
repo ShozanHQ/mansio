@@ -9,12 +9,12 @@ use std::sync::Arc;
 use axum::extract::rejection::{BytesRejection, PathRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use mansio_core::api::{EffectiveSettings, Polled, Published};
 use mansio_core::{
-    Broker, Envelope, EventId, NoSink, ParseError, Principal, Sink, Stored, TenantId, Timestamp,
+    Action, Broker, Envelope, EventId, NoSink, ParseError, Principal, Sink, TenantId, Timestamp,
     Topic,
 };
 use serde::Deserialize;
@@ -26,9 +26,11 @@ use tracing::warn;
 
 use crate::auth::{Auth, Authenticated};
 use crate::clock::{Clock, SystemClock};
+use crate::credentials::Credentials;
 use crate::engine::Engine;
 use crate::error::ApiError;
-use crate::settings::{Limits, WorkSettings};
+use crate::principals_api;
+use crate::settings::{CredentialSettings, Limits, WorkSettings};
 use crate::work_api;
 
 /// Attributes the server sets itself, from the path and the credential. A
@@ -43,17 +45,30 @@ const WORK_SET: [&str; 2] = ["itemid", "attempt"];
 pub struct AppState {
     pub(crate) broker: Arc<dyn Broker>,
     pub(crate) engine: Arc<Engine>,
+    pub(crate) credentials: Arc<Credentials>,
     pub(crate) auth: Auth,
     pub(crate) limits: Limits,
+}
+
+/// What [`Server::build`] makes: the routes, and the two things that have to
+/// be run alongside them.
+pub struct Parts {
+    /// The routes.
+    pub router: Router,
+    /// The work and alert engine. Run [`Engine::run`] alongside the routes.
+    pub engine: Arc<Engine>,
+    /// Credentials. Run [`Credentials::run`] alongside the routes.
+    pub credentials: Arc<Credentials>,
 }
 
 /// The mansio HTTP server, ready to run.
 ///
 /// A host application builds one with its own [`Broker`] and [`Sink`] and
 /// calls [`Server::serve`], which also runs the timer that expires leases,
-/// republishes items and surfaces alerts again. A host that mounts the
-/// [`Router`] itself takes it from [`Server::build`] together with the
-/// [`Engine`], and runs [`Engine::run`] alongside.
+/// republishes items and surfaces alerts again, and the sweep that revokes
+/// expired credentials. A host that mounts the [`Router`] itself takes it from
+/// [`Server::build`] together with the [`Engine`] and [`Credentials`], and
+/// runs [`Engine::run`] and [`Credentials::run`] alongside.
 pub struct Server {
     broker: Arc<dyn Broker>,
     sink: Arc<dyn Sink>,
@@ -61,6 +76,7 @@ pub struct Server {
     auth: Auth,
     limits: Limits,
     work: WorkSettings,
+    credentials: CredentialSettings,
 }
 
 /// Aborts a task when dropped, so that a server that is dropped or stopped
@@ -85,6 +101,7 @@ impl Server {
             auth,
             limits: Limits::default(),
             work: WorkSettings::default(),
+            credentials: CredentialSettings::default(),
         }
     }
 
@@ -109,6 +126,13 @@ impl Server {
         self
     }
 
+    /// Use these credential settings instead of the defaults.
+    #[must_use]
+    pub fn with_credential_settings(mut self, credentials: CredentialSettings) -> Self {
+        self.credentials = credentials;
+        self
+    }
+
     /// Read time from `clock` instead of the system clock.
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
@@ -116,20 +140,31 @@ impl Server {
         self
     }
 
-    /// The routes, and the engine behind them. Nothing drives the engine's
-    /// timer until [`Engine::run`] is, or [`Engine::tick`] is called.
-    pub fn build(self) -> (Router, Arc<Engine>) {
+    /// The routes, and the engine and credentials behind them. Nothing drives
+    /// the engine's timer or the credential sweep until [`Engine::run`] and
+    /// [`Credentials::run`] are, or [`Engine::tick`] and [`Credentials::sweep`]
+    /// are called.
+    pub fn build(self) -> Parts {
         let max_body = self.limits.max_body_bytes;
         let engine = Arc::new(Engine::new(
             Arc::clone(&self.broker),
             self.sink,
-            self.clock,
+            Arc::clone(&self.clock),
             self.work,
+            self.limits.poll_max_count,
+        ));
+        let credentials = Arc::new(Credentials::new(
+            Arc::clone(&self.broker),
+            Arc::clone(&engine),
+            self.clock,
+            self.credentials,
+            self.auth.principal().clone(),
             self.limits.poll_max_count,
         ));
         let state = AppState {
             broker: self.broker,
             engine: Arc::clone(&engine),
+            credentials: Arc::clone(&credentials),
             auth: self.auth,
             limits: self.limits,
         };
@@ -164,21 +199,35 @@ impl Server {
                 "/v1/tenants/{tenant}/alerts/{alert}/ack",
                 post(work_api::alerts_ack),
             )
+            .route(
+                "/v1/principals",
+                post(principals_api::principals_create).get(principals_api::principals_list),
+            )
+            .route(
+                "/v1/principals/{id}",
+                delete(principals_api::principals_revoke),
+            )
             .fallback(not_found)
             .layer(DefaultBodyLimit::max(max_body))
             .with_state(Arc::new(state));
-        (router, engine)
+        Parts {
+            router,
+            engine,
+            credentials,
+        }
     }
 
-    /// The routes. The engine's timer does not run; see [`Server::build`].
+    /// The routes. The engine's timer and the credential sweep do not run;
+    /// see [`Server::build`].
     pub fn router(self) -> Router {
-        self.build().0
+        self.build().router
     }
 
     /// Serve on `listener` until `shutdown` completes. Before it accepts a
-    /// request the engine takes up what the broker holds, and while it runs
-    /// the timer drives expiries, republishes and alerts. Dropping the future
-    /// stops the timer too.
+    /// request the engine takes up what the broker holds and the registry of
+    /// principals is loaded, and while it runs the timer drives expiries,
+    /// republishes and alerts, and the sweep revokes expired credentials.
+    /// Dropping the future stops both.
     ///
     /// # Errors
     ///
@@ -188,14 +237,25 @@ impl Server {
         listener: TcpListener,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> io::Result<()> {
-        let (router, engine) = self.build();
+        let Parts {
+            router,
+            engine,
+            credentials,
+        } = self.build();
         if let Err(error) = engine.recover().await {
             warn!(
                 ?error,
                 "the tenants could not be listed; the timer will try again"
             );
         }
+        if let Err(error) = credentials.load().await {
+            warn!(
+                ?error,
+                "the registry of principals could not be loaded; the next request will try again"
+            );
+        }
         let _timer = AbortOnDrop(tokio::spawn(engine.run()));
+        let _sweep = AbortOnDrop(tokio::spawn(credentials.run()));
         axum::serve(listener, router)
             .with_graceful_shutdown(shutdown)
             .await
@@ -211,6 +271,7 @@ async fn settings(
     _auth: Authenticated,
 ) -> Json<EffectiveSettings> {
     let work = state.engine.settings();
+    let credentials = state.credentials.settings();
     let limits = &state.limits;
     let seconds = |d: std::time::Duration| d.as_secs();
     Json(EffectiveSettings {
@@ -223,6 +284,9 @@ async fn settings(
         max_body_bytes: u64::try_from(limits.max_body_bytes).unwrap_or(u64::MAX),
         poll_default_count: limits.poll_default_count,
         poll_max_count: limits.poll_max_count,
+        agent_credential_ttl_seconds: seconds(credentials.agent_ttl),
+        credential_recheck_seconds: seconds(credentials.recheck),
+        credential_sweep_seconds: seconds(credentials.sweep),
     })
 }
 
@@ -340,17 +404,25 @@ pub(crate) fn build_envelope(
 
 async fn publish(
     State(state): State<Arc<AppState>>,
-    Authenticated(principal): Authenticated,
+    Authenticated(actor): Authenticated,
     path: Result<Path<(String, String)>, PathRejection>,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<(StatusCode, Json<Published>), ApiError> {
     let (tenant, topic) = parse_target(path)?;
+    actor.authorize(Action::Send, &tenant, &topic)?;
     let body = read_body(&state, body)?;
     let now = state.engine.now()?;
-    let envelope = build_envelope(&body, &tenant, &topic, &principal, &now, Origin::Message)?;
+    let envelope = build_envelope(
+        &body,
+        &tenant,
+        &topic,
+        actor.principal(),
+        &now,
+        Origin::Message,
+    )?;
     let published = state
         .engine
-        .publish(envelope)
+        .publish(&actor.caller(), envelope)
         .await
         .map_err(|error| error.logged(&tenant, &topic))?;
     Ok((StatusCode::CREATED, Json(published)))
@@ -365,11 +437,12 @@ struct PollQuery {
 
 async fn poll(
     State(state): State<Arc<AppState>>,
-    _auth: Authenticated,
+    Authenticated(actor): Authenticated,
     path: Result<Path<(String, String)>, PathRejection>,
     query: Result<Query<PollQuery>, QueryRejection>,
 ) -> Result<Json<Polled>, ApiError> {
     let (tenant, topic) = parse_target(path)?;
+    actor.authorize(Action::Poll, &tenant, &topic)?;
     let Query(query) = query.map_err(|e| ApiError::BadRequest(e.body_text()))?;
     let limits = &state.limits;
     let count = query
@@ -382,23 +455,20 @@ async fn poll(
         )));
     }
 
-    let messages = fetch(&state, &tenant, &topic, query.offset.unwrap_or(0), count)
+    // A read never makes a stream or a topic: a topic nobody has published
+    // to is not found.
+    let messages = state
+        .broker
+        .poll(
+            &actor.caller(),
+            &tenant,
+            &topic,
+            query.offset.unwrap_or(0),
+            count,
+        )
         .await
-        .map_err(|error| error.logged(&tenant, &topic))?;
+        .map_err(|error| ApiError::from(error).logged(&tenant, &topic))?;
     Ok(Json(Polled { messages }))
-}
-
-/// The part of a poll that needs the broker.
-async fn fetch(
-    state: &AppState,
-    tenant: &TenantId,
-    topic: &Topic,
-    offset: u64,
-    count: u32,
-) -> Result<Vec<Stored>, ApiError> {
-    state.broker.ensure_tenant(tenant).await?;
-    state.broker.ensure_topic(tenant, topic).await?;
-    Ok(state.broker.poll(tenant, topic, offset, count).await?)
 }
 
 #[cfg(test)]
@@ -585,11 +655,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn polling_an_empty_topic_returns_nothing() {
+    async fn polling_a_topic_nobody_published_to_is_a_404_and_makes_nothing() {
+        let broker = Arc::new(MemoryBroker::new());
+        let auth = Auth::new(
+            SecretString::from(TOKEN.to_owned()),
+            "service:mansio".parse().unwrap(),
+        );
+        let router = Server::new(broker.clone(), auth).router();
+        let uri = "/v1/tenants/acme/topics/alerts/messages";
+        for _ in 0..2 {
+            let (status, body) = send(&router, Method::GET, uri, Some(TOKEN), "").await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(error_code(&body), "not_found");
+        }
+        // The read made no stream and no topic.
+        assert!(broker.tenants().await.unwrap().is_empty());
+
+        // Once something is published the topic is there, and a read of it
+        // before any message beyond the end is empty.
+        let (status, _) = send(&router, Method::POST, URI, Some(TOKEN), MINIMAL).await;
+        assert_eq!(status, StatusCode::CREATED);
         let (status, body) = send(
-            &router(),
+            &router,
             Method::GET,
-            "/v1/tenants/acme/topics/alerts/messages",
+            &format!("{URI}?offset=1"),
             Some(TOKEN),
             "",
         )
@@ -852,6 +941,7 @@ mod tests {
 
         async fn publish(
             &self,
+            _caller: &mansio_core::Caller<'_>,
             _envelope: &Envelope,
         ) -> Result<Option<u64>, mansio_core::BrokerError> {
             (self.publish)()
@@ -859,12 +949,13 @@ mod tests {
 
         async fn poll(
             &self,
+            caller: &mansio_core::Caller<'_>,
             tenant: &TenantId,
             topic: &Topic,
             offset: u64,
             max: u32,
-        ) -> Result<Vec<Stored>, mansio_core::BrokerError> {
-            self.inner.poll(tenant, topic, offset, max).await
+        ) -> Result<Vec<mansio_core::Stored>, mansio_core::BrokerError> {
+            self.inner.poll(caller, tenant, topic, offset, max).await
         }
     }
 
@@ -939,6 +1030,29 @@ mod tests {
         ] {
             assert!(logged.contains(expected), "{expected} is not in {logged}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_by_the_brokers_permissions_is_a_403_and_a_bad_credential_a_401() {
+        let (logs, _guard) = Logs::capture();
+        let router = router_over(|| {
+            Err(mansio_core::BrokerError::Forbidden(
+                "the credential may not send to facts.build".to_owned(),
+            ))
+        });
+        let (status, body) = send(&router, Method::POST, URI, Some(TOKEN), MINIMAL).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(error_code(&body), "forbidden");
+
+        let router = router_over(|| {
+            Err(mansio_core::BrokerError::Unauthenticated(
+                "revoked".to_owned(),
+            ))
+        });
+        let (status, body) = send(&router, Method::POST, URI, Some(TOKEN), MINIMAL).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(error_code(&body), "unauthorized");
+        assert!(!logs.text().contains("WARN"), "a refusal is not a failure");
     }
 
     #[tokio::test]

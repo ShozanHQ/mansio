@@ -13,7 +13,7 @@ use std::time::Duration;
 use mansio_core::Principal;
 use mansio_iggy::{
     DEFAULT_ADDRESS, DEFAULT_CONNECT_TIMEOUT, DEFAULT_LOCATE_WINDOW, DEFAULT_PRESENCE_RETENTION,
-    DEFAULT_USERNAME, DurabilityPolicy, IggyConfig, Retention,
+    DEFAULT_USERNAME, DurabilityPolicy, IggyConfig, ProvisionConfig, Retention,
 };
 use secrecy::SecretString;
 use thiserror::Error;
@@ -122,6 +122,56 @@ impl WorkSettings {
     }
 }
 
+/// How credentials are issued and kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CredentialSettings {
+    /// How long an agent credential lasts when the request does not say
+    /// (`MANSIO_AGENT_CREDENTIAL_TTL_SECONDS`).
+    pub agent_ttl: Duration,
+    /// The longest a credential is trusted without asking the broker again
+    /// (`MANSIO_CREDENTIAL_RECHECK_SECONDS`). A revocation or an expiry that
+    /// happened out of this server's sight takes effect within it.
+    pub recheck: Duration,
+    /// How often expired principals are revoked
+    /// (`MANSIO_CREDENTIAL_SWEEP_SECONDS`).
+    pub sweep: Duration,
+}
+
+impl Default for CredentialSettings {
+    fn default() -> Self {
+        Self {
+            agent_ttl: Duration::from_secs(3600),
+            recheck: Duration::from_secs(30),
+            sweep: Duration::from_secs(60),
+        }
+    }
+}
+
+impl CredentialSettings {
+    /// Check the settings are usable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the variable that is out of range.
+    pub fn validate(&self) -> Result<(), SettingsError> {
+        let invalid = |name: &'static str| SettingsError::Invalid {
+            name,
+            reason: "must be at least 1".to_owned(),
+        };
+        let one = Duration::from_secs(1);
+        if self.agent_ttl < one {
+            return Err(invalid("MANSIO_AGENT_CREDENTIAL_TTL_SECONDS"));
+        }
+        if self.recheck < one {
+            return Err(invalid("MANSIO_CREDENTIAL_RECHECK_SECONDS"));
+        }
+        if self.sweep < one {
+            return Err(invalid("MANSIO_CREDENTIAL_SWEEP_SECONDS"));
+        }
+        Ok(())
+    }
+}
+
 /// Which broker to run on (`MANSIO_BROKER`), with what it needs.
 #[derive(Debug)]
 pub enum Backend {
@@ -179,6 +229,8 @@ pub struct Settings {
     pub limits: Limits,
     /// The work and alert engine.
     pub work: WorkSettings,
+    /// Credentials.
+    pub credentials: CredentialSettings,
 }
 
 impl Settings {
@@ -231,6 +283,20 @@ impl Settings {
         };
         work.validate()?;
 
+        let credential_defaults = CredentialSettings::default();
+        let credentials = CredentialSettings {
+            agent_ttl: env.seconds(
+                "MANSIO_AGENT_CREDENTIAL_TTL_SECONDS",
+                credential_defaults.agent_ttl,
+            )?,
+            recheck: env.seconds(
+                "MANSIO_CREDENTIAL_RECHECK_SECONDS",
+                credential_defaults.recheck,
+            )?,
+            sweep: env.seconds("MANSIO_CREDENTIAL_SWEEP_SECONDS", credential_defaults.sweep)?,
+        };
+        credentials.validate()?;
+
         let broker = match env.string("MANSIO_BROKER", "iggy").as_str() {
             "iggy" => Backend::Iggy(Self::iggy_config(&env)?),
             "memory" => Backend::Memory,
@@ -254,6 +320,39 @@ impl Settings {
             },
             limits,
             work,
+            credentials,
+        })
+    }
+
+    /// Read what `mansio-server provision-admin` needs from the process
+    /// environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the first variable that is missing or wrong.
+    pub fn provision_from_env() -> Result<ProvisionConfig, SettingsError> {
+        Self::provision_from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// Read what `provision-admin` needs through `lookup`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the first variable that is missing or wrong.
+    pub fn provision_from_lookup(
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<ProvisionConfig, SettingsError> {
+        let env = Env(lookup);
+        Ok(ProvisionConfig {
+            address: env.string("MANSIO_IGGY_ADDRESS", DEFAULT_ADDRESS),
+            root_username: env.string("IGGY_ROOT_USERNAME", "iggy"),
+            root_password: env.required_secret("IGGY_ROOT_PASSWORD")?,
+            admin_username: env.string("MANSIO_IGGY_USERNAME", DEFAULT_USERNAME),
+            admin_password: env.required_secret("MANSIO_IGGY_PASSWORD")?,
+            connect_timeout: Duration::from_secs(env.parse(
+                "MANSIO_IGGY_CONNECT_TIMEOUT_SECONDS",
+                DEFAULT_CONNECT_TIMEOUT.as_secs(),
+            )?),
         })
     }
 
@@ -360,11 +459,12 @@ mod tests {
         assert_eq!(settings.sink_path, Some(PathBuf::from("mansio-sink.jsonl")));
         assert_eq!(settings.limits, Limits::default());
         assert_eq!(settings.work, WorkSettings::default());
+        assert_eq!(settings.credentials, CredentialSettings::default());
         let Backend::Iggy(iggy) = settings.broker else {
             panic!("expected the Iggy broker");
         };
         assert_eq!(iggy.address, "127.0.0.1:8090");
-        assert_eq!(iggy.username, "iggy");
+        assert_eq!(iggy.username, "mansio");
         assert_eq!(iggy.password.expose_secret(), "p");
         assert_eq!(iggy.connect_timeout, Duration::from_secs(60));
         assert_eq!(iggy.locate_window, 100);
@@ -505,6 +605,84 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn the_credential_defaults_are_the_documented_ones() {
+        let credentials = CredentialSettings::default();
+        assert_eq!(credentials.agent_ttl, Duration::from_secs(3600));
+        assert_eq!(credentials.recheck, Duration::from_secs(30));
+        assert_eq!(credentials.sweep, Duration::from_secs(60));
+        assert_eq!(credentials.validate(), Ok(()));
+    }
+
+    #[test]
+    fn credential_settings_are_read_from_the_environment() {
+        let settings = settings(&[
+            ("MANSIO_TOKEN", "t"),
+            ("MANSIO_BROKER", "memory"),
+            ("MANSIO_AGENT_CREDENTIAL_TTL_SECONDS", "120"),
+            ("MANSIO_CREDENTIAL_RECHECK_SECONDS", "5"),
+            ("MANSIO_CREDENTIAL_SWEEP_SECONDS", "7"),
+        ])
+        .unwrap();
+        assert_eq!(
+            settings.credentials,
+            CredentialSettings {
+                agent_ttl: Duration::from_secs(120),
+                recheck: Duration::from_secs(5),
+                sweep: Duration::from_secs(7),
+            }
+        );
+    }
+
+    #[test]
+    fn credential_settings_that_cannot_work_are_refused_by_name() {
+        for (name, value) in [
+            ("MANSIO_AGENT_CREDENTIAL_TTL_SECONDS", "0"),
+            ("MANSIO_CREDENTIAL_RECHECK_SECONDS", "0"),
+            ("MANSIO_CREDENTIAL_SWEEP_SECONDS", "0"),
+            ("MANSIO_CREDENTIAL_SWEEP_SECONDS", "often"),
+        ] {
+            let error = settings(&[
+                ("MANSIO_TOKEN", "t"),
+                ("MANSIO_BROKER", "memory"),
+                (name, value),
+            ])
+            .unwrap_err();
+            assert!(
+                matches!(&error, SettingsError::Invalid { name: reported, .. } if *reported == name),
+                "{name}={value}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn provisioning_reads_the_root_and_the_admin_credentials_from_named_variables() {
+        let pairs = [
+            ("IGGY_ROOT_PASSWORD", "root-secret"),
+            ("MANSIO_IGGY_PASSWORD", "admin-secret"),
+        ];
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        let config = Settings::provision_from_lookup(|name| map.get(name).cloned()).unwrap();
+        assert_eq!(config.root_username, "iggy");
+        assert_eq!(config.admin_username, "mansio");
+        assert_eq!(config.address, "127.0.0.1:8090");
+        assert_eq!(config.root_password.expose_secret(), "root-secret");
+        assert_eq!(config.admin_password.expose_secret(), "admin-secret");
+        let shown = format!("{config:?}");
+        assert!(!shown.contains("root-secret") && !shown.contains("admin-secret"));
+
+        for missing in ["IGGY_ROOT_PASSWORD", "MANSIO_IGGY_PASSWORD"] {
+            let error = Settings::provision_from_lookup(|name| {
+                (name != missing).then(|| map.get(name).cloned()).flatten()
+            })
+            .unwrap_err();
+            assert_eq!(error, SettingsError::Missing { name: missing });
+        }
     }
 
     #[test]

@@ -39,6 +39,23 @@ All notable changes to mansio are listed here. The format follows
   `MANSIO_TICK_MILLIS`.
 - `Broker::tenants` and `Broker::topics`, so a server can find what to take up
   again on start.
+- Credentials. The admin API (`principals_create`, `principals_list`,
+  `principals_revoke`: `POST /v1/principals`, `GET /v1/principals?tenant=`,
+  `DELETE /v1/principals/{id}`) issues a credential to a principal with scopes
+  (topic patterns and the verbs `publish`, `subscribe`, `claim`, `ack`,
+  `approve`). The credential is a personal access token of an Iggy user with
+  permissions on exactly its tenant's stream and the topics its scopes cover,
+  so the broker refuses the rest. It expires (an agent's always does), a
+  revocation deletes the user, and a sweep revokes the expired. Each issue and
+  revoke is recorded on `facts.principal` and in the sink first, and the
+  principals are kept in a log in the broker that no credential can read.
+- `MemoryBroker` holds users, scopes and expiring credentials as Iggy does, so
+  credentials are tested without Iggy.
+- `mansio-server provision-admin`, which makes the Iggy user the server acts
+  as. `compose.yaml` runs it as `iggy-admin`.
+- The settings `MANSIO_AGENT_CREDENTIAL_TTL_SECONDS`,
+  `MANSIO_CREDENTIAL_RECHECK_SECONDS` and `MANSIO_CREDENTIAL_SWEEP_SECONDS`,
+  and `MANSIO_E2E_IGGY_ADDRESS` for the tests that ask Iggy itself.
 
 ### Changed
 
@@ -48,4 +65,13 @@ All notable changes to mansio are listed here. The format follows
 - The generic messages route refuses `work.<queue>`, `facts.work` and
   `facts.alert`.
 - `compose.yaml` passes the work settings through, and keeps the sink file in
-  `MANSIO_SINK_DIR` when it is set.
+  `MANSIO_SINK_DIR` when it is set.- Every request is authenticated by its bearer credential and acts through the
+  broker as that credential; the bootstrap `MANSIO_TOKEN` is the admin's.
+  `Broker::publish` and `Broker::poll` take a `Caller`, and `Server::build`
+  returns the routes, the engine and the credentials as `Parts`.
+- A read no longer makes a stream or a topic: a topic nobody has published to is
+  a 404. The generic messages route also refuses `facts.principal`.
+- mansio-server no longer acts as Iggy's root user. `MANSIO_IGGY_USERNAME`
+  defaults to `mansio`, the user `iggy-admin` makes; the root password is given
+  to Iggy and `iggy-admin` only. `compose.yaml` publishes Iggy's TCP port on
+  loopback.

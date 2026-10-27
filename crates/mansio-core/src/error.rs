@@ -55,6 +55,13 @@ pub enum BrokerError {
     /// The broker refused the request.
     #[error("broker refused the request: {0}")]
     Rejected(String),
+    /// The credential is valid, and the broker's permissions do not let it do
+    /// this.
+    #[error("not permitted: {0}")]
+    Forbidden(String),
+    /// The credential is not valid: unknown, expired or revoked.
+    #[error("not authenticated: {0}")]
+    Unauthenticated(String),
     /// A stored message is not a valid envelope for where it was found.
     #[error("stored message is corrupt: {0}")]
     Corrupt(String),

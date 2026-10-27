@@ -336,7 +336,12 @@ async fn work_is_published_through_work_publish_only() -> anyhow::Result<()> {
     let target = Target::start().await?;
 
     // The generic route refuses work topics and the topics mansio writes.
-    for topic in ["work.builds", "facts.work", "facts.alert"] {
+    for topic in [
+        "work.builds",
+        "facts.work",
+        "facts.alert",
+        "facts.principal",
+    ] {
         let (status, body) = target
             .authed(Method::POST, &target.messages_uri(topic), Some(&job(1)))
             .await?;
@@ -397,6 +402,9 @@ async fn the_settings_are_served_and_need_the_token() -> anyhow::Result<()> {
     assert!(settings.alert_resurface_seconds >= 1);
     assert!(settings.tick_millis >= 1);
     assert!(settings.poll_max_count >= settings.poll_default_count);
+    assert!(settings.agent_credential_ttl_seconds >= 1);
+    assert!(settings.credential_recheck_seconds >= 1);
+    assert!(settings.credential_sweep_seconds >= 1);
 
     let uri = format!("{}/v1/settings", target.base);
     let (status, body) = target.call(Method::GET, &uri, None, None).await?;
@@ -417,6 +425,9 @@ async fn the_settings_are_served_and_need_the_token() -> anyhow::Result<()> {
         "backoff_cap_seconds",
         "alert_resurface_seconds",
         "tick_millis",
+        "agent_credential_ttl_seconds",
+        "credential_recheck_seconds",
+        "credential_sweep_seconds",
     ] {
         assert!(keys.contains(key), "{key} in {body}");
     }

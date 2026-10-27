@@ -30,8 +30,8 @@ use std::time::Duration;
 
 use mansio_core::api::{Claimed, Published};
 use mansio_core::{
-    AlertEvent, AlertFact, Broker, BrokerError, ConsumerName, Envelope, EventId, ItemId, LeaseId,
-    Next, Principal, Segment, Sink, TenantId, Timestamp, Topic, WorkEvent, WorkFact,
+    AlertEvent, AlertFact, Broker, BrokerError, Caller, ConsumerName, Envelope, EventId, ItemId,
+    LeaseId, Next, Principal, Segment, Sink, TenantId, Timestamp, Topic, WorkEvent, WorkFact,
 };
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::time::MissedTickBehavior;
@@ -174,10 +174,14 @@ impl Engine {
     /// The one way anything durable reaches the broker: record it in the
     /// sink, set the record on it, publish it. The caller holds the tenant's
     /// lock, which is what keeps the sink and the topic in the same order.
-    async fn append(
+    /// The stream and topic are made by the admin identity, if they are not
+    /// there; the publish is made as `caller`, so that the broker holds a
+    /// credential to its scopes.
+    async fn append_as(
         &self,
         held: &mut TenantState,
         mut envelope: Envelope,
+        caller: &Caller<'_>,
     ) -> Result<Published, ApiError> {
         if !held.tenant_ready {
             self.broker.ensure_tenant(&envelope.tenant).await?;
@@ -194,27 +198,57 @@ impl Engine {
         {
             envelope.record = Some(record);
         }
-        let offset = self.broker.publish(&envelope).await?;
+        let offset = self.broker.publish(caller, &envelope).await?;
         Ok(Published { offset, envelope })
     }
 
-    /// Publish an envelope to a topic: the generic messages route.
-    ///
-    /// Work goes through [`Engine::work_publish`], and `facts.work` and
-    /// `facts.alert` are written by the engine alone.
+    /// What the engine publishes itself: transitions and republished items,
+    /// as the admin identity.
+    async fn append(
+        &self,
+        held: &mut TenantState,
+        envelope: Envelope,
+    ) -> Result<Published, ApiError> {
+        self.append_as(held, envelope, &Caller::Admin).await
+    }
+
+    /// Record a fact the server makes outside the work and alert engine, such
+    /// as the issue of a credential: in the sink, then on its topic, in order
+    /// with everything else for the tenant.
     ///
     /// # Errors
     ///
-    /// Returns 400 for those topics, 503 if the sink or the broker is
-    /// unavailable, and 502 if the broker refuses.
-    pub async fn publish(&self, envelope: Envelope) -> Result<Published, ApiError> {
+    /// Returns 503 if the sink or the broker is unavailable, and 502 if the
+    /// broker refuses.
+    pub(crate) async fn record(&self, fact: Envelope) -> Result<Published, ApiError> {
+        let mut held = self.lock(&fact.tenant).await?;
+        self.append(&mut held, fact).await
+    }
+
+    /// Publish an envelope to a topic as `caller`: the generic messages route.
+    ///
+    /// Work goes through [`Engine::work_publish`], and `facts.work`,
+    /// `facts.alert` and `facts.principal` are written by the server alone.
+    /// What the caller is allowed to publish is for the route to decide
+    /// before it gets here, and for the broker to enforce.
+    ///
+    /// # Errors
+    ///
+    /// Returns 400 for those topics, 403 if the broker does not let the
+    /// credential send there, 503 if the sink or the broker is unavailable,
+    /// and 502 if the broker refuses.
+    pub async fn publish(
+        &self,
+        caller: &Caller<'_>,
+        envelope: Envelope,
+    ) -> Result<Published, ApiError> {
         match &envelope.topic {
             Topic::Work(_) => {
                 return Err(ApiError::BadRequest(
                     "work is published with work_publish, not to a work topic directly".to_owned(),
                 ));
             }
-            topic if *topic == Topic::facts_work() || *topic == Topic::facts_alert() => {
+            topic if is_written_by_mansio(topic) => {
                 return Err(ApiError::BadRequest(format!(
                     "{topic} is written by mansio and cannot be published to"
                 )));
@@ -227,11 +261,11 @@ impl Engine {
             self.broker
                 .ensure_topic(&envelope.tenant, &envelope.topic)
                 .await?;
-            let offset = self.broker.publish(&envelope).await?;
+            let offset = self.broker.publish(caller, &envelope).await?;
             return Ok(Published { offset, envelope });
         }
         let mut held = self.lock(&envelope.tenant).await?;
-        let stored = self.append(&mut held, envelope).await?;
+        let stored = self.append_as(&mut held, envelope, caller).await?;
         if stored.envelope.topic == Topic::Alerts {
             held.alerts.insert(
                 stored.envelope.id,
@@ -256,7 +290,11 @@ impl Engine {
     ///
     /// Returns 409 if an open item in the queue already has the id, and the
     /// errors of [`Engine::publish`].
-    pub async fn work_publish(&self, envelope: Envelope) -> Result<Published, ApiError> {
+    pub async fn work_publish(
+        &self,
+        caller: &Caller<'_>,
+        envelope: Envelope,
+    ) -> Result<Published, ApiError> {
         let (Topic::Work(queue), Some(item)) = (envelope.topic.clone(), envelope.item_id.clone())
         else {
             return Err(ApiError::Internal);
@@ -267,7 +305,7 @@ impl Engine {
                 "an item with id {item} is already open in {queue}"
             )));
         }
-        let stored = self.append(&mut held, envelope).await?;
+        let stored = self.append_as(&mut held, envelope, caller).await?;
         held.queue_mut(&queue)
             .insert(item, stored.envelope.clone(), Phase::Ready);
         Ok(stored)
@@ -674,6 +712,13 @@ impl Engine {
         }
         Ok(())
     }
+}
+
+/// Whether the server writes the topic itself, so that nobody else may.
+fn is_written_by_mansio(topic: &Topic) -> bool {
+    *topic == Topic::facts_work()
+        || *topic == Topic::facts_alert()
+        || *topic == Topic::facts_principal()
 }
 
 /// The open item, or 404.
