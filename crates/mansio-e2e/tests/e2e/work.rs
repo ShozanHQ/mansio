@@ -89,10 +89,16 @@ async fn an_unacked_claim_expires_and_the_item_is_claimed_again_with_the_attempt
     let expired = &facts[1];
     assert_eq!(expired.item_id, first.item.item_id);
     assert_eq!(expired.attempt, Some(1));
-    assert_eq!(
-        expired.data.as_ref().context("data")?["lease_id"],
-        first.lease_id.to_string()
-    );
+    // The fact says which lease it was and not what its id is.
+    let data = expired.data.as_ref().context("data")?;
+    assert_eq!(data["lease"], first.lease_id.fingerprint().to_string());
+    assert!(data.get("lease_id").is_none(), "{data}");
+    for fact in &facts {
+        let text = serde_json::to_string(fact)?;
+        for claim in [&first, &second] {
+            assert!(!text.contains(&claim.lease_id.to_string()), "{text}");
+        }
+    }
     assert_eq!(
         facts[2].data.as_ref().context("data")?["message_id"],
         second.item.id.to_string()
@@ -199,25 +205,36 @@ async fn only_the_holder_presenting_the_lease_id_can_ack_or_fail() -> anyhow::Re
     let stranger = EventId::generate().to_string();
 
     // A lease id that is not the one given out.
-    let (status, body) = target.ack(QUEUE, &item, &stranger).await?;
+    let (status, body) = target.ack(QUEUE, &item, "worker", &stranger).await?;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["error"]["code"], "forbidden");
-    let (status, _) = target.fail(QUEUE, &item, &stranger, "no").await?;
+    let (status, _) = target.fail(QUEUE, &item, "worker", &stranger, "no").await?;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Another consumer of the same principal, with the right lease id, is not
+    // the holder either.
+    let (status, body) = target.ack(QUEUE, &item, "another", &lease).await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, _) = target.fail(QUEUE, &item, "another", &lease, "no").await?;
     assert_eq!(status, StatusCode::FORBIDDEN);
     // Not a lease id at all, or no body, or a reason that says nothing.
-    let (status, _) = target.ack(QUEUE, &item, "nope").await?;
+    let (status, _) = target.ack(QUEUE, &item, "worker", "nope").await?;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let uri = target.tenant_uri(&format!("work/{QUEUE}/items/{item}/ack"));
     let (status, _) = target.authed(Method::POST, &uri, None).await?;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    let (status, _) = target.fail(QUEUE, &item, &lease, "  ").await?;
+    let (status, _) = target.fail(QUEUE, &item, "worker", &lease, "  ").await?;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     // An item that is not there.
-    let (status, body) = target.ack(QUEUE, "no-such-item", &lease).await?;
+    let (status, body) = target.ack(QUEUE, "no-such-item", "worker", &lease).await?;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     // Not signed in.
     let (status, _) = target
-        .call(Method::POST, &uri, None, Some(&json!({"lease_id": lease})))
+        .call(
+            Method::POST,
+            &uri,
+            None,
+            Some(&json!({"lease_id": lease, "consumer": "worker"})),
+        )
         .await?;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
@@ -226,10 +243,10 @@ async fn only_the_holder_presenting_the_lease_id_can_ack_or_fail() -> anyhow::Re
 
     // Once the lease has ended even the holder is refused.
     tokio::time::sleep(target.lease()).await;
-    let (status, body) = target.ack(QUEUE, &item, &lease).await?;
+    let (status, body) = target.ack(QUEUE, &item, "worker", &lease).await?;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"]["code"], "conflict");
-    let (status, _) = target.fail(QUEUE, &item, &lease, "late").await?;
+    let (status, _) = target.fail(QUEUE, &item, "worker", &lease, "late").await?;
     assert_eq!(status, StatusCode::CONFLICT);
     let transitions = target.work_transitions().await?;
     assert!(
@@ -255,7 +272,12 @@ async fn an_acked_item_is_done() -> anyhow::Result<()> {
     assert_eq!(acked.envelope.attempt, Some(1));
 
     let (status, _) = target
-        .ack(QUEUE, &item_of(&claim)?, &claim.lease_id.to_string())
+        .ack(
+            QUEUE,
+            &item_of(&claim)?,
+            claim.consumer.as_str(),
+            &claim.lease_id.to_string(),
+        )
         .await?;
     assert_eq!(status, StatusCode::NOT_FOUND);
 

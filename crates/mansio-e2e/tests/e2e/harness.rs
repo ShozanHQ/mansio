@@ -351,11 +351,12 @@ impl Target {
         &self,
         queue: &str,
         item: &str,
+        consumer: &str,
         lease: &str,
     ) -> anyhow::Result<(StatusCode, Value)> {
         let uri = self.tenant_uri(&format!("work/{queue}/items/{item}/ack"));
-        self.authed(Method::POST, &uri, Some(&json!({ "lease_id": lease })))
-            .await
+        let body = json!({ "lease_id": lease, "consumer": consumer });
+        self.authed(Method::POST, &uri, Some(&body)).await
     }
 
     /// `work_fail`, answering whatever the server says.
@@ -363,18 +364,26 @@ impl Target {
         &self,
         queue: &str,
         item: &str,
+        consumer: &str,
         lease: &str,
         reason: &str,
     ) -> anyhow::Result<(StatusCode, Value)> {
         let uri = self.tenant_uri(&format!("work/{queue}/items/{item}/fail"));
-        let body = json!({ "lease_id": lease, "reason": reason });
+        let body = json!({ "lease_id": lease, "consumer": consumer, "reason": reason });
         self.authed(Method::POST, &uri, Some(&body)).await
     }
 
     /// Ack a claim, which must be accepted.
     pub async fn ack_claim(&self, queue: &str, claim: &Claimed) -> anyhow::Result<Published> {
         let item = item_of(claim)?;
-        let (status, response) = self.ack(queue, &item, &claim.lease_id.to_string()).await?;
+        let (status, response) = self
+            .ack(
+                queue,
+                &item,
+                claim.consumer.as_str(),
+                &claim.lease_id.to_string(),
+            )
+            .await?;
         ensure!(
             status == StatusCode::OK,
             "work_ack answered {status}: {response}"
@@ -391,7 +400,13 @@ impl Target {
     ) -> anyhow::Result<Published> {
         let item = item_of(claim)?;
         let (status, response) = self
-            .fail(queue, &item, &claim.lease_id.to_string(), reason)
+            .fail(
+                queue,
+                &item,
+                claim.consumer.as_str(),
+                &claim.lease_id.to_string(),
+                reason,
+            )
             .await?;
         ensure!(
             status == StatusCode::OK,
@@ -590,16 +605,146 @@ impl Target {
 
     // ---- the broker, not through the server ---------------------------------
 
+    /// Sign in to the broker with the credential, asked of the broker itself
+    /// and not of mansio-server: `None` if the broker will not have it. In
+    /// process the broker is the memory broker; against a live server it is
+    /// Iggy at `MANSIO_E2E_IGGY_ADDRESS`, which must be set.
+    pub async fn broker_session(&self, token: &str) -> anyhow::Result<Option<Direct>> {
+        if let Some((broker, _)) = &self.local {
+            let credential = Credential::new(token);
+            return Ok(match broker.identify(&credential).await {
+                Ok(_) => Some(Direct(DirectKind::Memory {
+                    broker: Arc::clone(broker),
+                    credential,
+                })),
+                Err(_) => None,
+            });
+        }
+        let client = iggy_client(&iggy_address()?).await?;
+        Ok(match client.login_with_personal_access_token(token).await {
+            Ok(_) => Some(Direct(DirectKind::Iggy(client))),
+            Err(_) => {
+                let _ = client.shutdown().await;
+                None
+            }
+        })
+    }
+
+    /// Whether the broker still signs in as the credential:
+    /// [`Outcome::Accepted`] if it does.
+    pub async fn broker_login(&self, token: &str) -> anyhow::Result<Outcome> {
+        Ok(match self.broker_session(token).await? {
+            Some(session) => {
+                session.close().await;
+                Outcome::Accepted
+            }
+            None => Outcome::Unauthenticated,
+        })
+    }
+
+    /// Whether the broker lets the credential read the topic of the tenant.
+    pub async fn broker_poll(
+        &self,
+        token: &str,
+        tenant: &str,
+        topic: &str,
+    ) -> anyhow::Result<Outcome> {
+        let Some(session) = self.broker_session(token).await? else {
+            return Ok(Outcome::Unauthenticated);
+        };
+        let outcome = session.poll(tenant, topic).await?;
+        session.close().await;
+        Ok(outcome)
+    }
+
     /// Whether the broker lets the credential send a message to the topic of
-    /// the tenant, asked of the broker itself and not of mansio-server. In
-    /// process that is the memory broker; against a live server it is Iggy at
-    /// `MANSIO_E2E_IGGY_ADDRESS`, which must be set.
+    /// the tenant. It never does: a credential reads, and the server writes.
     pub async fn broker_send(
         &self,
         token: &str,
         tenant: &str,
         topic: &str,
     ) -> anyhow::Result<Outcome> {
+        let Some(session) = self.broker_session(token).await? else {
+            return Ok(Outcome::Unauthenticated);
+        };
+        let outcome = session.send(tenant, topic).await?;
+        session.close().await;
+        Ok(outcome)
+    }
+
+    /// Whether the broker lets the credential read the server's own records,
+    /// where the registry of principals is kept. Only Iggy can be asked: in
+    /// process the records have no reader but the server, and `None` comes
+    /// back.
+    pub async fn broker_read_registry(&self, token: &str) -> anyhow::Result<Option<Outcome>> {
+        if self.local.is_some() {
+            return Ok(None);
+        }
+        let Some(session) = self.broker_session(token).await? else {
+            return Ok(Some(Outcome::Unauthenticated));
+        };
+        let outcome = session
+            .poll(mansio_iggy::SYSTEM_STREAM, mansio_iggy::SYSTEM_TOPIC)
+            .await?;
+        session.close().await;
+        Ok(Some(outcome))
+    }
+}
+
+/// A session with the broker opened with a credential, kept open to show what
+/// the broker does with it later.
+pub struct Direct(DirectKind);
+
+enum DirectKind {
+    Memory {
+        broker: Arc<MemoryBroker>,
+        credential: Credential,
+    },
+    Iggy(iggy::prelude::IggyClient),
+}
+
+impl Direct {
+    /// Read one message of the topic.
+    pub async fn poll(&self, tenant: &str, topic: &str) -> anyhow::Result<Outcome> {
+        Ok(match &self.0 {
+            DirectKind::Memory { broker, credential } => {
+                match broker
+                    .poll(
+                        &Caller::Credential(credential),
+                        &tenant.parse()?,
+                        &topic.parse()?,
+                        0,
+                        1,
+                    )
+                    .await
+                {
+                    Ok(_) => Outcome::Accepted,
+                    Err(error) => outcome_of(&error),
+                }
+            }
+            DirectKind::Iggy(client) => {
+                match client
+                    .poll_messages(
+                        &iggy::prelude::Identifier::named(tenant)?,
+                        &iggy::prelude::Identifier::named(topic)?,
+                        Some(0),
+                        &iggy::prelude::Consumer::default(),
+                        &iggy::prelude::PollingStrategy::offset(0),
+                        1,
+                        false,
+                    )
+                    .await
+                {
+                    Ok(_) => Outcome::Accepted,
+                    Err(error) => iggy_outcome(error),
+                }
+            }
+        })
+    }
+
+    /// Send a message to the topic.
+    pub async fn send(&self, tenant: &str, topic: &str) -> anyhow::Result<Outcome> {
         let envelope = Envelope::new(
             EventId::generate(),
             "e2e".parse()?,
@@ -608,22 +753,17 @@ impl Target {
             topic.parse()?,
             "agent:direct".parse()?,
         );
-        if let Some((broker, _)) = &self.local {
-            let credential = Credential::new(token);
-            return Ok(
+        Ok(match &self.0 {
+            DirectKind::Memory { broker, credential } => {
                 match broker
-                    .publish(&Caller::Credential(&credential), &envelope)
+                    .publish(&Caller::Credential(credential), &envelope)
                     .await
                 {
                     Ok(_) => Outcome::Accepted,
                     Err(error) => outcome_of(&error),
-                },
-            );
-        }
-        let client = iggy_client(&iggy_address()?).await?;
-        let outcome = match client.login_with_personal_access_token(token).await {
-            Err(_) => Outcome::Unauthenticated,
-            Ok(_) => {
+                }
+            }
+            DirectKind::Iggy(client) => {
                 let mut message = IggyMessage::builder()
                     .id(envelope.id.as_u128())
                     .payload(envelope.to_json_vec()?.into())
@@ -641,60 +781,28 @@ impl Target {
                     Err(error) => iggy_outcome(error),
                 }
             }
-        };
-        let _ = client.shutdown().await;
-        Ok(outcome)
+        })
     }
 
-    /// Whether the broker still signs in as the credential, asked of the
-    /// broker itself: [`Outcome::Accepted`] if it does.
-    pub async fn broker_login(&self, token: &str) -> anyhow::Result<Outcome> {
-        if let Some((broker, _)) = &self.local {
-            return Ok(match broker.identify(&Credential::new(token)).await {
-                Ok(_) => Outcome::Accepted,
-                Err(error) => outcome_of(&error),
-            });
+    /// Make a token that never expires for the signed-in user, which Iggy lets
+    /// any signed-in user do. `None` in process, where the memory broker has no
+    /// such call, or if Iggy refuses.
+    pub async fn mint_token(&self) -> Option<String> {
+        match &self.0 {
+            DirectKind::Memory { .. } => None,
+            DirectKind::Iggy(client) => client
+                .create_personal_access_token("mine", iggy::prelude::IggyExpiry::NeverExpire)
+                .await
+                .ok()
+                .map(|raw| raw.token),
         }
-        let client = iggy_client(&iggy_address()?).await?;
-        let outcome = match client.login_with_personal_access_token(token).await {
-            Ok(_) => Outcome::Accepted,
-            Err(_) => Outcome::Unauthenticated,
-        };
-        let _ = client.shutdown().await;
-        Ok(outcome)
     }
 
-    /// Whether the broker lets the credential read the server's own records,
-    /// where the registry of principals is kept. Only Iggy can be asked: in
-    /// process the records have no reader but the server, and `None` comes
-    /// back.
-    pub async fn broker_read_registry(&self, token: &str) -> anyhow::Result<Option<Outcome>> {
-        if self.local.is_some() {
-            return Ok(None);
+    /// End the session.
+    pub async fn close(self) {
+        if let DirectKind::Iggy(client) = self.0 {
+            let _ = client.shutdown().await;
         }
-        let client = iggy_client(&iggy_address()?).await?;
-        let outcome = match client.login_with_personal_access_token(token).await {
-            Err(_) => Outcome::Unauthenticated,
-            Ok(_) => {
-                match client
-                    .poll_messages(
-                        &iggy::prelude::Identifier::named(mansio_iggy::SYSTEM_STREAM)?,
-                        &iggy::prelude::Identifier::named(mansio_iggy::SYSTEM_TOPIC)?,
-                        Some(0),
-                        &iggy::prelude::Consumer::default(),
-                        &iggy::prelude::PollingStrategy::offset(0),
-                        10,
-                        false,
-                    )
-                    .await
-                {
-                    Ok(_) => Outcome::Accepted,
-                    Err(error) => iggy_outcome(error),
-                }
-            }
-        };
-        let _ = client.shutdown().await;
-        Ok(Some(outcome))
     }
 }
 
@@ -837,7 +945,7 @@ impl Issued {
             .as_str()
             .context("a claim names its item")?;
         let uri = self.tenant_uri(&self.tenant, &format!("work/{queue}/items/{item}/ack"));
-        let body = json!({"lease_id": claim["lease_id"]});
+        let body = json!({"lease_id": claim["lease_id"], "consumer": claim["consumer"]});
         self.call(Method::POST, &uri, Some(&body)).await
     }
 

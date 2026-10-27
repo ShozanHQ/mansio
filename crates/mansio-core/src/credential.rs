@@ -6,6 +6,8 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
+use crate::id::{read_hex, write_hex};
+
 /// A bearer credential: the personal access token of the broker user that was
 /// made for a principal.
 ///
@@ -80,7 +82,7 @@ impl fmt::Debug for CredentialDigest {
 
 impl fmt::Display for CredentialDigest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+        write_hex(f, &self.0)
     }
 }
 
@@ -94,16 +96,9 @@ impl<'de> Deserialize<'de> for CredentialDigest {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use serde::de::Error as _;
         let text = String::deserialize(deserializer)?;
-        let invalid = || D::Error::custom("a credential digest is 64 lowercase hex digits");
-        if text.len() != 64 || !text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-            return Err(invalid());
-        }
-        let mut bytes = [0_u8; 32];
-        for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().chunks(2)) {
-            let pair = std::str::from_utf8(pair).map_err(|_| invalid())?;
-            *byte = u8::from_str_radix(pair, 16).map_err(|_| invalid())?;
-        }
-        Ok(Self(bytes))
+        read_hex(&text)
+            .map(Self)
+            .ok_or_else(|| D::Error::custom("a credential digest is 64 lowercase hex digits"))
     }
 }
 

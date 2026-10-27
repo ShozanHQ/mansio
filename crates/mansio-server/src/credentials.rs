@@ -12,14 +12,14 @@
 //! The registry of principals is rebuilt from the server's log in the broker
 //! on first use.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use mansio_core::api::{CreatePrincipal, Issued};
 use mansio_core::{
-    Broker, BrokerError, Credential, Principal, PrincipalEvent, PrincipalFact, PrincipalId,
-    PrincipalInfo, PrincipalKind, RevokeReason, TenantId, Timestamp,
+    Broker, BrokerError, BrokerUser, Credential, Principal, PrincipalEvent, PrincipalFact,
+    PrincipalId, PrincipalInfo, PrincipalKind, RevokeReason, TenantId, Timestamp,
 };
 use tokio::sync::OnceCell;
 use tokio::time::MissedTickBehavior;
@@ -45,9 +45,21 @@ fn timestamp(millis: i64) -> Result<Timestamp, ApiError> {
         .map_err(|_| ApiError::BadRequest("the expiry is too far off".to_owned()))
 }
 
-/// The name of the broker user made for a principal.
+/// The name of the broker user made for a principal: `mansio-` and the id
+/// without its hyphens.
 fn user_name(id: PrincipalId) -> String {
-    format!("mansio-{}", id.to_string().replace('-', ""))
+    format!("{USER_PREFIX}{}", id.to_string().replace('-', ""))
+}
+
+/// The start of the name of every broker user made for a principal.
+const USER_PREFIX: &str = "mansio-";
+
+/// Whether the name has the shape [`user_name`] gives, which no other user of
+/// the broker, the server's own included, has.
+fn is_principal_user(name: &str) -> bool {
+    name.strip_prefix(USER_PREFIX).is_some_and(|rest| {
+        rest.len() == 32 && rest.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
 }
 
 /// Credentials: the principals that have one, and who a bearer token is.
@@ -116,8 +128,11 @@ impl Credentials {
 
     /// Rebuild the registry from the log, once. Every principal the log says
     /// is current is told to the broker again, because the broker keeps the
-    /// scopes only in memory, and a principal whose user the broker has lost
-    /// is withdrawn.
+    /// scopes only in memory. A principal the broker cannot find is withdrawn,
+    /// and its user is deleted first, as it may be there all the same. A
+    /// broker user made for a principal that the log does not know is deleted:
+    /// one whose record could not be read, or that was made just before the
+    /// server stopped.
     ///
     /// # Errors
     ///
@@ -164,12 +179,48 @@ impl Credentials {
                 Err(error) => return Err(error.into()),
             }
         }
+        self.delete_orphans().await?;
         info!(principals = self.registry.all().len(), "registry rebuilt");
         Ok(())
     }
 
-    /// A principal whose broker user is gone: withdraw it.
+    /// Delete the broker users made for principals that no record owns.
+    async fn delete_orphans(&self) -> Result<(), ApiError> {
+        let owned: HashSet<BrokerUser> = self
+            .registry
+            .all()
+            .iter()
+            .map(|record| record.user)
+            .collect();
+        for found in self.broker.list_users().await? {
+            if !is_principal_user(&found.name) || owned.contains(&found.user) {
+                continue;
+            }
+            warn!(
+                user = %found.user,
+                name = %found.name,
+                "a broker user that no principal owns is deleted"
+            );
+            if let Err(error) = self.broker.delete_user(found.user).await {
+                warn!(user = %found.user, %error, "it could not be deleted; the next start tries again");
+            }
+        }
+        Ok(())
+    }
+
+    /// A principal the broker cannot find the user or tenant of. Its user is
+    /// deleted first, because the broker not finding it says nothing about its
+    /// token, which may still sign in. If that cannot be done the principal is
+    /// kept, and the next start tries again.
     async fn withdraw_lost(&self, record: &Record) {
+        if let Err(error) = self.broker.delete_user(record.user).await {
+            warn!(
+                principal = %record.info.id,
+                %error,
+                "the user of a principal the broker cannot find could not be deleted; the principal is kept"
+            );
+            return;
+        }
         self.registry.remove(record.info.id);
         self.save_revoked(record.info.id).await;
         self.record_revoked(&self.engine_principal(), &record.info, RevokeReason::Failed)
@@ -518,8 +569,13 @@ mod tests {
         fail_create_user: AtomicBool,
         fail_delete_user: AtomicBool,
         fail_system_append: AtomicBool,
+        /// `set_grants` says the user or its tenant is not found, whatever the
+        /// memory broker holds.
+        lose_grants: AtomicBool,
         made: TestMutex<Vec<BrokerUser>>,
         deleted: TestMutex<Vec<BrokerUser>>,
+        /// Every `set_grants`, in order.
+        told: TestMutex<Vec<(BrokerUser, TenantId, Vec<Grant>)>>,
     }
 
     fn down() -> BrokerError {
@@ -603,6 +659,13 @@ mod tests {
             tenant: &TenantId,
             grants: &[Grant],
         ) -> Result<(), BrokerError> {
+            self.told
+                .lock()
+                .unwrap()
+                .push((user, tenant.clone(), grants.to_vec()));
+            if self.lose_grants.load(Ordering::SeqCst) {
+                return Err(BrokerError::NotFound(format!("user {user}")));
+            }
             self.inner.set_grants(user, tenant, grants).await
         }
 
@@ -612,6 +675,10 @@ mod tests {
             }
             self.deleted.lock().unwrap().push(user);
             self.inner.delete_user(user).await
+        }
+
+        async fn list_users(&self) -> Result<Vec<mansio_core::BrokerUserInfo>, BrokerError> {
+            self.inner.list_users().await
         }
 
         async fn identify(&self, credential: &Credential) -> Result<BrokerUser, BrokerError> {
@@ -1074,25 +1141,224 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_scopes_the_registry_holds_are_told_to_the_broker_again_on_start() {
+    async fn every_principal_is_told_to_the_broker_again_on_start_with_its_tenant_and_scopes() {
         let rig = Rig::new();
-        let issued = rig.issue("agent", "builder-1", None).await.unwrap();
+        let build = rig.issue("agent", "builder-1", None).await.unwrap();
+        let mut other = request("person", "paul", None);
+        other.tenant = "other".parse().unwrap();
+        other.scopes =
+            vec![Grant::new("alerts".parse().unwrap(), [Verb::Ack, Verb::Subscribe]).unwrap()];
+        let paul = rig.credentials.create(&admin(), other).await.unwrap();
+        let revoked = rig.issue("person", "gone", None).await.unwrap();
+        rig.credentials
+            .revoke(&admin(), revoked.principal.id, RevokeReason::Requested)
+            .await
+            .unwrap();
+        rig.broker.told.lock().unwrap().clear();
+
         let restarted = rig.restart().await;
         restarted.credentials.load().await.unwrap();
-        // The broker was told the grants again for the user it made.
-        let user = restarted
+
+        let mut told = rig.broker.told.lock().unwrap().clone();
+        told.sort_by_key(|(user, _, _)| user.0);
+        let user_of = |issued: &Issued| {
+            restarted
+                .credentials
+                .registry
+                .get(issued.principal.id)
+                .unwrap()
+                .user
+        };
+        let mut expected = vec![
+            (user_of(&build), tenant(), build.principal.scopes.clone()),
+            (
+                user_of(&paul),
+                "other".parse().unwrap(),
+                paul.principal.scopes.clone(),
+            ),
+        ];
+        expected.sort_by_key(|(user, _, _)| user.0);
+        assert_eq!(
+            told, expected,
+            "once each, for the principals the log says are current"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_principal_the_broker_cannot_find_has_its_user_deleted_before_it_is_withdrawn() {
+        let rig = Rig::new();
+        let issued = rig.issue("person", "paul", None).await.unwrap();
+        let user = rig
             .credentials
             .registry
             .get(issued.principal.id)
             .unwrap()
             .user;
-        let grants = vec![Grant::new("facts.build".parse().unwrap(), [Verb::Publish]).unwrap()];
+        // The broker says it has no such user or tenant, and the user is
+        // there all the same.
+        rig.broker.lose_grants.store(true, Ordering::SeqCst);
+
+        let restarted = rig.restart().await;
+        assert!(restarted.credentials.list(None).await.unwrap().is_empty());
         assert!(
-            rig.broker
-                .inner
-                .set_grants(user, &tenant(), &grants)
+            rig.broker.deleted.lock().unwrap().contains(&user),
+            "the user is deleted, not only forgotten"
+        );
+        assert!(
+            rig.broker.inner.identify(&issued.credential).await.is_err(),
+            "the token no longer signs in"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_principal_whose_user_cannot_be_deleted_is_kept_and_tried_again_on_the_next_start() {
+        let rig = Rig::new();
+        let issued = rig.issue("person", "paul", None).await.unwrap();
+        let user = rig
+            .credentials
+            .registry
+            .get(issued.principal.id)
+            .unwrap()
+            .user;
+        rig.broker.lose_grants.store(true, Ordering::SeqCst);
+        rig.broker.fail_delete_user.store(true, Ordering::SeqCst);
+
+        let restarted = rig.restart().await;
+        restarted.credentials.load().await.unwrap();
+        assert_eq!(
+            restarted.credentials.list(None).await.unwrap().len(),
+            1,
+            "kept"
+        );
+        assert!(rig.broker.inner.identify(&issued.credential).await.is_ok());
+        assert_eq!(
+            restarted.facts().await.len(),
+            1,
+            "nothing was recorded as withdrawn"
+        );
+
+        rig.broker.fail_delete_user.store(false, Ordering::SeqCst);
+        let again = rig.restart().await;
+        assert!(again.credentials.list(None).await.unwrap().is_empty());
+        assert!(rig.broker.deleted.lock().unwrap().contains(&user));
+        assert!(rig.broker.inner.identify(&issued.credential).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_credential_with_facts_star_publish_cannot_write_what_only_mansio_writes() {
+        let rig = Rig::new();
+        let mut body = request("agent", "forger", Some(600));
+        body.scopes =
+            vec![Grant::new("facts.*".parse().unwrap(), [Verb::Publish, Verb::Subscribe]).unwrap()];
+        let forger = rig.credentials.create(&admin(), body).await.unwrap();
+        for name in [
+            "facts.work",
+            "facts.alert",
+            "facts.principal",
+            "dead",
+            "facts.build",
+        ] {
+            let topic: Topic = name.parse().unwrap();
+            rig.broker.ensure_topic(&tenant(), &topic).await.unwrap();
+            let mut forged = Envelope::new(
+                mansio_core::EventId::generate(),
+                "probe".parse().unwrap(),
+                "mansio.work.acked".parse().unwrap(),
+                tenant(),
+                topic,
+                "service:mansio-engine".parse().unwrap(),
+            );
+            forged.subject = Some("item-1".parse().unwrap());
+            let refused = rig
+                .broker
+                .publish(&Caller::Credential(&forger.credential), &forged)
+                .await;
+            assert!(
+                matches!(refused, Err(BrokerError::Forbidden(_))),
+                "{name}: a credential writes nothing at the broker: {refused:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_broker_user_made_for_a_principal_that_no_record_owns_is_deleted_on_start() {
+        let rig = Rig::new();
+        let kept = rig.issue("person", "kept", None).await.unwrap();
+        let made = |name: String| {
+            let broker = Arc::clone(&rig.broker);
+            async move {
+                broker
+                    .inner
+                    .create_user(&tenant(), &name, &[], None)
+                    .await
+                    .unwrap()
+            }
+        };
+        // A user made just before a crash, whose record was never written, or
+        // whose record cannot be read now.
+        let orphan = made(user_name(PrincipalId::generate())).await;
+        rig.broker
+            .system_append(br#"{"op":"created","principal":"unreadable"}"#)
+            .await
+            .unwrap();
+        // Users that are not the principals': the server's own, and others.
+        let admin = made("mansio-admin".to_owned()).await;
+        let shaped_wrong = made(format!("mansio-{}", "A".repeat(32))).await;
+        let someone = made("someone".to_owned()).await;
+
+        let restarted = rig.restart().await;
+        restarted.credentials.load().await.unwrap();
+
+        let deleted = rig.broker.deleted.lock().unwrap().clone();
+        assert_eq!(deleted, [orphan.user], "only the orphan");
+        assert!(rig.broker.inner.identify(&orphan.credential).await.is_err());
+        for left in [&admin, &shaped_wrong, &someone] {
+            assert!(rig.broker.inner.identify(&left.credential).await.is_ok());
+        }
+        assert!(
+            restarted
+                .credentials
+                .authenticate(&token(&kept))
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn a_user_that_cannot_be_deleted_is_left_for_the_next_start() {
+        let rig = Rig::new();
+        rig.issue("person", "kept", None).await.unwrap();
+        let orphan = rig
+            .broker
+            .inner
+            .create_user(&tenant(), &user_name(PrincipalId::generate()), &[], None)
+            .await
+            .unwrap();
+        rig.broker.fail_delete_user.store(true, Ordering::SeqCst);
+        let restarted = rig.restart().await;
+        restarted.credentials.load().await.unwrap();
+        assert!(rig.broker.inner.identify(&orphan.credential).await.is_ok());
+
+        rig.broker.fail_delete_user.store(false, Ordering::SeqCst);
+        rig.restart().await.credentials.load().await.unwrap();
+        assert!(rig.broker.inner.identify(&orphan.credential).await.is_err());
+    }
+
+    #[test]
+    fn a_principals_user_name_is_mansio_and_its_id_and_nothing_else_has_that_shape() {
+        let id = PrincipalId::generate();
+        assert!(is_principal_user(&user_name(id)));
+        for name in [
+            "mansio",
+            "mansio-",
+            "mansio-admin",
+            "iggy",
+            &format!("mansio-{}", "a".repeat(31)),
+            &format!("mansio-{}", "a".repeat(33)),
+            &format!("mansio-{}", "g".repeat(32)),
+            &format!("x{}", user_name(id)),
+        ] {
+            assert!(!is_principal_user(name), "{name}");
+        }
     }
 }

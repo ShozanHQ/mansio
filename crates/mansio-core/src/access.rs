@@ -1,10 +1,10 @@
 //! What a principal may do: scopes made of a topic pattern and verbs.
 //!
 //! A scope names the topics it covers (`work.builds`, `facts.*`, `alerts`) and
-//! the verbs it grants there. [`topic_access`] turns scopes into what a broker
-//! enforces on a topic, send and poll; [`allows`] answers what a request
-//! needs. Both the brokers and the server use these two, so a scope means the
-//! same everywhere.
+//! the verbs it grants there. [`allows`] answers whether scopes let a request
+//! of some kind through. A broker enforces only reading for a credential:
+//! every write goes through the server, which checks `publish` here, stamps the
+//! principal from the credential and writes as its own admin identity.
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -21,7 +21,9 @@ use crate::topic::Topic;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verb {
-    /// Send messages: the broker's send permission.
+    /// Publish through the server: `messages`, `work_publish`, `alerts_publish`.
+    /// The server writes, as the principal the credential stands for. Not on a
+    /// topic only mansio writes.
     Publish,
     /// Read messages: the broker's poll permission.
     Subscribe,
@@ -183,6 +185,11 @@ impl Grant {
         if verbs.is_empty() {
             return Err(refuse("must grant at least one verb"));
         }
+        if verbs.contains(&Verb::Publish)
+            && matches!(&topic, TopicPattern::Topic(named) if named.is_written_by_mansio())
+        {
+            return Err(refuse("only mansio publishes to this topic"));
+        }
         let covers_work = matches!(
             topic,
             TopicPattern::AllWork | TopicPattern::Topic(Topic::Work(_))
@@ -220,7 +227,7 @@ impl Grant {
         let has = |verb| self.verbs.contains(&verb);
         let approves = has(Verb::Approve) && *topic == Topic::work_approvals();
         match action {
-            Action::Send => has(Verb::Publish),
+            Action::Send => has(Verb::Publish) && !topic.is_written_by_mansio(),
             Action::Poll => has(Verb::Subscribe) || has(Verb::Claim) || approves,
             Action::Claim => matches!(topic, Topic::Work(_)) && (has(Verb::Claim) || approves),
             Action::Ack => *topic == Topic::Alerts && has(Verb::Ack),
@@ -234,34 +241,6 @@ fn verb_list(verbs: &BTreeSet<Verb>) -> String {
         .map(|verb| verb.as_str())
         .collect::<Vec<_>>()
         .join(",")
-}
-
-/// What a broker enforces on one topic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct TopicAccess {
-    /// May send messages to the topic.
-    pub send: bool,
-    /// May read messages from the topic.
-    pub poll: bool,
-}
-
-impl TopicAccess {
-    /// Whether the access grants nothing.
-    #[must_use]
-    pub fn is_none(&self) -> bool {
-        !self.send && !self.poll
-    }
-}
-
-/// What the scopes grant on a topic, as the broker enforces it. Claiming,
-/// approving and acknowledging are enforced by mansio and add only the right
-/// to read.
-#[must_use]
-pub fn topic_access(grants: &[Grant], topic: &Topic) -> TopicAccess {
-    TopicAccess {
-        send: allows(grants, Action::Send, topic),
-        poll: allows(grants, Action::Poll, topic),
-    }
 }
 
 /// Whether the scopes let a request of this kind through on a topic.
@@ -326,36 +305,22 @@ mod tests {
     }
 
     #[test]
-    fn publish_is_send_and_subscribe_and_claim_are_poll() {
+    fn publish_is_a_send_through_the_server_and_subscribe_and_claim_are_reads() {
         let grants = [
             grant("facts.build", &[Verb::Publish]),
             grant("facts.signal", &[Verb::Subscribe]),
             grant("work.builds", &[Verb::Claim]),
         ];
-        let access = |name: &str| topic_access(&grants, &topic(name));
-        assert_eq!(
-            access("facts.build"),
-            TopicAccess {
-                send: true,
-                poll: false
-            }
-        );
-        assert_eq!(
-            access("facts.signal"),
-            TopicAccess {
-                send: false,
-                poll: true
-            }
-        );
-        assert_eq!(
-            access("work.builds"),
-            TopicAccess {
-                send: false,
-                poll: true
-            }
-        );
-        assert!(access("work.reviews").is_none());
-        assert!(access("alerts").is_none());
+        let can = |action, name: &str| allows(&grants, action, &topic(name));
+        assert!(can(Action::Send, "facts.build") && !can(Action::Poll, "facts.build"));
+        assert!(can(Action::Poll, "facts.signal") && !can(Action::Send, "facts.signal"));
+        assert!(can(Action::Poll, "work.builds") && !can(Action::Send, "work.builds"));
+        for name in ["work.reviews", "alerts"] {
+            assert!(
+                !can(Action::Send, name) && !can(Action::Poll, name),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -387,22 +352,22 @@ mod tests {
         let grants = [grant("alerts", &[Verb::Ack])];
         assert!(allows(&grants, Action::Ack, &Topic::Alerts));
         assert!(!allows(&grants, Action::Poll, &Topic::Alerts));
-        assert!(topic_access(&grants, &Topic::Alerts).is_none());
         assert!(!allows(&grants, Action::Ack, &Topic::Dead));
     }
 
     #[test]
     fn a_wildcard_covers_topics_made_later_and_nothing_outside_its_family() {
         let grants = [grant("facts.*", &[Verb::Publish, Verb::Subscribe])];
-        assert!(topic_access(&grants, &topic("facts.later")).send);
-        assert!(topic_access(&grants, &topic("facts.later")).poll);
-        assert!(topic_access(&grants, &topic("work.later")).is_none());
-        assert!(topic_access(&grants, &Topic::Presence).is_none());
+        assert!(allows(&grants, Action::Send, &topic("facts.later")));
+        assert!(allows(&grants, Action::Poll, &topic("facts.later")));
+        assert!(!allows(&grants, Action::Poll, &topic("work.later")));
+        assert!(!allows(&grants, Action::Send, &Topic::Presence));
     }
 
     #[test]
     fn no_scopes_grant_nothing() {
-        assert!(topic_access(&[], &topic("facts.build")).is_none());
+        assert!(!allows(&[], Action::Poll, &topic("facts.build")));
+        assert!(!allows(&[], Action::Send, &topic("facts.build")));
         assert!(!allows(&[], Action::Claim, &topic("work.builds")));
         assert!(!allows(&[], Action::Ack, &Topic::Alerts));
     }
@@ -444,5 +409,37 @@ mod tests {
         ] {
             assert!(serde_json::from_str::<Grant>(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn facts_star_publish_does_not_reach_the_topics_only_mansio_writes() {
+        let grants = [grant("facts.*", &[Verb::Publish, Verb::Subscribe])];
+        for name in ["facts.work", "facts.alert", "facts.principal"] {
+            assert!(!allows(&grants, Action::Send, &topic(name)), "{name}");
+            assert!(
+                allows(&grants, Action::Poll, &topic(name)),
+                "{name} is readable"
+            );
+        }
+        assert!(allows(&grants, Action::Send, &topic("facts.build")));
+    }
+
+    #[test]
+    fn a_publish_scope_naming_a_topic_only_mansio_writes_is_refused() {
+        for name in ["facts.work", "facts.alert", "facts.principal", "dead"] {
+            let pattern: TopicPattern = name.parse().unwrap();
+            assert!(
+                Grant::new(pattern.clone(), [Verb::Publish]).is_err(),
+                "{name} cannot be published to"
+            );
+            assert!(
+                Grant::new(pattern, [Verb::Publish, Verb::Subscribe]).is_err(),
+                "{name} with another verb too"
+            );
+            assert!(Grant::new(name.parse().unwrap(), [Verb::Subscribe]).is_ok());
+        }
+        // Work is published through work_publish, which publish allows.
+        assert!(Grant::new("work.builds".parse().unwrap(), [Verb::Publish]).is_ok());
+        assert!(Grant::new("work.*".parse().unwrap(), [Verb::Publish]).is_ok());
     }
 }

@@ -17,13 +17,13 @@ use iggy::prelude::{
     TopicClient, TopicCreateOptions, UserClient, UserStatus,
 };
 use mansio_core::{
-    Broker, BrokerError, BrokerUser, Caller, Credential, Envelope, EventId, Grant, Minted, Stored,
-    SystemRecord, TenantId, Topic,
+    Broker, BrokerError, BrokerUser, BrokerUserInfo, Caller, Credential, Envelope, EventId, Grant,
+    Minted, Stored, SystemRecord, TenantId, Topic,
 };
 use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use tracing::{info, warn};
 
-use crate::access::{Users, permissions};
+use crate::access::{Users, no_permissions, permissions};
 use crate::config::{Durability, DurabilityPolicy, IggyConfig, Retention};
 use crate::sessions::{Session, Sessions};
 
@@ -122,6 +122,17 @@ fn new_client(address: &str) -> Result<IggyClient, BrokerError> {
         .with_server_address(address.to_owned())
         .build()
         .map_err(map_iggy)
+}
+
+/// What applying a user's permissions came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Applied {
+    /// The permissions its scopes work out to are set.
+    Done,
+    /// Its tenant's stream is not there, and it has no permissions.
+    NoStream,
+    /// There is no such user.
+    NoUser,
 }
 
 /// End a client that is no longer used. Whether Iggy hears about it does not
@@ -402,7 +413,12 @@ impl IggyBroker {
         if self.ensured.has_stream(tenant) {
             return Ok(());
         }
-        self.make_stream(tenant.as_str()).await?;
+        if self.make_stream(tenant.as_str()).await? {
+            // Iggy may give a new stream the number of one that was deleted,
+            // and permissions name streams by number: whoever held the old
+            // number must not hold the new stream.
+            self.refresh_users().await?;
+        }
         self.ensured.add_stream(tenant);
         Ok(())
     }
@@ -491,16 +507,17 @@ impl IggyBroker {
 
     // ---- users ------------------------------------------------------------
 
-    /// The stream's number and its topics' numbers and names.
+    /// The stream's number and its topics' numbers and names, or `None` if
+    /// there is no stream.
     async fn stream_topics(
         &self,
         tenant: &TenantId,
-    ) -> Result<(u32, Vec<(u32, Topic)>), BrokerError> {
+    ) -> Result<Option<(u32, Vec<(u32, Topic)>)>, BrokerError> {
         let stream = stream_id(tenant)?;
         let details = match self.client.get_stream(&stream).await {
             Ok(Some(details)) => details,
             Ok(None) | Err(IggyError::StreamIdNotFound(_) | IggyError::StreamNameNotFound(_)) => {
-                return Err(BrokerError::NotFound(format!("tenant {tenant}")));
+                return Ok(None);
             }
             Err(error) => return Err(map_iggy(error)),
         };
@@ -509,37 +526,55 @@ impl IggyBroker {
             .iter()
             .filter_map(|topic| Some((topic.id, topic.name.parse().ok()?)))
             .collect();
-        Ok((details.id, named))
+        Ok(Some((details.id, named)))
     }
 
     /// Give the user the permissions its scopes work out to on the topics the
-    /// tenant has now. The caller holds the permissions lock.
+    /// tenant has now, or none if the tenant's stream is gone. The caller
+    /// holds the permissions lock.
     async fn apply(
         &self,
         user: BrokerUser,
         tenant: &TenantId,
         grants: &[Grant],
-    ) -> Result<(), BrokerError> {
-        let (stream, topics) = self.stream_topics(tenant).await?;
-        let granted = permissions(stream, &topics, grants);
-        self.client
+    ) -> Result<Applied, BrokerError> {
+        let (granted, applied) = match self.stream_topics(tenant).await? {
+            Some((stream, topics)) => (permissions(stream, &topics, grants), Applied::Done),
+            None => (no_permissions(), Applied::NoStream),
+        };
+        match self
+            .client
             .update_permissions(&user_id(user)?, Some(granted))
             .await
-            .map_err(map_iggy)
+        {
+            Ok(()) => Ok(applied),
+            Err(IggyError::ResourceNotFound(_)) => Ok(Applied::NoUser),
+            Err(error) => Err(map_iggy(error)),
+        }
     }
 
-    /// A topic of the tenant was found or made: open it to the users whose
-    /// scopes cover it.
+    /// A topic of the tenant was found or made: work out again what every
+    /// user of the tenant may read, which includes the topic if their scopes
+    /// cover it.
     async fn open_to_users(&self, tenant: &TenantId) -> Result<(), BrokerError> {
         let _held = self.permissions.lock().await;
         for (user, grants) in self.users.of_tenant(tenant) {
-            match self.apply(user, tenant, &grants).await {
-                Ok(()) => {}
-                Err(BrokerError::NotFound(why)) => {
-                    warn!(%tenant, %user, %why, "a user the broker was told about is gone");
-                    self.users.remove(user);
-                }
-                Err(error) => return Err(error),
+            if self.apply(user, tenant, &grants).await? == Applied::NoUser {
+                warn!(%tenant, %user, "a user the broker was told about is gone");
+                self.users.remove(user);
+            }
+        }
+        Ok(())
+    }
+
+    /// A stream was made: work out again what every user of every tenant may
+    /// read. A user whose stream is not there gets no permissions.
+    async fn refresh_users(&self) -> Result<(), BrokerError> {
+        let _held = self.permissions.lock().await;
+        for (user, tenant, grants) in self.users.all() {
+            if self.apply(user, &tenant, &grants).await? == Applied::NoUser {
+                warn!(%tenant, %user, "a user the broker was told about is gone");
+                self.users.remove(user);
             }
         }
         Ok(())
@@ -813,23 +848,31 @@ impl Broker for IggyBroker {
         grants: &[Grant],
         ttl: Option<Duration>,
     ) -> Result<Minted, BrokerError> {
-        let _held = self.permissions.lock().await;
-        let (stream, topics) = self.stream_topics(tenant).await?;
         // Nobody is told this password: it is used once, to sign in as the
         // user and make its token, and then dropped.
         let password = Credential::random();
-        let made = self
-            .client
-            .create_user(
-                name,
-                password.expose(),
-                UserStatus::Active,
-                Some(permissions(stream, &topics, grants)),
-            )
-            .await
-            .map_err(map_iggy)?;
-        let user = BrokerUser(made.id);
-        self.users.set(user, tenant, grants);
+        let user = {
+            // Held until the user is remembered, so that a topic made in the
+            // meantime is opened to it; not held for the sign-in and the token.
+            let _held = self.permissions.lock().await;
+            let (stream, topics) = self
+                .stream_topics(tenant)
+                .await?
+                .ok_or_else(|| BrokerError::NotFound(format!("tenant {tenant}")))?;
+            let made = self
+                .client
+                .create_user(
+                    name,
+                    password.expose(),
+                    UserStatus::Active,
+                    Some(permissions(stream, &topics, grants)),
+                )
+                .await
+                .map_err(map_iggy)?;
+            let user = BrokerUser(made.id);
+            self.users.set(user, tenant, grants);
+            user
+        };
         match self.mint_token(name, &password, ttl).await {
             Ok(credential) => Ok(Minted { user, credential }),
             Err(error) => {
@@ -849,9 +892,25 @@ impl Broker for IggyBroker {
         grants: &[Grant],
     ) -> Result<(), BrokerError> {
         let _held = self.permissions.lock().await;
-        self.apply(user, tenant, grants).await?;
-        self.users.set(user, tenant, grants);
-        Ok(())
+        match self.apply(user, tenant, grants).await? {
+            Applied::Done => {
+                self.users.set(user, tenant, grants);
+                Ok(())
+            }
+            Applied::NoStream => Err(BrokerError::NotFound(format!("tenant {tenant}"))),
+            Applied::NoUser => Err(BrokerError::NotFound(format!("user {user}"))),
+        }
+    }
+
+    async fn list_users(&self) -> Result<Vec<BrokerUserInfo>, BrokerError> {
+        let users = self.client.get_users().await.map_err(map_iggy)?;
+        Ok(users
+            .into_iter()
+            .map(|found| BrokerUserInfo {
+                user: BrokerUser(found.id),
+                name: found.username,
+            })
+            .collect())
     }
 
     async fn delete_user(&self, user: BrokerUser) -> Result<(), BrokerError> {
