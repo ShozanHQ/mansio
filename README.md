@@ -189,7 +189,11 @@ cannot) as a tool with the same name as the command, `work_pull` for
 `--lease-id`. A tool does what the command does, by the same code, and returns
 what the command prints; an operation that fails is a result with `isError`,
 so that the model can read the reason and try again. A test lists the commands
-and the tools and fails on any difference beyond `watch` and `mcp`.
+and the tools and fails on any difference beyond `watch` and `mcp`. It speaks
+the protocol versions 2024-11-05, 2025-03-26, 2025-06-18 and 2025-11-25,
+answers the one the client asks for, and accepts a batch of messages, which
+2025-03-26 requires and later versions do not send. A line that is not UTF-8
+or not JSON is a JSON-RPC parse error and does not end the server.
 
 | Tool | |
 |---|---|
@@ -355,11 +359,20 @@ a 409 means the first attempt was stored.
 
 ### Consumers
 
-A named durable consumer is a name per tenant and topic whose offset the broker
-keeps (an Iggy consumer offset), so it survives a restart of the server and of
-the client. The name is the whole of its identity: anyone who may read the
-topic and uses the name shares the offset. The operations are `consumers_get`
-and `consumers_commit`, and they need the right to read the topic.
+A named durable consumer is a name whose position on a topic mansio keeps, so
+it survives a restart of the server and of the client. The position is the
+offset of the last message the consumer handled, and it reads next from one
+after it. The operations are `consumers_get` and `consumers_commit`, and they
+need the right to read the topic.
+
+A consumer belongs to the principal that uses it: the name is a name in that
+principal's own namespace, per tenant and topic. Two principals that both use
+`dash` have two consumers, and neither can read or move the other's. The
+positions are kept in a log of mansio's own stream in the broker that no
+credential can reach, and not in Iggy's consumer offsets, which any credential
+that may read a topic could set for any consumer of it. Every commit is a
+record of that log, and the log is never trimmed. A webhook's position is kept
+the same way and is not reachable through this API at all.
 
 ```sh
 # consumers_get: 200 {"consumer":"dash","offset":4,"next":5}
@@ -368,14 +381,17 @@ and `consumers_commit`, and they need the right to read the topic.
 curl -H "Authorization: Bearer $MANSIO_TOKEN" \
   http://127.0.0.1:7070/v1/tenants/acme/topics/facts.build/consumers/dash
 
-# consumers_commit: the offset of the last message handled. Any offset may be
-# set, so a consumer can be set back to read again.
+# consumers_commit: the offset of the last message handled.
 curl -H "Authorization: Bearer $MANSIO_TOKEN" -H 'Content-Type: application/json' \
   -d '{"offset":4}' \
   http://127.0.0.1:7070/v1/tenants/acme/topics/facts.build/consumers/dash/commit
 ```
 
-A topic nobody has published to has no consumers (404).
+The message at the offset must exist: an offset past the last message of the
+topic is a 409, as is any offset of an empty topic, so a mistake cannot make a
+consumer skip what is published next. An earlier offset sets the consumer back
+to read again, and one that retention has since deleted is accepted. A topic
+nobody has published to has no consumers (404).
 
 ### Server-sent events
 
@@ -398,10 +414,15 @@ data: {"specversion":"1.0","id":"...","type":"build.finished",...}
   that a proxy does not take the connection for dead.
 - It is authorised as `poll` is, with the caller's credential, and the answer
   is the status of a refusal (401, 403, 404) before any event. A credential
-  that is revoked or expires while the stream is open ends it at the next read.
+  that is revoked while the stream is open ends it at the next read; one that
+  expires ends it when the sweep deletes its user, which is up to
+  `MANSIO_CREDENTIAL_SWEEP_SECONDS` later.
   The browser's `EventSource` cannot send an `Authorization` header: use a
   client that can, such as `fetch` with a stream reader.
 - The server looks for new messages every `MANSIO_STREAM_POLL_MILLIS`.
+- When the server is told to stop it ends every event stream first, so a
+  connected client does not hold the shutdown up; the client sees the stream
+  end and reconnects with `Last-Event-ID` to the next server.
 
 ### Webhooks
 
@@ -606,6 +627,7 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_TICK_MILLIS` | `500` | How often the timer looks for leases to expire, items to republish and alerts to surface again. |
 | `MANSIO_STREAM_POLL_MILLIS` | `500` | How often an event stream and a webhook look for new messages once they have caught up. |
 | `MANSIO_SSE_KEEPALIVE_SECONDS` | `15` | How often a quiet event stream sends a comment. |
+| `MANSIO_SHUTDOWN_GRACE_SECONDS` | `10` | On SIGINT or SIGTERM the server ends every event stream, and waits this long for the requests still being served before it stops anyway. |
 | `MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS` | `5` | The wait before a delivery is tried again after its first failed attempt. It doubles with each attempt. |
 | `MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS` | `300` | The longest that wait gets. At least the base. |
 | `MANSIO_WEBHOOK_MAX_ATTEMPTS` | `8` | Attempts at one delivery before it is recorded as failed and the webhook moves on. |
@@ -645,12 +667,12 @@ storage, so a 201 survives a crash of the host. With `replicated`, Iggy
 answers after its quorum commit without that barrier; on one node that is a
 write to the operating system, and a crash of the host can lose the messages
 acknowledged since the last flush, after the sink has already recorded them.
-`persisted` costs write latency. Iggy's flush thresholds,
-`messages_required_to_save` and `size_of_messages_required_to_save`, set how
-much its journal holds before a flush, and they do not weaken `persisted`.
-See [Iggy's durability documentation](https://iggy.apache.org/docs). mansio
-sets both Iggy's `durability` and `consumer_offset_durability` on the topics
-it creates, and leaves the flush thresholds at Iggy's defaults.
+`persisted` costs write latency. Under `persisted` Iggy 0.9's partition setting
+`wal_group_commit_delay_micros` (environment `IGGY_PARTITION_WAL_GROUP_COMMIT_DELAY_MICROS`,
+0 in the configuration Iggy prints on start) is the knob that trades latency
+for group commits. See [Iggy's durability documentation](https://iggy.apache.org/docs).
+mansio sets both Iggy's `durability` and `consumer_offset_durability` on the
+topics it creates, and leaves Iggy's own settings at its defaults.
 
 ### mansio (CLI)
 
@@ -667,7 +689,7 @@ it creates, and leaves the flush thresholds at Iggy's defaults.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MANSIO_E2E_URL` | unset | A running server for `mansio-e2e` to use, with `MANSIO_TOKEN` set to its token. Unset starts a server in the test process on the memory broker, with a lease of 2 s, 3 attempts, a backoff from 1 s to 4 s, alerts surfaced every 2 s, an agent credential that lasts 3 s, is checked every second and swept every second, streams that look every 50 ms and send a comment every second, and webhooks that retry after 1 s to 4 s, give up after 3 attempts and wait 2 s for an answer. Against a running server the tests read its settings from `GET /v1/settings`. |
+| `MANSIO_E2E_URL` | unset | A running server for `mansio-e2e` to use, with `MANSIO_TOKEN` set to its token. Unset starts a server in the test process on the memory broker, with a lease of 2 s, 3 attempts, a backoff from 1 s to 4 s, alerts surfaced every 2 s, an agent credential that lasts 3 s, is checked every second and swept every second, streams that look every 50 ms and send a comment every second, a grace of 2 s for a shutdown, and webhooks that retry after 1 s to 4 s, give up after 3 attempts and wait 2 s for an answer. Against a running server the tests read its settings from `GET /v1/settings`. |
 | `MANSIO_E2E_STATE_DIR` | unset | A directory that the first and second passes of the restart and retention tests (see [Develop](#develop)) keep their state in. Required by those tests, which fail without it. |
 | `MANSIO_E2E_SINK_PATH` | unset | The sink file of the running server, as the test process can read it. With it the tests also check the order of the sink; without it they check the topics only. |
 | `MANSIO_E2E_IGGY_ADDRESS` | unset | Iggy's TCP address as the test process reaches it (`127.0.0.1:8090` for `compose.yaml`). With `MANSIO_E2E_URL` set it is required: the credential tests ask Iggy itself, without mansio-server, what a credential may do, and fail if they cannot. Without `MANSIO_E2E_URL` they ask the memory broker. |

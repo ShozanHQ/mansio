@@ -143,7 +143,7 @@ pub async fn handle(client: &Client, message: Value) -> Option<Value> {
         return Some(failure(
             &Value::Null,
             INVALID_REQUEST,
-            "a message is a JSON object; batches are not supported",
+            "a message is a JSON object",
         ));
     };
     let method = object.get("method").and_then(Value::as_str);
@@ -181,6 +181,42 @@ pub async fn handle(client: &Client, message: Value) -> Option<Value> {
     })
 }
 
+/// What to write back for one line of input, if anything. A line that is not
+/// UTF-8 or not JSON is answered with a parse error and does not end the
+/// server. A batch (an array of messages, which the 2025-03-26 revision of the
+/// protocol allows and later ones do not send) is answered with an array of
+/// the answers, or with nothing if it held only notifications.
+pub async fn answer_line(client: &Client, line: &[u8]) -> Option<String> {
+    let parse_error = |why: String| {
+        Some(failure(&Value::Null, PARSE_ERROR, &format!("not JSON: {why}")).to_string())
+    };
+    let text = match std::str::from_utf8(line) {
+        Ok(text) => text,
+        Err(error) => return parse_error(error.to_string()),
+    };
+    match serde_json::from_str::<Value>(text) {
+        Ok(Value::Array(batch)) if batch.is_empty() => Some(
+            failure(
+                &Value::Null,
+                INVALID_REQUEST,
+                "a batch holds a message at least",
+            )
+            .to_string(),
+        ),
+        Ok(Value::Array(batch)) => {
+            let mut answers = Vec::new();
+            for message in batch {
+                answers.extend(handle(client, message).await);
+            }
+            (!answers.is_empty()).then(|| Value::Array(answers).to_string())
+        }
+        Ok(message) => handle(client, message)
+            .await
+            .map(|answer| answer.to_string()),
+        Err(error) => parse_error(error.to_string()),
+    }
+}
+
 /// Serve on stdin and stdout until stdin closes. Calls run side by side, so a
 /// `work_pull` that waits does not hold up a `ping`.
 ///
@@ -199,25 +235,22 @@ pub async fn serve(client: Client) -> anyhow::Result<()> {
         }
         Ok::<(), std::io::Error>(())
     });
-    let mut input = BufReader::new(tokio::io::stdin()).lines();
+    let mut input = BufReader::new(tokio::io::stdin());
     let mut calls = JoinSet::new();
-    while let Some(line) = input.next_line().await? {
-        if line.trim().is_empty() {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if input.read_until(b'\n', &mut line).await? == 0 {
+            break;
+        }
+        let text = line.trim_ascii();
+        if text.is_empty() {
             continue;
         }
-        let client = Arc::clone(&client);
-        let lines = lines.clone();
+        let (client, lines, text) = (Arc::clone(&client), lines.clone(), text.to_vec());
         calls.spawn(async move {
-            let answer = match serde_json::from_str::<Value>(&line) {
-                Ok(message) => handle(&client, message).await,
-                Err(error) => Some(failure(
-                    &Value::Null,
-                    PARSE_ERROR,
-                    &format!("not JSON: {error}"),
-                )),
-            };
-            if let Some(answer) = answer {
-                let _ = lines.send(answer.to_string());
+            if let Some(answer) = answer_line(&client, &text).await {
+                let _ = lines.send(answer);
             }
         });
     }
@@ -361,7 +394,49 @@ mod tests {
         assert_eq!(answer["error"]["code"], METHOD_NOT_FOUND);
         let answer = ask(json!({"jsonrpc": "2.0", "id": 9})).await;
         assert_eq!(answer["error"]["code"], INVALID_REQUEST);
-        let answer = ask(json!([{"jsonrpc": "2.0", "id": 1, "method": "ping"}])).await;
+        let answer = ask(json!(7)).await;
         assert_eq!(answer["error"]["code"], INVALID_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_line_that_is_not_utf8_or_not_json_is_a_parse_error_and_the_server_goes_on() {
+        let client = client();
+        for line in [&b"\xff\xfe{"[..], b"{", b"nonsense", b""] {
+            let answer = answer_line(&client, line).await.unwrap();
+            let answer: Value = serde_json::from_str(&answer).unwrap();
+            assert_eq!(answer["error"]["code"], PARSE_ERROR, "{line:?}");
+            assert_eq!(answer["id"], Value::Null);
+        }
+        let ping = answer_line(&client, br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
+            .await
+            .unwrap();
+        assert!(ping.contains(r#""result":{}"#), "{ping}");
+    }
+
+    #[tokio::test]
+    async fn a_batch_is_answered_with_a_batch_of_the_answers() {
+        let client = client();
+        let line = br#"[
+            {"jsonrpc":"2.0","id":1,"method":"ping"},
+            {"jsonrpc":"2.0","method":"notifications/initialized"},
+            {"jsonrpc":"2.0","id":2,"method":"tools/list"},
+            {"jsonrpc":"2.0","id":3,"method":"nope"}
+        ]"#;
+        let answer = answer_line(&client, line).await.unwrap();
+        let answers: Vec<Value> = serde_json::from_str(&answer).unwrap();
+        let ids: Vec<&Value> = answers.iter().map(|a| &a["id"]).collect();
+        assert_eq!(
+            ids,
+            [&json!(1), &json!(2), &json!(3)],
+            "no answer to the notification"
+        );
+        assert!(answers[1]["result"]["tools"].is_array());
+        assert_eq!(answers[2]["error"]["code"], METHOD_NOT_FOUND);
+
+        // Only notifications: nothing is answered. An empty batch is refused.
+        let quiet = br#"[{"jsonrpc":"2.0","method":"notifications/initialized"}]"#;
+        assert!(answer_line(&client, quiet).await.is_none());
+        let empty = answer_line(&client, b"[]").await.unwrap();
+        assert!(empty.contains("-32600"), "{empty}");
     }
 }

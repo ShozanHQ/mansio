@@ -11,14 +11,14 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy::prelude::{
-    AutoLogin, Client, Consumer, ConsumerOffsetClient, Credentials, Durability as IggyDurability,
-    Identifier, IggyByteSize, IggyClient, IggyClientBuilder, IggyDuration, IggyError, IggyExpiry,
-    IggyMessage, MaxTopicSize, MessageClient, Partitioning, PersonalAccessTokenClient,
-    PollingStrategy, StreamClient, TopicClient, TopicCreateOptions, UserClient, UserStatus,
+    AutoLogin, Client, Consumer, Credentials, Durability as IggyDurability, Identifier,
+    IggyByteSize, IggyClient, IggyClientBuilder, IggyDuration, IggyError, IggyExpiry, IggyMessage,
+    MaxTopicSize, MessageClient, Partitioning, PersonalAccessTokenClient, PollingStrategy,
+    StreamClient, TopicClient, TopicCreateOptions, UserClient, UserStatus,
 };
 use mansio_core::{
-    Broker, BrokerError, BrokerUser, BrokerUserInfo, Caller, ConsumerName, Credential, Envelope,
-    EventId, Grant, Minted, Stored, SystemLog, SystemRecord, TenantId, Topic,
+    Broker, BrokerError, BrokerUser, BrokerUserInfo, Caller, Credential, Envelope, EventId, Grant,
+    Minted, Stored, SystemLog, SystemRecord, TenantId, Topic,
 };
 use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use tracing::{info, warn};
@@ -36,6 +36,9 @@ pub const SYSTEM_TOPIC: &str = "principals";
 /// The topic of [`SYSTEM_STREAM`] that holds the registry of webhooks, and
 /// with it their signing secrets.
 pub const SYSTEM_WEBHOOKS_TOPIC: &str = "webhooks";
+/// The topic of [`SYSTEM_STREAM`] that holds where every named consumer and
+/// every webhook has got to.
+pub const SYSTEM_CURSORS_TOPIC: &str = "cursors";
 /// What the personal access token of every user mansio makes is called.
 const TOKEN_NAME: &str = "mansio";
 
@@ -637,14 +640,6 @@ fn topic_id(topic: &Topic) -> Result<Identifier, BrokerError> {
     Identifier::named(&topic.to_string()).map_err(map_iggy)
 }
 
-/// A named consumer. Iggy turns the name into the number it keeps the
-/// consumer's offset under.
-fn named_consumer(consumer: &ConsumerName) -> Result<Consumer, BrokerError> {
-    Ok(Consumer::new(
-        Identifier::named(consumer.as_str()).map_err(map_iggy)?,
-    ))
-}
-
 /// A user by its number, which no other user can share.
 fn user_id(user: BrokerUser) -> Result<Identifier, BrokerError> {
     Identifier::numeric(user.0).map_err(map_iggy)
@@ -842,51 +837,6 @@ impl Broker for IggyBroker {
             Caller::Admin => self.ensured.forget_if_missing(tenant, result),
             Caller::Credential(_) => result,
         }
-    }
-
-    async fn consumer_offset(
-        &self,
-        tenant: &TenantId,
-        topic: &Topic,
-        consumer: &ConsumerName,
-    ) -> Result<Option<u64>, BrokerError> {
-        let stored = self
-            .client
-            .get_consumer_offset(
-                &named_consumer(consumer)?,
-                &stream_id(tenant)?,
-                &topic_id(topic)?,
-                Some(PARTITION),
-            )
-            .await;
-        let result = match stored {
-            Ok(info) => Ok(info.map(|info| info.stored_offset)),
-            // A consumer that has stored nothing is not an error.
-            Err(IggyError::ConsumerOffsetNotFound(_)) => Ok(None),
-            Err(error) => Err(map_iggy(error)),
-        };
-        self.ensured.forget_if_missing(tenant, result)
-    }
-
-    async fn commit_offset(
-        &self,
-        tenant: &TenantId,
-        topic: &Topic,
-        consumer: &ConsumerName,
-        offset: u64,
-    ) -> Result<(), BrokerError> {
-        let result = self
-            .client
-            .store_consumer_offset(
-                &named_consumer(consumer)?,
-                &stream_id(tenant)?,
-                &topic_id(topic)?,
-                Some(PARTITION),
-                offset,
-            )
-            .await
-            .map_err(map_iggy);
-        self.ensured.forget_if_missing(tenant, result)
     }
 
     async fn system_append(&self, log: SystemLog, record: &[u8]) -> Result<(), BrokerError> {
@@ -1268,6 +1218,8 @@ mod tests {
         assert!(SYSTEM_WEBHOOKS_TOPIC.parse::<Topic>().is_err());
         assert_eq!(SystemLog::Principals.as_str(), SYSTEM_TOPIC);
         assert_eq!(SystemLog::Webhooks.as_str(), SYSTEM_WEBHOOKS_TOPIC);
+        assert_eq!(SystemLog::Cursors.as_str(), SYSTEM_CURSORS_TOPIC);
+        assert!(SYSTEM_CURSORS_TOPIC.parse::<Topic>().is_err());
         assert!(user_id(BrokerUser(7)).is_ok());
     }
 

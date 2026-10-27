@@ -14,8 +14,8 @@ use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use futures_util::Stream;
 use futures_util::stream;
+use futures_util::{Stream, StreamExt};
 use mansio_core::{Action, Stored, TenantId, Topic};
 use serde::Deserialize;
 use tracing::warn;
@@ -132,7 +132,16 @@ pub(crate) async fn events_stream(
         poll: state.streams.poll,
         waiting: first.into(),
     };
-    Ok(Sse::new(events(following)).keep_alive(
+    // A server that is shutting down ends the stream, so that a client that is
+    // connected does not hold the shutdown up.
+    let mut ending = state.ending.clone();
+    let ended = async move {
+        // A host that dropped its `Ender` ends nothing.
+        if ending.wait_for(|ending| *ending).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    Ok(Sse::new(events(following).take_until(ended)).keep_alive(
         KeepAlive::new()
             .interval(state.streams.sse_keepalive)
             .text("keep-alive"),

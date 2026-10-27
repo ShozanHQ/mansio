@@ -1,5 +1,6 @@
-//! Following a topic: reading it page by page from an offset, for the event
-//! stream and for webhooks.
+//! Reading a topic page by page from an offset: the one reader that the event
+//! stream, webhooks and the rebuild of the engine's state all use, which steps
+//! over a message that cannot be read instead of stopping at it.
 
 use std::sync::Arc;
 
@@ -38,6 +39,11 @@ impl Tail {
             page: page.max(1),
             one_by_one_until: 0,
         }
+    }
+
+    /// The offset the next read starts at.
+    pub(crate) fn next(&self) -> u64 {
+        self.next
     }
 
     /// The next messages, in publish order, as `caller`; none if it has caught

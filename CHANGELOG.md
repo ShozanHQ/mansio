@@ -83,10 +83,13 @@ All notable changes to mansio are listed here. The format follows
   as a tool with the same name and the same parameters, and docs for Claude
   Code and Codex. The CLI and MCP retry a request that failed on the network.
 - Named durable consumers: `consumers_get` and `consumers_commit`, an offset
-  per tenant, topic and name that the broker keeps (`Broker::consumer_offset`,
-  `Broker::commit_offset`).
+  per tenant, topic, principal and name that mansio keeps in a log of its own
+  stream in the broker, never in Iggy's consumer offsets. A commit past the
+  last message of the topic is a 409.
 - `GET /v1/events`, a topic as server-sent events: `id` is the offset, `event`
-  the envelope's type, `data` the envelope. It resumes after `Last-Event-ID`.
+  the envelope's type, `data` the envelope. It resumes after `Last-Event-ID`,
+  and a shutdown ends every stream and waits at most
+  `MANSIO_SHUTDOWN_GRACE_SECONDS` for the rest.
 - Webhooks (`webhooks_create`, `webhooks_list`, `webhooks_delete`, admin only):
   each envelope of a topic is POSTed in order as CloudEvents JSON with a
   `mansio-signature` HMAC-SHA256 header, from a durable consumer, retried with
@@ -94,9 +97,9 @@ All notable changes to mansio are listed here. The format follows
   given up on. Secrets are kept on the server's own `webhooks` log.
 - The settings `MANSIO_STREAM_POLL_MILLIS`, `MANSIO_SSE_KEEPALIVE_SECONDS`,
   `MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS`, `MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS`,
-  `MANSIO_WEBHOOK_MAX_ATTEMPTS` and `MANSIO_WEBHOOK_TIMEOUT_SECONDS` for the
-  server, and `MANSIO_RETRIES`, `MANSIO_RETRY_BACKOFF_MILLIS` and
-  `MANSIO_POLL_INTERVAL_MILLIS` for the CLI.
+  `MANSIO_WEBHOOK_MAX_ATTEMPTS`, `MANSIO_WEBHOOK_TIMEOUT_SECONDS` and
+  `MANSIO_SHUTDOWN_GRACE_SECONDS` for the server, and `MANSIO_RETRIES`,
+  `MANSIO_RETRY_BACKOFF_MILLIS` and `MANSIO_POLL_INTERVAL_MILLIS` for the CLI.
 
 ### Changed
 
@@ -104,7 +107,6 @@ All notable changes to mansio are listed here. The format follows
   lease again instead of claiming another item, so a claim whose answer was
   lost can be asked for again. A server restarted since the claim cannot say
   the lease id again, and gives a new one for the same item and expiry.
-
 - A broker error is a 502 only when it is a refusal the broker named before it
   stores anything (not found, unauthorized, an invalid identifier, a message
   count or payload size it refuses). Every other Iggy error is a 503, because

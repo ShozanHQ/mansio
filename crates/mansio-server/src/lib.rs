@@ -24,6 +24,7 @@ mod auth;
 mod clock;
 mod consumers_api;
 mod credentials;
+mod cursors;
 mod engine;
 mod error;
 mod events_api;
@@ -43,6 +44,7 @@ pub use app::{AppState, Parts, Server};
 pub use auth::{Actor, Auth, Authenticated};
 pub use clock::{Clock, SystemClock};
 pub use credentials::Credentials;
+pub use cursors::Cursors;
 pub use engine::{Engine, Holder};
 pub use error::ApiError;
 pub use settings::{
