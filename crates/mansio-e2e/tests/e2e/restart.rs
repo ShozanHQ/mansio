@@ -26,9 +26,15 @@ async fn a_restarted_server_keeps_the_lease_and_claims_the_item_again_exactly_on
     target.stop_server().await?;
     target.start_server().await?;
 
-    // The new server knows the lease: nobody else can claim the item.
+    // The new server knows the lease: nobody else can claim the item, and the
+    // consumer that holds it is given it again.
     assert!(target.pull(QUEUE, "other").await?.is_none());
-    assert!(target.pull(QUEUE, "worker").await?.is_none());
+    let held = target.pull(QUEUE, "worker").await?;
+    assert_eq!(
+        held.map(|claim| claim.lease_id),
+        Some(first.lease_id),
+        "the lease survives the restart"
+    );
 
     // After the lease and the backoff it is claimed, as attempt 2.
     let wait = target.lease() + target.backoff(1) + SLACK;
@@ -37,7 +43,7 @@ async fn a_restarted_server_keeps_the_lease_and_claims_the_item_again_exactly_on
     assert_eq!(second.item.attempt, Some(2));
     assert_eq!(second.item.item_id, first.item.item_id);
 
-    // Exactly once: nobody gets it again, and the log has one of each.
+    // Exactly once: nobody else gets it, and the log has one of each.
     assert!(target.pull(QUEUE, "worker").await?.is_none());
     tokio::time::sleep(target.settle()).await;
     assert!(target.pull(QUEUE, "worker").await?.is_none());
@@ -108,8 +114,13 @@ async fn a_failure_whose_retry_was_not_published_is_retried_once_after_a_restart
         .claim(QUEUE, "worker", target.backoff(1) + SLACK)
         .await?;
     assert_eq!(second.item.attempt, Some(2));
-    assert!(target.pull(QUEUE, "worker").await?.is_none());
+    assert!(target.pull(QUEUE, "other").await?.is_none());
     tokio::time::sleep(target.settle()).await;
+    assert_eq!(
+        target.pull(QUEUE, "worker").await?.map(|claim| claim.lease_id),
+        Some(second.lease_id),
+        "the holder is given its lease again, and nobody is given a second item"
+    );
     assert_eq!(
         target.work_transitions().await?,
         ["claimed", "failed", "retried", "claimed"]

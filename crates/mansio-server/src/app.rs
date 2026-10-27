@@ -26,11 +26,17 @@ use tracing::warn;
 
 use crate::auth::{Auth, Authenticated};
 use crate::clock::{Clock, SystemClock};
+use crate::consumers_api;
 use crate::credentials::Credentials;
 use crate::engine::Engine;
 use crate::error::ApiError;
+use crate::events_api;
 use crate::principals_api;
-use crate::settings::{CredentialSettings, Limits, SettingsError, WorkSettings};
+use crate::settings::{
+    CredentialSettings, Limits, SettingsError, StreamSettings, WebhookSettings, WorkSettings,
+};
+use crate::webhooks::Webhooks;
+use crate::webhooks_api;
 use crate::work_api;
 
 /// Attributes the server sets itself, from the path and the credential. A
@@ -46,12 +52,14 @@ pub struct AppState {
     pub(crate) broker: Arc<dyn Broker>,
     pub(crate) engine: Arc<Engine>,
     pub(crate) credentials: Arc<Credentials>,
+    pub(crate) webhooks: Arc<Webhooks>,
     pub(crate) auth: Auth,
     pub(crate) limits: Limits,
+    pub(crate) streams: StreamSettings,
 }
 
-/// What [`Server::build`] makes: the routes, and the two things that have to
-/// be run alongside them.
+/// What [`Server::build`] makes: the routes, and the things that have to be
+/// run alongside them.
 pub struct Parts {
     /// The routes.
     pub router: Router,
@@ -59,16 +67,19 @@ pub struct Parts {
     pub engine: Arc<Engine>,
     /// Credentials. Run [`Credentials::run`] alongside the routes.
     pub credentials: Arc<Credentials>,
+    /// Webhooks. Run [`Webhooks::run`] alongside the routes.
+    pub webhooks: Arc<Webhooks>,
 }
 
 /// The mansio HTTP server, ready to run.
 ///
 /// A host application builds one with its own [`Broker`] and [`Sink`] and
 /// calls [`Server::serve`], which also runs the timer that expires leases,
-/// republishes items and surfaces alerts again, and the sweep that revokes
-/// expired credentials. A host that mounts the [`Router`] itself takes it from
-/// [`Server::build`] together with the [`Engine`] and [`Credentials`], and
-/// runs [`Engine::run`] and [`Credentials::run`] alongside.
+/// republishes items and surfaces alerts again, the sweep that revokes
+/// expired credentials, and the tasks that deliver webhooks. A host that
+/// mounts the [`Router`] itself takes it from [`Server::build`] together with
+/// the [`Engine`], [`Credentials`] and [`Webhooks`], and runs
+/// [`Engine::run`], [`Credentials::run`] and [`Webhooks::run`] alongside.
 pub struct Server {
     broker: Arc<dyn Broker>,
     sink: Arc<dyn Sink>,
@@ -77,32 +88,47 @@ pub struct Server {
     limits: Limits,
     work: WorkSettings,
     credentials: CredentialSettings,
+    streams: StreamSettings,
+    webhooks: WebhookSettings,
 }
 
-/// The server's timers, running as tasks: the engine's, and the credential
-/// sweep. Dropping it aborts them, so a server that is dropped does not leave
-/// them running; [`Timer::stop`] also waits until they are gone.
-struct Timer(Vec<JoinHandle<()>>);
+/// The server's timers, running as tasks: the engine's, the credential sweep
+/// and the webhooks'. Dropping it aborts them, so a server that is dropped
+/// does not leave them running; [`Timer::stop`] also waits until they are
+/// gone, the webhooks' delivery tasks too.
+struct Timer {
+    tasks: Vec<JoinHandle<()>>,
+    webhooks: Arc<Webhooks>,
+}
 
 impl Timer {
-    fn start(engine: Arc<Engine>, credentials: Arc<Credentials>) -> Self {
-        Self(vec![
-            tokio::spawn(engine.run()),
-            tokio::spawn(credentials.run()),
-        ])
+    fn start(
+        engine: Arc<Engine>,
+        credentials: Arc<Credentials>,
+        webhooks: Arc<Webhooks>,
+    ) -> Self {
+        Self {
+            tasks: vec![
+                tokio::spawn(engine.run()),
+                tokio::spawn(credentials.run()),
+                tokio::spawn(Arc::clone(&webhooks).run()),
+            ],
+            webhooks,
+        }
     }
 
     async fn stop(mut self) {
-        for mut task in self.0.drain(..) {
+        for mut task in self.tasks.drain(..) {
             task.abort();
             let _ = (&mut task).await;
         }
+        self.webhooks.shutdown().await;
     }
 }
 
 impl Drop for Timer {
     fn drop(&mut self) {
-        for task in &self.0 {
+        for task in &self.tasks {
             task.abort();
         }
     }
@@ -121,6 +147,8 @@ impl Server {
             limits: Limits::default(),
             work: WorkSettings::default(),
             credentials: CredentialSettings::default(),
+            streams: StreamSettings::default(),
+            webhooks: WebhookSettings::default(),
         }
     }
 
@@ -157,6 +185,30 @@ impl Server {
         self
     }
 
+    /// Use these event stream settings instead of the defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the setting if the settings cannot work, for
+    /// example a poll of zero.
+    pub fn with_stream_settings(mut self, streams: StreamSettings) -> Result<Self, SettingsError> {
+        streams.validate()?;
+        self.streams = streams;
+        Ok(self)
+    }
+
+    /// Use these webhook settings instead of the defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the setting if the settings do not fit
+    /// together, for example a cap below the base.
+    pub fn with_webhook_settings(mut self, webhooks: WebhookSettings) -> Result<Self, SettingsError> {
+        webhooks.validate()?;
+        self.webhooks = webhooks;
+        Ok(self)
+    }
+
     /// Read time from `clock` instead of the system clock.
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
@@ -164,9 +216,10 @@ impl Server {
         self
     }
 
-    /// The routes, and the engine and credentials behind them. Nothing drives
-    /// the engine's timer or the credential sweep until [`Engine::run`] and
-    /// [`Credentials::run`] are, or [`Engine::tick`] and [`Credentials::sweep`]
+    /// The routes, and the engine, credentials and webhooks behind them.
+    /// Nothing drives the engine's timer, the credential sweep or the
+    /// delivery of webhooks until [`Engine::run`], [`Credentials::run`] and
+    /// [`Webhooks::run`] are, or [`Engine::tick`] and [`Credentials::sweep`]
     /// are called.
     pub fn build(self) -> Parts {
         let max_body = self.limits.max_body_bytes;
@@ -180,17 +233,27 @@ impl Server {
         let credentials = Arc::new(Credentials::new(
             Arc::clone(&self.broker),
             Arc::clone(&engine),
-            self.clock,
+            Arc::clone(&self.clock),
             self.credentials,
             self.auth.principal().clone(),
             self.limits.poll_max_count,
+        ));
+        let webhooks = Arc::new(Webhooks::new(
+            Arc::clone(&self.broker),
+            Arc::clone(&engine),
+            self.clock,
+            self.webhooks,
+            self.streams,
+            self.limits.poll_default_count,
         ));
         let state = AppState {
             broker: self.broker,
             engine: Arc::clone(&engine),
             credentials: Arc::clone(&credentials),
+            webhooks: Arc::clone(&webhooks),
             auth: self.auth,
             limits: self.limits,
+            streams: self.streams,
         };
         let router = Router::new()
             .route("/healthz", get(healthz))
@@ -199,6 +262,15 @@ impl Server {
                 "/v1/tenants/{tenant}/topics/{topic}/messages",
                 get(poll).post(publish),
             )
+            .route(
+                "/v1/tenants/{tenant}/topics/{topic}/consumers/{consumer}",
+                get(consumers_api::consumers_get),
+            )
+            .route(
+                "/v1/tenants/{tenant}/topics/{topic}/consumers/{consumer}/commit",
+                post(consumers_api::consumers_commit),
+            )
+            .route("/v1/events", get(events_api::events_stream))
             .route(
                 "/v1/tenants/{tenant}/work/{queue}/items",
                 post(work_api::work_publish),
@@ -231,6 +303,14 @@ impl Server {
                 "/v1/principals/{id}",
                 delete(principals_api::principals_revoke),
             )
+            .route(
+                "/v1/webhooks",
+                post(webhooks_api::webhooks_create).get(webhooks_api::webhooks_list),
+            )
+            .route(
+                "/v1/webhooks/{id}",
+                delete(webhooks_api::webhooks_delete),
+            )
             .fallback(not_found)
             .layer(DefaultBodyLimit::max(max_body))
             .with_state(Arc::new(state));
@@ -238,6 +318,7 @@ impl Server {
             router,
             engine,
             credentials,
+            webhooks,
         }
     }
 
@@ -248,10 +329,11 @@ impl Server {
     }
 
     /// Serve on `listener` until `shutdown` completes. Before it accepts a
-    /// request the engine takes up what the broker holds and the registry of
-    /// principals is loaded, and while it runs the timer drives expiries,
-    /// republishes and alerts, and the sweep revokes expired credentials.
-    /// Dropping the future stops both.
+    /// request the engine takes up what the broker holds and the registries of
+    /// principals and webhooks are loaded, and while it runs the timer drives
+    /// expiries, republishes and alerts, the sweep revokes expired
+    /// credentials, and each webhook is delivered. Dropping the future stops
+    /// all of them.
     ///
     /// # Errors
     ///
@@ -265,6 +347,7 @@ impl Server {
             router,
             engine,
             credentials,
+            webhooks,
         } = self.build();
         if let Err(error) = engine.recover().await {
             warn!(
@@ -278,7 +361,13 @@ impl Server {
                 "the registry of principals could not be loaded; the next request will try again"
             );
         }
-        let timer = Timer::start(engine, credentials);
+        if let Err(error) = webhooks.load().await {
+            warn!(
+                ?error,
+                "the registry of webhooks could not be loaded; the next request will try again"
+            );
+        }
+        let timer = Timer::start(engine, credentials, webhooks);
         let served = axum::serve(listener, router)
             .with_graceful_shutdown(shutdown)
             .await;
@@ -297,6 +386,7 @@ async fn settings(
 ) -> Json<EffectiveSettings> {
     let work = state.engine.settings();
     let credentials = state.credentials.settings();
+    let webhooks = state.webhooks.settings();
     let limits = &state.limits;
     let seconds = |d: std::time::Duration| d.as_secs();
     Json(EffectiveSettings {
@@ -312,6 +402,12 @@ async fn settings(
         agent_credential_ttl_seconds: seconds(credentials.agent_ttl),
         credential_recheck_seconds: seconds(credentials.recheck),
         credential_sweep_seconds: seconds(credentials.sweep),
+        stream_poll_millis: u64::try_from(state.streams.poll.as_millis()).unwrap_or(u64::MAX),
+        sse_keepalive_seconds: seconds(state.streams.sse_keepalive),
+        webhook_backoff_base_seconds: seconds(webhooks.backoff_base),
+        webhook_backoff_cap_seconds: seconds(webhooks.backoff_cap),
+        webhook_max_attempts: webhooks.max_attempts,
+        webhook_timeout_seconds: seconds(webhooks.timeout),
     })
 }
 

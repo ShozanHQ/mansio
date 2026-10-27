@@ -804,6 +804,7 @@ dependencies = [
  "block-buffer",
  "const-oid",
  "crypto-common",
+ "ctutils",
 ]
 
 [[package]]
@@ -1117,6 +1118,15 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hmac"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
+dependencies = [
+ "digest",
+]
 
 [[package]]
 name = "http"
@@ -1702,9 +1712,11 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "blake3",
+ "hmac",
  "secrecy",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "time",
  "tokio",
@@ -1716,6 +1728,7 @@ name = "mansio-e2e"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hmac",
  "iggy",
  "mansio-core",
  "mansio-iggy",
@@ -1723,6 +1736,7 @@ dependencies = [
  "reqwest",
  "secrecy",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 
@@ -1747,9 +1761,11 @@ dependencies = [
  "async-trait",
  "axum",
  "bytes",
+ "futures-util",
  "http-body-util",
  "mansio-core",
  "mansio-iggy",
+ "reqwest",
  "secrecy",
  "serde",
  "serde_json",
@@ -2661,6 +2677,17 @@ name = "sha1"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
+name = "sha2"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
 dependencies = [
  "cfg-if",
  "cpufeatures",

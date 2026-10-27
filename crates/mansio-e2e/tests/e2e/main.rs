@@ -9,10 +9,15 @@
 //! it accepts. See `e2e/harness.rs`.
 
 mod alerts;
+mod consumers;
 mod credentials;
+mod events;
 mod harness;
 mod ordering;
+mod receiver;
 mod restart;
+mod surfaces;
+mod webhooks;
 mod work;
 
 use std::path::PathBuf;

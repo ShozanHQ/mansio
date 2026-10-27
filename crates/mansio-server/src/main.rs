@@ -83,6 +83,10 @@ async fn serve() -> anyhow::Result<()> {
         .with_work_settings(settings.work)
         .context("the work settings")?
         .with_credential_settings(settings.credentials)
+        .with_stream_settings(settings.stream)
+        .context("the stream settings")?
+        .with_webhook_settings(settings.webhooks)
+        .context("the webhook settings")?
         .serve(listener, shutdown_signal())
         .await
         .context("serving")?;
