@@ -87,6 +87,13 @@ arguments (and `seconds`, if it wants a lease of a length of its own), before
 end. A lease runs for `MANSIO_LEASE_MAX_SECONDS` (a day by default) at most from
 the claim.
 
+An agent works in tool calls and cannot call `work_extend` while one of them is
+still running. So before a step that may outlast the lease (a build, a test
+run, a long command), call `work_extend` with `seconds` at least as long as the
+step is expected to take, up to `MANSIO_LEASE_MAX_SECONDS`, and extend again
+between steps. A lease that ends during a step gives the item to another
+consumer while the step is still running.
+
 If it cannot do the work it calls `work_fail` with the same and a `reason`, and
 the item is offered again after a backoff. A `work_pull` that finds nothing
 returns `no output`.

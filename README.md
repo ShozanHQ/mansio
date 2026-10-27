@@ -316,8 +316,12 @@ curl ... -d '{"lease_id":"<uuid>","consumer":"worker-1","reason":"out of memory"
   (`MANSIO_LEASE_SECONDS` from now if there are none), so that a build or a
   review that takes far longer than a lease keeps its item: extend every half
   lease, and nothing else claims it, for as many lease lengths as the longest
-  lease allows. The longest a lease may run is `MANSIO_LEASE_MAX_SECONDS` (a day by default),
-  counted from the claim however often it is extended. An extension that would
+  lease allows. A consumer that works in blocking calls, as an agent does,
+  cannot extend during one: before a step that may outlast the lease it
+  extends with `seconds` at least as long as the step is expected to take, and
+  extends again between steps. The longest a lease may run is
+  `MANSIO_LEASE_MAX_SECONDS` (a day by default), counted from the claim however
+  often it is extended. An extension that would
   pass it is capped there and not refused, and the answer says where the
   lease ends (`data.expires_at` of the `extended` fact), so a consumer that
   sees the end stop moving knows it has the last of it. An extension never
@@ -669,8 +673,8 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_MAX_BODY_BYTES` | `1048576` | Largest request body. |
 | `MANSIO_POLL_DEFAULT_COUNT` | `100` | Envelopes a poll returns when `count` is not given. |
 | `MANSIO_POLL_MAX_COUNT` | `1000` | The most a poll may ask for. Also how many messages the server reads at a time when it rebuilds its state on start. |
-| `MANSIO_LEASE_SECONDS` | `300` | How long a claim holds, and how long an extension without `seconds` runs from now. Past it the item expires and, after its backoff, is claimed again. |
-| `MANSIO_LEASE_MAX_SECONDS` | `86400` | The longest a lease may run, counted from the claim however often it is extended. An extension that would pass it is capped there. At least `MANSIO_LEASE_SECONDS`. |
+| `MANSIO_LEASE_SECONDS` | `300` | How long a claim holds, and how long an extension without `seconds` runs from now. Past it the item expires and, after its backoff, is claimed again. At most `315360000` (ten years). |
+| `MANSIO_LEASE_MAX_SECONDS` | `86400` | The longest a lease may run, counted from the claim however often it is extended. An extension that would pass it is capped there. At least `MANSIO_LEASE_SECONDS`, at most `315360000` (ten years). |
 | `MANSIO_MAX_ATTEMPTS` | `5` | Attempts an item gets. A failure or expiry of the last one sends it to `dead`. |
 | `MANSIO_BACKOFF_BASE_SECONDS` | `5` | The wait before an item is republished after its first failure. It doubles with each attempt. |
 | `MANSIO_BACKOFF_CAP_SECONDS` | `300` | The longest that wait gets. At least the base. |
@@ -797,9 +801,11 @@ skip, without `MANSIO_E2E_URL` or `MANSIO_E2E_STATE_DIR`. The `e2e` job in
 pages of 5, a lease of 30 s, a segment of 1 MiB and alerts kept for 5 s, runs
 the two first passes, restarts mansio-server (`docker compose restart`), and
 runs the two second passes. The restart pair publishes a queue longer than
-`MANSIO_POLL_MAX_COUNT`, claims one item, and after the restart checks that
-the lease still holds, that the item is retried exactly once after it and that
-every other item can be claimed once. The retention pair fills and rolls a
+`MANSIO_POLL_MAX_COUNT`, claims one item and extends its lease to twice the
+lease setting, and after the restart checks that the lease still holds past
+the end it first had and until the end it was extended to, that the item is
+retried exactly once after that and that every other item can be claimed
+once. The retention pair fills and rolls a
 segment of `alerts`, waits for Iggy to delete it, publishes another alert, and
 after the restart checks that the server's rebuild, which reads from offset 0,
 finds the alerts that are left. The same checks as the restart pair run in one

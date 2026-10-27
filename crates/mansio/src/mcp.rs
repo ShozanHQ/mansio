@@ -167,7 +167,7 @@ pub async fn handle(client: &Client, message: Value) -> Option<Value> {
                     "protocolVersion": version,
                     "capabilities": {"tools": {"listChanged": false}},
                     "serverInfo": {"name": "mansio", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": "Tools to publish to and read from the mansio bus, and to claim, extend, complete and fail work items. A work_pull returns an item and a lease; pass the item's itemid, the consumer and the lease_id to work_ack or work_fail. A lease ends at its expires_at: work that takes longer calls work_extend before then, again and again, and its answer's data.expires_at is the new end."
+                    "instructions": "Tools to publish to and read from the mansio bus, and to claim, extend, complete and fail work items. A work_pull returns an item and a lease; pass the item's itemid, the consumer and the lease_id to work_ack or work_fail. A lease ends at its expires_at: work that takes longer calls work_extend before then, again and again, and its answer's data.expires_at is the new end. You cannot call a tool while another is running, so before a step that may outlast the lease (a build, a test run, a long command) call work_extend with seconds at least as long as the step is expected to take, up to the server's maximum, and extend again between steps."
                 }),
             )
         }
