@@ -1,0 +1,77 @@
+# A development stack: Apache Iggy and mansio-server.
+#
+#   docker compose up --build --wait
+#
+# The credentials below are DEVELOPMENT DEFAULTS. They are fine on a machine
+# you trust and nowhere else. To use your own, set the variables in the
+# environment or in a .env file next to this one:
+#
+#   MANSIO_TOKEN         the bearer token clients present to mansio-server
+#   IGGY_ROOT_USERNAME   the Iggy admin user, shared by Iggy and mansio-server
+#   IGGY_ROOT_PASSWORD   its password; Iggy sets it on first start only, so
+#                        change it before the first start or remove the
+#                        iggy-data volume
+#
+# Only mansio-server is published, and only on loopback.
+
+name: mansio
+
+services:
+  iggy:
+    image: apache/iggy:0.9.0
+    restart: unless-stopped
+    # What Iggy's io_uring runtime needs, as in Iggy's own compose file.
+    cap_add:
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    environment:
+      IGGY_ROOT_USERNAME: ${IGGY_ROOT_USERNAME:-iggy}
+      IGGY_ROOT_PASSWORD: ${IGGY_ROOT_PASSWORD:-iggy}
+      IGGY_PATH: local_data
+      # The image binds loopback unless told otherwise.
+      IGGY_TCP_ADDRESS: 0.0.0.0:8090
+      # The name other containers reach it by.
+      IGGY_NODE_ADVERTISED_ADDRESS: iggy
+    volumes:
+      - iggy-data:/app/local_data
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/iggy", "--tcp-server-address", "127.0.0.1:8090", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 2s
+
+  mansio-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mansio-server:dev
+    restart: unless-stopped
+    depends_on:
+      iggy:
+        condition: service_healthy
+    environment:
+      MANSIO_BROKER: iggy
+      MANSIO_TOKEN: ${MANSIO_TOKEN:-mansio-dev-token}
+      MANSIO_IGGY_ADDRESS: iggy:8090
+      MANSIO_IGGY_USERNAME: ${IGGY_ROOT_USERNAME:-iggy}
+      MANSIO_IGGY_PASSWORD: ${IGGY_ROOT_PASSWORD:-iggy}
+    ports:
+      - "127.0.0.1:7070:7070"
+    volumes:
+      - sink:/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--output", "/dev/null", "http://127.0.0.1:7070/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  iggy-data:
+  sink:
