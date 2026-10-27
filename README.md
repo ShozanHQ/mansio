@@ -114,7 +114,8 @@ mints an agent credential for a fresh tenant with `mansio principals create`
 and runs three scenarios of N items (`MANSIO_OFFLINE_ITEMS`, 50) with a
 consumer, [`tests/offline/consumer.sh`](tests/offline/consumer.sh): a plain
 shell loop of `mansio work pull --wait` and `mansio work ack` that appends the
-item's id to a file only when the ack succeeds. Any harness can copy it.
+item's id to a file only when the ack succeeds. Any harness can copy its shape;
+read the next paragraph before copying its order.
 
 1. A consumer is started and killed with `kill -9`. N items are published. A
    new process of the consumer starts. The file ends with N lines, N distinct
@@ -132,6 +133,15 @@ item's id to a file only when the ack succeeds. Any harness can copy it.
    and `facts.work` holds one claim and one ack of attempt 1 for every item,
    the held one included: no expiry, no second attempt.
 
+The consumer appends after the ack so that the file counts acknowledgements and
+can never hold an item twice, which is what the test needs. The price is a lost
+effect: if the consumer dies between the ack and the append, or the answer to
+the ack is lost (the CLI does not send an ack again), the server has the item as
+done and the file does not hold it. A real worker does its effect first,
+idempotent on the item's `itemid` (the attempt is in the item), and then acks,
+so that a death between the two is a redelivery that the idempotent effect
+absorbs.
+
 The consumer that takes over in scenario 2 has a name of its own because the
 dead one's name would be given its lease back, and there would be no expiry to
 wait for.
@@ -145,7 +155,10 @@ server with a lease of seconds, not the default five minutes, because scenario
 2 waits for it, and long enough to restart a consumer inside, because scenario
 3 does. The test reads the server's lease, backoff and tick from
 `GET /v1/settings` and refuses to start if its timeout, or a settle time you
-set, is shorter than they need. On Linux, with Docker:
+set, is shorter than they need. It also checks the consumers' logs: no ack
+may have failed, and the pulls that failed and were tried again are counted and
+printed, so that a broker that hiccups is visible in a passing run. On Linux,
+with Docker:
 
 ```sh
 MANSIO_LEASE_SECONDS=8 MANSIO_MAX_ATTEMPTS=3 MANSIO_BACKOFF_BASE_SECONDS=1 \
@@ -162,6 +175,7 @@ the server in another terminal with the same settings and point the test at it:
 MANSIO_BROKER=memory MANSIO_TOKEN=dev MANSIO_SINK_PATH= MANSIO_LEASE_SECONDS=8 \
   MANSIO_MAX_ATTEMPTS=3 MANSIO_BACKOFF_BASE_SECONDS=1 MANSIO_BACKOFF_CAP_SECONDS=4 \
   MANSIO_TICK_MILLIS=200 cargo run -p mansio-server
+cargo build -p mansio
 MANSIO_TOKEN=dev MANSIO_BIN=target/debug/mansio tests/offline/run.sh
 ```
 
@@ -830,7 +844,7 @@ from `MANSIO_TOKEN`; its consumers are given the credential it mints as their
 | `MANSIO_OFFLINE_CREDENTIAL_TTL_SECONDS` | `3600` | How long the agent credentials the test mints last. |
 | `MANSIO_OFFLINE_PULL_WAIT_SECONDS` | `5` | How long one `work pull` of the consumer looks for an item. |
 | `MANSIO_OFFLINE_RETRY_SECONDS` | `1` | The consumer's wait after a pull that failed. |
-| `MANSIO_OFFLINE_STOP_AFTER_CLAIM` | `0` | `1` makes the consumer `kill -9` itself right after its first claim, holding the lease. The test sets it for the consumer that dies in scenario 2. |
+| `MANSIO_OFFLINE_STOP_AFTER_CLAIM` | `0` | `1` makes the consumer `kill -9` itself right after its first claim, holding the lease. The test sets it for the consumer that dies in scenarios 2 and 3. |
 
 ## Develop
 
