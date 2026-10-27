@@ -316,46 +316,63 @@ impl<'de> Deserialize<'de> for EventId {
     }
 }
 
-/// The id of a lease on a work item: a random (version 4) UUID, so that
-/// holding it is proof of having been given it. Only the holder presents it
-/// to acknowledge or fail the item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct LeaseId(Uuid);
+/// Define a random (version 4) UUID newtype, so that holding the value is
+/// proof of having been given it.
+macro_rules! random_uuid_type {
+    ($(#[$meta:meta])* $name:ident, $what:expr) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub struct $name(Uuid);
 
-impl LeaseId {
-    /// A new unguessable id.
-    #[must_use]
-    pub fn generate() -> Self {
-        Self(Uuid::new_v4())
-    }
+        impl $name {
+            /// A new unguessable id.
+            #[must_use]
+            pub fn generate() -> Self {
+                Self(Uuid::new_v4())
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = ParseError;
+
+            fn from_str(s: &str) -> Result<Self, ParseError> {
+                parse_uuid($what, s).map(Self)
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}", self.0.hyphenated())
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.collect_str(self)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let s = Cow::<str>::deserialize(deserializer)?;
+                s.parse().map_err(D::Error::custom)
+            }
+        }
+    };
 }
 
-impl FromStr for LeaseId {
-    type Err = ParseError;
-
-    fn from_str(s: &str) -> Result<Self, ParseError> {
-        parse_uuid("lease id", s).map(Self)
-    }
-}
-
-impl fmt::Display for LeaseId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0.hyphenated())
-    }
-}
-
-impl Serialize for LeaseId {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(self)
-    }
-}
-
-impl<'de> Deserialize<'de> for LeaseId {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = Cow::<str>::deserialize(deserializer)?;
-        s.parse().map_err(D::Error::custom)
-    }
-}
+random_uuid_type!(
+    /// The id of a lease on a work item. Only the holder presents it to
+    /// acknowledge or fail the item.
+    LeaseId,
+    "lease id"
+);
+random_uuid_type!(
+    /// The id of a principal the admin API issued a credential to. It names
+    /// the principal in the API and in the broker, and is not a secret.
+    PrincipalId,
+    "principal id"
+);
 
 /// Who acted: a kind and a name, written `kind:name`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

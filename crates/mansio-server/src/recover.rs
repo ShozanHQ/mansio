@@ -10,8 +10,8 @@
 use std::collections::HashMap;
 
 use mansio_core::{
-    AlertEvent, AlertFact, Broker, BrokerError, Envelope, EventId, ItemId, Next, Segment, Stored,
-    TenantId, Timestamp, Topic, WorkEvent, WorkFact,
+    AlertEvent, AlertFact, Broker, BrokerError, Caller, Envelope, EventId, ItemId, Next, Segment,
+    Stored, TenantId, Timestamp, Topic, WorkEvent, WorkFact,
 };
 use tracing::warn;
 
@@ -71,7 +71,10 @@ async fn read_all(
     let mut all = Vec::new();
     let mut offset = 0;
     loop {
-        let batch = match broker.poll(tenant, topic, offset, page).await {
+        let batch = match broker
+            .poll(&Caller::Admin, tenant, topic, offset, page)
+            .await
+        {
             Ok(batch) => batch,
             Err(BrokerError::NotFound(_)) => break,
             Err(error) => return Err(error),

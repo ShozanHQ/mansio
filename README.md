@@ -6,10 +6,11 @@ later picks up what is waiting. [Apache Iggy](https://iggy.apache.org) is the
 broker, and mansio is the contract around it. Open source under Apache-2.0.
 
 This is an early build. Publishing and polling work, and so do work items
-(claim with a lease, acknowledge, fail, retry with backoff, a dead topic) and
-alerts (acknowledge, surface again) over the HTTP API. The CLI and MCP
-commands for them, per-principal credentials, server-sent events and webhooks
-are designed in [ARCHITECTURE.md](ARCHITECTURE.md) and not built yet.
+(claim with a lease, acknowledge, fail, retry with backoff, a dead topic),
+alerts (acknowledge, surface again) and credentials (a principal gets a
+credential that the broker holds to its scopes) over the HTTP API. The CLI and
+MCP commands for them, server-sent events and webhooks are designed in
+[ARCHITECTURE.md](ARCHITECTURE.md) and not built yet.
 
 ## The contract
 
@@ -59,7 +60,8 @@ A tenant is an Iggy stream. Its topics are:
 
 Names inside a topic and tenant ids match `[a-z0-9][a-z0-9_-]{0,62}`. Each
 topic has one partition, so order is publish order, and an offset counts from
-0. Topics are created the first time they are used.
+0. A topic is created by the first publish to it; reading one that nobody has
+published to answers 404.
 
 ## Run it
 
@@ -69,11 +71,15 @@ topic has one partition, so order is publish order, and an offset counts from
 docker compose up --build --wait
 ```
 
-This starts Iggy 0.9.0 and mansio-server, and waits until both are healthy.
-mansio-server listens on `127.0.0.1:7070`; Iggy is reachable only from the
-other container. The token and the Iggy admin password in `compose.yaml` are
-development defaults (`mansio-dev-token`, `iggy`). Set `MANSIO_TOKEN` and
-`IGGY_ROOT_PASSWORD` in the environment, or in a `.env` file, to change them.
+This starts Iggy 0.9.0, makes the Iggy user mansio-server acts as (the
+`iggy-admin` service runs once and stops), and starts mansio-server, and waits
+until it is healthy. mansio-server listens on `127.0.0.1:7070` and Iggy's TCP
+port is published on `127.0.0.1:8090`. The token and the passwords in
+`compose.yaml` are development defaults (`mansio-dev-token` for the admin
+token, `iggy` for Iggy's root user, `mansio-dev-admin` for the Iggy user
+mansio-server acts as). Set `MANSIO_TOKEN`, `IGGY_ROOT_PASSWORD` and
+`MANSIO_IGGY_PASSWORD` in the environment, or in a `.env` file, to change
+them. Only Iggy and `iggy-admin` are given the root password.
 
 ```sh
 export MANSIO_TOKEN=mansio-dev-token
@@ -87,7 +93,8 @@ cargo run -p mansio -- poll --tenant acme --topic facts.build
 ### Without Docker, in memory
 
 The memory broker needs nothing else, and forgets everything when the server
-stops.
+stops. It holds users, scopes and expiring credentials the way Iggy does, so
+credentials work on it as they do on Iggy.
 
 ```sh
 MANSIO_BROKER=memory MANSIO_TOKEN=dev MANSIO_SINK_PATH= cargo run -p mansio-server
@@ -114,7 +121,9 @@ mansio poll --tenant T --topic TOPIC [--offset N] [--count M]
 
 ## The HTTP API
 
-Everything except `/healthz` needs `Authorization: Bearer <token>`.
+Everything except `/healthz` needs `Authorization: Bearer <token>`. The token
+is the admin token (`MANSIO_TOKEN`) or a credential issued to a principal, see
+[Credentials](#credentials). The examples use the admin token.
 
 ```sh
 curl -H "Authorization: Bearer $MANSIO_TOKEN" -H 'Content-Type: application/json' \
@@ -132,19 +141,21 @@ landed and mansio could not find it among the recent messages (see
 `MANSIO_IGGY_LOCATE_WINDOW`). The answer is still 201: the message is stored,
 so do not publish it again. Poll and match on the envelope's `id` to find it.
 
-A refusal is `{"error":{"code":"...","message":"..."}}` with status 400, 401,
-403, 404, 409, 413, 502 or 503. A 502 or 503 is also logged at `warn` with the
-tenant, the topic and what the broker or the sink said.
+A refusal is `{"error":{"code":"...","message":"..."}}` with status 400, 401
+(no valid credential), 403 (a valid credential that may not do this, or a lease
+that is not yours), 404, 409, 413, 502 or 503. A 502 or 503 is also logged at
+`warn` with the tenant, the topic and what the broker or the sink said.
 
 `GET /v1/settings` answers with the settings the server runs with, none of
-them secret: the work settings below and the API limits.
+them secret: the work and credential settings below and the API limits.
 
 ### Work items
 
 Iggy is offset-based and has no per-message claim, acknowledgement, redelivery
 or dead letters. mansio builds them, and records every transition as an
 envelope on `facts.work` and in the sink. Work does not go through the generic
-messages route, which refuses `work.<queue>`, `facts.work` and `facts.alert`.
+messages route, which refuses `work.<queue>`, `facts.work`, `facts.alert` and
+`facts.principal`.
 The operations are `work_publish`, `work_pull`, `work_ack` and `work_fail`.
 
 ```sh
@@ -214,6 +225,96 @@ An alert nobody has acknowledged `MANSIO_ALERT_RESURFACE_SECONDS` after it was
 published gets a `mansio.alert.resurfaced` envelope on `facts.alert`, and
 another after each further interval, until it is acknowledged.
 
+### Credentials
+
+Identity secures the bus, and the broker enforces it: a consumer that was never
+granted a topic cannot read it however it asks. The admin credential (the
+bootstrap `MANSIO_TOKEN`) issues a credential to a principal, and a host
+application's token issuance calls this, so one issuance covers the host's API
+and the bus. The operations are `principals_create`, `principals_list` and
+`principals_revoke`, and only the admin credential may call them.
+
+```sh
+# principals_create: a kind, a name, one tenant, and scopes.
+curl -H "Authorization: Bearer $MANSIO_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"kind":"agent","name":"builder-1","tenant":"acme","scopes":[
+        {"topic":"facts.build","verbs":["publish"]},
+        {"topic":"work.builds","verbs":["claim"]}]}' \
+  http://127.0.0.1:7070/v1/principals
+# 201 {"principal":{"id":"<uuid>","kind":"agent","name":"builder-1","tenant":"acme",
+#      "scopes":[...],"created_at":"...","expires_at":"..."},"credential":"<token>"}
+
+# principals_list: the principals that have a credential, of one tenant or all.
+curl -H "Authorization: Bearer $MANSIO_TOKEN" 'http://127.0.0.1:7070/v1/principals?tenant=acme'
+# 200 {"principals":[{...}]}   no credential in it
+
+# principals_revoke: 200 with the principal; its credential stops working.
+curl -X DELETE -H "Authorization: Bearer $MANSIO_TOKEN" http://127.0.0.1:7070/v1/principals/<id>
+```
+
+The credential is in the answer to `principals_create` and nowhere else: mansio
+keeps no copy of it, and it is in no log, fact or record. Present it as
+`Authorization: Bearer <token>`. Who a request is from comes from the
+credential and from nothing in the request: the `principalkind` and
+`principalname` on what it publishes are the principal's. A kind and a name
+name one principal in a tenant (409 otherwise), and `service:mansio`, the admin
+principal, and `service:mansio-engine` cannot be issued.
+
+A scope is a topic pattern and the verbs granted there. A pattern is a topic
+(`work.builds`, `facts.build`, `alerts`), or `facts.*` or `work.*` for every
+topic of that family, including ones made later. There is no pattern for the
+whole stream.
+
+| Verb | Lets the principal | On |
+|---|---|---|
+| `publish` | send messages: `messages`, `work_publish`, `alerts_publish` | any topic |
+| `subscribe` | read messages | any topic |
+| `claim` | read messages, `work_pull` from the queue, and `work_ack` and `work_fail` its own leases | `work.<queue>` |
+| `ack` | `alerts_ack` | `alerts` |
+| `approve` | do what `claim` does | `work.approvals` only |
+
+A scope that grants a verb where it cannot apply, such as `claim` on
+`facts.build`, is refused with 400. A credential reaches its tenant and no
+other.
+
+- An `agent` credential always expires: after `ttl_seconds` if the request
+  gives it, else after `MANSIO_AGENT_CREDENTIAL_TTL_SECONDS`. Any other kind
+  expires only if the request gives `ttl_seconds`. An expired credential is
+  refused with 401 at once, and a sweep every `MANSIO_CREDENTIAL_SWEEP_SECONDS`
+  revokes it.
+- A revocation deletes the broker's user and with it the credential, so the
+  broker refuses it as well as mansio. A server that did not itself see a
+  revocation or an expiry asks the broker about a token at least every
+  `MANSIO_CREDENTIAL_RECHECK_SECONDS`, so it takes effect within that time. A
+  token that was never issued or was revoked is refused without asking the
+  broker.
+- Each issue and revoke is an envelope on `facts.principal`,
+  `mansio.principal.created` and `mansio.principal.revoked` (with the reason:
+  `requested`, `expired` or `failed`), recorded in the sink first. The
+  generic messages route refuses the topic, and a credential with `facts.*`
+  can read it. The principals themselves are kept in a log in the broker that
+  no credential can read, and read again on start.
+
+#### What enforces what
+
+The broker enforces who may send to and read which topic. Each principal is a
+user of the broker with permissions on its tenant's stream and on the topics its
+scopes cover, named one by one, and never on the stream as a whole; mansio
+acts for a credential on a connection signed in as that user, so a request the
+scopes do not allow is refused by the broker and answered 403. A topic made
+later is opened to the users whose scopes cover it. The test suite asks the
+broker itself, without mansio-server, and Iggy refuses a credential that sends to
+another tenant's stream.
+
+mansio enforces what the broker has no word for: that only the holder of a lease
+acks or fails it, that `claim` and `approve` are what let a principal take from
+a queue, that `ack` is what lets it acknowledge an alert, and that only the
+admin credential calls the admin API. It checks a request against the scopes
+before it records or creates anything, so a refused request leaves nothing
+behind. The server acts as an Iggy user of its own that manages users and
+streams and reads and writes topics (`mansio-server provision-admin` makes it;
+see [Settings](#settings)), never as Iggy's root user.
+
 ### Order
 
 Every durable publish mansio makes (messages, work, transitions) is recorded
@@ -230,8 +331,11 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 |---|---|---|
 | `MANSIO_LISTEN` | `127.0.0.1:7070` (`0.0.0.0:7070` in the image) | Address the HTTP API listens on. |
 | `MANSIO_BROKER` | `iggy` | `iggy` or `memory`. |
-| `MANSIO_TOKEN` | none, required | The bearer token clients present. |
-| `MANSIO_TOKEN_PRINCIPAL` | `service:mansio` | The `kind:name` the token stands for. |
+| `MANSIO_TOKEN` | none, required | The admin's bearer token, which may do everything in every tenant, and call the admin API. |
+| `MANSIO_TOKEN_PRINCIPAL` | `service:mansio` | The `kind:name` the admin token stands for. |
+| `MANSIO_AGENT_CREDENTIAL_TTL_SECONDS` | `3600` | How long an agent credential lasts when the request does not say. |
+| `MANSIO_CREDENTIAL_RECHECK_SECONDS` | `30` | The longest a credential is trusted without asking the broker again, so the longest a revocation the server did not see itself takes to apply. |
+| `MANSIO_CREDENTIAL_SWEEP_SECONDS` | `60` | How often expired credentials are revoked. |
 | `MANSIO_SINK_PATH` | `mansio-sink.jsonl` (`/data/sink.jsonl` in the image) | JSON Lines file that every durable publish is appended to before it is published. Empty turns the sink off. |
 | `MANSIO_MAX_BODY_BYTES` | `1048576` | Largest request body. |
 | `MANSIO_POLL_DEFAULT_COUNT` | `100` | Envelopes a poll returns when `count` is not given. |
@@ -243,7 +347,7 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_ALERT_RESURFACE_SECONDS` | `3600` | How long an alert may go unacknowledged before it is surfaced again, and again after each further interval. |
 | `MANSIO_TICK_MILLIS` | `500` | How often the timer looks for leases to expire, items to republish and alerts to surface again. |
 | `MANSIO_IGGY_ADDRESS` | `127.0.0.1:8090` | Iggy's TCP address, `host:port`. |
-| `MANSIO_IGGY_USERNAME` | `iggy` | The Iggy admin user mansio acts as. |
+| `MANSIO_IGGY_USERNAME` | `mansio` | The Iggy user mansio-server acts as. It manages users and streams and reads and writes topics; it is not Iggy's root user. |
 | `MANSIO_IGGY_PASSWORD` | none, required with `iggy` | Its password. |
 | `MANSIO_IGGY_CONNECT_TIMEOUT_SECONDS` | `60` | How long startup waits for Iggy. |
 | `MANSIO_IGGY_LOCATE_WINDOW` | `100` | How many recent messages to search, by message id, when Iggy accepts a publish without saying where it landed. 0 turns the search off. A message that is not found is still answered with 201, without an offset. |
@@ -258,6 +362,16 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 
 Retention and durability are applied when a topic is created; a topic that
 already exists keeps the ones it was created with.
+
+#### The Iggy user
+
+`mansio-server provision-admin` signs in to Iggy as the root user once, makes
+the user `MANSIO_IGGY_USERNAME` with `MANSIO_IGGY_PASSWORD` (or, if it exists,
+sets its permissions again and leaves its password), and exits. It reads
+`MANSIO_IGGY_ADDRESS`, `MANSIO_IGGY_USERNAME`, `MANSIO_IGGY_PASSWORD` and
+`MANSIO_IGGY_CONNECT_TIMEOUT_SECONDS` as the server does, and the root user from
+`IGGY_ROOT_USERNAME` (default `iggy`) and `IGGY_ROOT_PASSWORD` (required). The
+server itself is never given those two. `compose.yaml` runs it as `iggy-admin`.
 
 #### Durability
 
@@ -282,11 +396,14 @@ acknowledged since the last flush, after the sink has already recorded them.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MANSIO_E2E_URL` | unset | A running server for `mansio-e2e` to use, with `MANSIO_TOKEN` set to its token. Unset starts a server in the test process on the memory broker, with a lease of 2 s, 3 attempts, a backoff from 1 s to 4 s and alerts surfaced every 2 s. Against a running server the tests read its work settings from `GET /v1/settings`. |
+| `MANSIO_E2E_URL` | unset | A running server for `mansio-e2e` to use, with `MANSIO_TOKEN` set to its token. Unset starts a server in the test process on the memory broker, with a lease of 2 s, 3 attempts, a backoff from 1 s to 4 s, alerts surfaced every 2 s, and an agent credential that lasts 3 s, is checked every second and swept every second. Against a running server the tests read its settings from `GET /v1/settings`. |
 | `MANSIO_E2E_SINK_PATH` | unset | The sink file of the running server, as the test process can read it. With it the tests also check the order of the sink; without it they check the topics only. |
+| `MANSIO_E2E_IGGY_ADDRESS` | unset | Iggy's TCP address as the test process reaches it (`127.0.0.1:8090` for `compose.yaml`). With `MANSIO_E2E_URL` set it is required: the credential tests ask Iggy itself, without mansio-server, what a credential may do, and fail if they cannot. Without `MANSIO_E2E_URL` they ask the memory broker. |
 | `MANSIO_SINK_DIR` | the `sink` volume | A directory on the host for `compose.yaml` to keep the sink file in, so that a test can read it. |
-| `MANSIO_LEASE_SECONDS` and the other work settings above | the defaults | Passed through by `compose.yaml` to mansio-server, so a test run can use short ones. |
-| `IGGY_ROOT_USERNAME`, `IGGY_ROOT_PASSWORD` | `iggy`, `iggy` | The Iggy admin user, read by `compose.yaml` for both services. Development defaults. |
+| `MANSIO_LEASE_SECONDS`, the other work settings and the credential settings above | the defaults | Passed through by `compose.yaml` to mansio-server, so a test run can use short ones. Against a running server the tests read them from `GET /v1/settings`. |
+| `IGGY_ROOT_USERNAME`, `IGGY_ROOT_PASSWORD` | `iggy`, `iggy` | Iggy's root user, read by `compose.yaml` for Iggy and `iggy-admin` only. Development defaults. |
+| `MANSIO_IGGY_USERNAME`, `MANSIO_IGGY_PASSWORD` | `mansio`, `mansio-dev-admin` | The Iggy user mansio-server acts as, read by `compose.yaml` for `iggy-admin` and mansio-server. Development defaults. |
+| `IGGY_PORT` | `8090` | The port on `127.0.0.1` that `compose.yaml` publishes Iggy's TCP port on. |
 
 ## Develop
 
@@ -307,15 +424,17 @@ run them against Iggy:
 ```sh
 MANSIO_LEASE_SECONDS=2 MANSIO_MAX_ATTEMPTS=3 MANSIO_BACKOFF_BASE_SECONDS=1 \
   MANSIO_BACKOFF_CAP_SECONDS=4 MANSIO_ALERT_RESURFACE_SECONDS=2 \
-  MANSIO_TICK_MILLIS=200 docker compose up --build --wait
+  MANSIO_TICK_MILLIS=200 MANSIO_AGENT_CREDENTIAL_TTL_SECONDS=5 \
+  MANSIO_CREDENTIAL_RECHECK_SECONDS=2 MANSIO_CREDENTIAL_SWEEP_SECONDS=2 \
+  docker compose up --build --wait
 MANSIO_E2E_URL=http://127.0.0.1:7070 MANSIO_TOKEN=mansio-dev-token \
-  cargo test -p mansio-e2e --locked
+  MANSIO_E2E_IGGY_ADDRESS=127.0.0.1:8090 cargo test -p mansio-e2e --locked
 docker compose down --volumes
 ```
 
-The default work settings make a test of a lease or a backoff take minutes, so
-set short ones as above. The tests that stop and start the server run only
-against the in-process one.
+The default work and credential settings make a test of a lease, a backoff or an
+expiry take minutes, so set short ones as above. The tests that stop and start
+the server run only against the in-process one.
 
 ## Licence
 

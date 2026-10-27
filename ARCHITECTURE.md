@@ -6,9 +6,9 @@ mansio is a message bus for agents, people and programs that are not connected a
 
 | Crate | Kind | Holds |
 |---|---|---|
-| `mansio-core` | lib | The envelope, tenant and principal ids, topics, work and alert types, the `Broker` and `Sink` traits, `MemoryBroker`, and the JSON bodies the HTTP API and its clients share. No network I/O. |
-| `mansio-iggy` | lib | `IggyBroker`: the `Broker` trait over the Iggy Rust SDK (TCP), plus the admin calls for users, permissions and personal access tokens. |
-| `mansio-server` | lib and bin | The HTTP API, the work and alert engine, credentials, server-sent events, webhooks. A host application embeds it as a library with its own `Sink`; the binary runs it standalone with the file sink. |
+| `mansio-core` | lib | The envelope, tenant and principal ids, topics, scopes (topic patterns and verbs), the credential type, work and alert types, the `Broker` and `Sink` traits, `MemoryBroker`, and the JSON bodies the HTTP API and its clients share. No network I/O. |
+| `mansio-iggy` | lib | `IggyBroker`: the `Broker` trait over the Iggy Rust SDK (TCP), with Iggy users, permissions and personal access tokens for credentials and a client per credential in use; and the making of the Iggy user the server acts as. |
+| `mansio-server` | lib and bin | The HTTP API, the work and alert engine, credentials, server-sent events, webhooks. A host application embeds it as a library with its own `Sink`; the binary runs it standalone with the file sink, and `mansio-server provision-admin` makes the Iggy user it acts as. |
 | `mansio` | bin | The CLI and the MCP server (`mansio mcp`, stdio). Both are clients of the HTTP API and use the same operation names. |
 | `mansio-e2e` | test | End-to-end tests. With `MANSIO_E2E_URL` unset they start an in-process server on `MemoryBroker`; with it set they run against a live server and Iggy (CI, through compose). |
 
@@ -39,17 +39,17 @@ A tenant is an Iggy stream. Its topics:
 
 | Topic | Holds | Retention |
 |---|---|---|
-| `facts.<kind>` | Durable events: from a host's ledger, and every work and alert transition mansio makes (`facts.work`, `facts.alert`). | setting |
+| `facts.<kind>` | Durable events: from a host's ledger, and every work and alert transition and every credential issued or revoked that mansio records (`facts.work`, `facts.alert`, `facts.principal`). | setting |
 | `work.<queue>` | Claimable items: builds, reviews, approvals, connector reads. | setting |
 | `alerts` | Escalations a person acknowledges. | setting |
 | `dead` | Work items past the attempt cap, and nowhere else. | setting |
 | `presence` | Heartbeats and progress. Ephemeral, short expiry, never sent to the sink. | setting, short |
 
-Segments match `[a-z0-9][a-z0-9_-]{0,62}`; so does a tenant id. Each topic has one partition, so order is publish order, and an offset counts from 0. The Iggy stream is named by the tenant id and the Iggy topic by the topic name. Topics are created on first use, by a publish or a poll, by the server's admin identity, with a message retention set per kind of topic (`MANSIO_RETENTION_<KIND>_SECONDS`, 0 keeps forever, and a topic that keeps forever has no size cap) and a durability: `persisted` for everything that goes through the sink (`MANSIO_IGGY_DURABILITY`), `replicated` for `presence` (`MANSIO_IGGY_PRESENCE_DURABILITY`). `persisted` makes Iggy confirm a write only once it is on stable storage, so a 201 survives a crash of the host. The Iggy backend remembers the streams and topics it has found or created, and checks again for a tenant when Iggy says one is missing.
+Segments match `[a-z0-9][a-z0-9_-]{0,62}`; so does a tenant id. Each topic has one partition, so order is publish order, and an offset counts from 0. The Iggy stream is named by the tenant id and the Iggy topic by the topic name. Topics are created on first use, by a publish, by the server's admin identity; a read never creates a stream or a topic, and a read of one that does not exist is a 404. A topic is made with a message retention set per kind of topic (`MANSIO_RETENTION_<KIND>_SECONDS`, 0 keeps forever, and a topic that keeps forever has no size cap) and a durability: `persisted` for everything that goes through the sink (`MANSIO_IGGY_DURABILITY`), `replicated` for `presence` (`MANSIO_IGGY_PRESENCE_DURABILITY`). `persisted` makes Iggy confirm a write only once it is on stable storage, so a 201 survives a crash of the host. The Iggy backend remembers the streams and topics it has found or created, and checks again for a tenant when Iggy says one is missing.
 
 ## Work items
 
-Iggy is offset-based: it has no per-message claim, acknowledgement, redelivery or dead letters. The engine in mansio-server builds them and records every transition. An item is named by the `id` of its first message, which `work_publish` sets as `itemid` with `attempt` 1; a caller cannot set either, and the generic messages route refuses `work.<queue>`, `facts.work` and `facts.alert`.
+Iggy is offset-based: it has no per-message claim, acknowledgement, redelivery or dead letters. The engine in mansio-server builds them and records every transition. An item is named by the `id` of its first message, which `work_publish` sets as `itemid` with `attempt` 1; a caller cannot set either, and the generic messages route refuses `work.<queue>`, `facts.work`, `facts.alert` and `facts.principal`.
 
 - **Claim** (`work_pull`) hands the oldest claimable item to the caller with a lease: a random lease id, the holder (the principal behind the credential and the consumer name from the request), the item and an expiry (now plus `MANSIO_LEASE_SECONDS`). Another caller cannot see it while the lease holds, and the claim is atomic.
 - **Ack** (`work_ack`) by the holder, presenting the lease id, completes it. Another lease id or principal is refused with 403, an item with no live lease (never claimed, expired, waiting for its retry) with 409, an item that is not open with 404. Nothing changes then.
@@ -78,9 +78,21 @@ Record and publish happen under one async lock per tenant, so the sink sees a te
 
 ## Credentials
 
-A principal is a kind (`person`, `agent`, `connector`, `service`, or another lowercase token), a name and a tenant, with scopes: topic patterns (`work.builds`, `facts.*`) and verbs (`publish`, `subscribe`, `claim`, `ack`, `approve`). The admin API mints an Iggy user with exactly the matching stream and topic permissions and a personal access token, which is the credential; an expiry on it is enforced by Iggy. The server acts for a caller through an Iggy client logged in with the caller's token, so Iggy refuses what the scopes do not allow. Revocation deletes the Iggy user. The server's own admin identity comes from the environment; configuration names variables, never values.
+A principal is a kind (`person`, `agent`, `connector`, `service`, or another lowercase token), a name and a tenant, with scopes: a topic pattern (a topic, `facts.*` or `work.*`) and verbs (`publish`, `subscribe`, `claim`, `ack`, `approve`). A kind and a name name one principal in a tenant. The admin API (`principals_create`, `principals_list`, `principals_revoke`) issues the credential: a user of the broker with permissions on its tenant's stream and the topics its scopes cover, and a personal access token of that user, which is the credential. Only the bootstrap token, now the admin principal's credential (`MANSIO_TOKEN`), compared in constant time and standing for `MANSIO_TOKEN_PRINCIPAL`, may call it.
 
-Until per-principal credentials exist, one bearer token (`MANSIO_TOKEN`), compared in constant time, stands for one principal (`MANSIO_TOKEN_PRINCIPAL`, default `service:mansio`) in every tenant. The server sets `tenant`, `topic`, `principalkind` and `principalname` from the path and that principal, and refuses a body that carries any of them.
+**Verbs.** `publish` is the broker's send permission; `subscribe` and `claim` are its poll permission; `claim` and `approve` (on `work.approvals` only) also let the holder `work_pull` from the queue and `work_ack` or `work_fail` its own leases; `ack` (on `alerts` only) lets it `alerts_ack`. The broker has no word for claim, approve or ack, so mansio enforces them. A verb on a pattern it cannot apply to is refused when the scope is made.
+
+**In the broker.** An Iggy permission names a topic by number. `IggyBroker` expands a pattern to the topics the tenant has, remembers each user's scopes, and applies them again to every user whose pattern matches when a topic is made, and `MemoryBroker` evaluates the same scopes. A permission is never given on a stream as a whole, or globally. The server's own Iggy user, made by `provision-admin` with root credentials that the server is never given, manages users and streams and reads and writes every topic. It creates streams and topics, on a publish; a read creates nothing.
+
+**Who is asking.** A bearer is the admin token, or a credential: a digest of every credential issued is in the registry, so a token that was never issued, or was revoked, is refused without any traffic to the broker. For one that is known, the expiry is checked against the server's clock, and the broker is asked whether it still accepts the token and whose it is, at most every `MANSIO_CREDENTIAL_RECHECK_SECONDS`, so a revocation or an expiry the server did not itself see applies within that time. Identity is the credential's and nothing in a request. The server acts for a credential through a client signed in with it (`Caller::Credential`, one client per credential in use), so the broker refuses what the scopes do not allow, and a refusal is a 403. A request is also checked against the scopes before anything is recorded or created, so a refusal leaves nothing behind; `work_pull` additionally reads the queue as the caller before a lease is handed out.
+
+**Issue.** Recorded first: the `created` fact goes to the sink and `facts.principal`. Then the broker makes the user, with a random password nobody is told and that is dropped once the token is made, and the token with the expiry (an `agent` always has one: `MANSIO_AGENT_CREDENTIAL_TTL_SECONDS`, or the request's). Then the registry log is written. If a step after the fact fails, the user is deleted, a `revoked` fact with the reason `failed` closes it, and no credential is returned. The credential is returned once; no log, fact or record holds it.
+
+**Registry.** The principals are a projection of a log in the broker that no credential can reach (the Iggy stream `mansio.system`, topic `principals`, whose name is not a valid tenant): `created` with the principal, its broker user and the digest of its credential, and `revoked`. It is read when first needed, and every principal in it is told to the broker again, because the broker keeps scopes in memory; one whose user the broker has lost is withdrawn.
+
+**Revoke and sweep.** The broker's user is deleted first, which ends its token and its sessions, and the revocation holds from then on whatever else fails. Then the principal leaves the registry and its log, and `revoked` is recorded (reasons `requested`, `expired`, `failed`). A sweep every `MANSIO_CREDENTIAL_SWEEP_SECONDS` revokes the expired, as `service:mansio-engine`.
+
+The bootstrap token's principal (`service:mansio` by default) and `service:mansio-engine` cannot be issued. The server sets `tenant`, `topic`, `principalkind` and `principalname` from the path and the credential's principal, and refuses a body that carries any of them.
 
 ## Surfaces
 
@@ -94,8 +106,9 @@ One HTTP API under `/v1`:
 - `work_pull`: `POST /v1/tenants/{tenant}/work/{queue}/pull` with `{"consumer"}`; 200 with `{"lease_id", "expires_at", "item"}`, or 204 when nothing is claimable.
 - `work_ack`: `POST /v1/tenants/{tenant}/work/{queue}/items/{itemid}/ack` with `{"lease_id"}`, and `work_fail`: `.../fail` with `{"lease_id", "reason"}`; 200 with the transition's envelope.
 - `alerts_publish`: `POST /v1/tenants/{tenant}/alerts`, as a publish to `alerts`. `alerts_ack`: `POST /v1/tenants/{tenant}/alerts/{id}/ack`; 200 with the `acknowledged` envelope.
+- `principals_create`: `POST /v1/principals` with `{"kind", "name", "tenant", "scopes", "ttl_seconds"?}`; 201 with `{"principal", "credential"}`. `principals_list`: `GET /v1/principals?tenant=`; 200 with `{"principals"}`. `principals_revoke`: `DELETE /v1/principals/{id}`; 200 with the principal. The admin credential only.
 
-Every refusal is `{"error": {"code", "message"}}` with 400 (malformed), 401 (no valid token), 403 (a lease that is not the caller's), 404, 409 (the state does not allow it: no live lease, an alert already acknowledged, an item id already open), 413 (body too large), 502 (the broker refused) or 503 (the broker or the sink is unavailable). A 502 or 503 is logged at `warn` with the tenant, topic and cause. Everything but `/healthz` needs `Authorization: Bearer <token>`.
+Every refusal is `{"error": {"code", "message"}}` with 400 (malformed), 401 (no valid token), 403 (a valid credential that may not do this, or a lease that is not the caller's), 404 (including a read of a topic nobody has published to), 409 (the state does not allow it: no live lease, an alert already acknowledged, an item id already open, a principal that already has a credential), 413 (body too large), 502 (the broker refused) or 503 (the broker or the sink is unavailable). A 502 or 503 is logged at `warn` with the tenant, topic and cause. Everything but `/healthz` needs `Authorization: Bearer <token>`.
 
 The CLI, the MCP server, server-sent events (`GET /v1/events`, resuming from `Last-Event-ID`) and signed webhooks (CloudEvents JSON, HMAC-SHA256 signature header, retry with backoff) all use it, with the same operation names.
 

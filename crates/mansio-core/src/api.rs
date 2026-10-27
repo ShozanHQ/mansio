@@ -2,9 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::access::Grant;
 use crate::broker::Stored;
+use crate::credential::Credential;
 use crate::envelope::{Envelope, Timestamp};
-use crate::id::{ConsumerName, LeaseId};
+use crate::id::{ConsumerName, LeaseId, PrincipalKind, PrincipalName, TenantId};
+use crate::principal::PrincipalInfo;
 
 /// The answer to a publish: the envelope as stored, and where it landed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -81,6 +84,42 @@ pub struct FailRequest {
     pub reason: String,
 }
 
+/// The body of `principals_create`: who the credential is for and what it may
+/// do.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreatePrincipal {
+    /// The kind. An `agent` credential always expires.
+    pub kind: PrincipalKind,
+    /// The name, unique within its kind and tenant.
+    pub name: PrincipalName,
+    /// The tenant the credential reaches, and no other.
+    pub tenant: TenantId,
+    /// What the credential may do. At least one.
+    pub scopes: Vec<Grant>,
+    /// Seconds until the credential stops working. Left out, an agent gets
+    /// `MANSIO_AGENT_CREDENTIAL_TTL_SECONDS` and other kinds do not expire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<u64>,
+}
+
+/// The answer to `principals_create`: the principal, and the credential. The
+/// credential is shown this once and mansio keeps no copy of it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Issued {
+    /// The principal as recorded.
+    pub principal: PrincipalInfo,
+    /// The bearer credential to present as `Authorization: Bearer ...`.
+    pub credential: Credential,
+}
+
+/// The answer to `principals_list`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Principals {
+    /// The principals that have a credential, oldest first.
+    pub principals: Vec<PrincipalInfo>,
+}
+
 /// The answer to `GET /v1/settings`: the settings the server runs with, none
 /// of them secret. Durations are whole seconds, except the tick.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +143,15 @@ pub struct EffectiveSettings {
     pub poll_default_count: u32,
     /// `MANSIO_POLL_MAX_COUNT`.
     pub poll_max_count: u32,
+    /// `MANSIO_AGENT_CREDENTIAL_TTL_SECONDS`: how long an agent credential
+    /// lasts when the request does not say.
+    pub agent_credential_ttl_seconds: u64,
+    /// `MANSIO_CREDENTIAL_RECHECK_SECONDS`: the longest a credential is
+    /// trusted without asking the broker.
+    pub credential_recheck_seconds: u64,
+    /// `MANSIO_CREDENTIAL_SWEEP_SECONDS`: how often expired principals are
+    /// removed.
+    pub credential_sweep_seconds: u64,
 }
 
 #[cfg(test)]

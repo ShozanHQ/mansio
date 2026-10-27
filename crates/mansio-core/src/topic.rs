@@ -95,6 +95,19 @@ impl Topic {
         Topic::Facts(Segment::known("alert"))
     }
 
+    /// `facts.principal`: where mansio records every credential it issues
+    /// and revokes.
+    #[must_use]
+    pub fn facts_principal() -> Self {
+        Topic::Facts(Segment::known("principal"))
+    }
+
+    /// `work.approvals`: the queue of items a person approves.
+    #[must_use]
+    pub fn work_approvals() -> Self {
+        Topic::Work(Segment::known("approvals"))
+    }
+
     /// Whether what is published here is durable, and so goes through the
     /// sink first. Everything is, except `presence`.
     #[must_use]
@@ -231,6 +244,20 @@ mod tests {
         assert_eq!(
             "facts.alert".parse::<Topic>().unwrap(),
             Topic::facts_alert()
+        );
+    }
+
+    #[test]
+    fn the_credential_topics_are_facts_principal_and_work_approvals() {
+        assert_eq!(Topic::facts_principal().to_string(), "facts.principal");
+        assert_eq!(Topic::work_approvals().to_string(), "work.approvals");
+        assert_eq!(
+            "facts.principal".parse::<Topic>().unwrap(),
+            Topic::facts_principal()
+        );
+        assert_eq!(
+            "work.approvals".parse::<Topic>().unwrap(),
+            Topic::work_approvals()
         );
     }
 

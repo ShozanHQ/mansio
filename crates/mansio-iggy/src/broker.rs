@@ -1,19 +1,40 @@
 //! `IggyBroker`: the `Broker` trait over the Iggy Rust SDK, TCP transport.
+//!
+//! The broker holds one client for the admin identity, which creates streams,
+//! topics and users, and one per credential in use, which Iggy holds to the
+//! permissions of the user the credential belongs to.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy::prelude::{
     AutoLogin, Client, Consumer, Credentials, Durability as IggyDurability, Identifier, IggyClient,
     IggyClientBuilder, IggyDuration, IggyError, IggyExpiry, IggyMessage, MaxTopicSize,
-    MessageClient, Partitioning, PollingStrategy, StreamClient, TopicClient, TopicCreateOptions,
+    MessageClient, Partitioning, PersonalAccessTokenClient, PollingStrategy, StreamClient,
+    TopicClient, TopicCreateOptions, UserClient, UserStatus,
 };
-use mansio_core::{Broker, BrokerError, Envelope, EventId, Stored, TenantId, Topic};
+use mansio_core::{
+    Broker, BrokerError, BrokerUser, Caller, Credential, Envelope, EventId, Grant, Minted, Stored,
+    SystemRecord, TenantId, Topic,
+};
+use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use tracing::{info, warn};
 
+use crate::access::{Users, permissions};
 use crate::config::{Durability, DurabilityPolicy, IggyConfig, Retention};
+use crate::sessions::{Session, Sessions};
+
+/// The Iggy stream that holds the server's own records. Its name is not a
+/// valid tenant id, so no tenant can be given it and no principal's
+/// permissions ever name it.
+pub const SYSTEM_STREAM: &str = "mansio.system";
+/// The topic of [`SYSTEM_STREAM`] that holds the registry of principals.
+pub const SYSTEM_TOPIC: &str = "principals";
+/// What the personal access token of every user mansio makes is called.
+const TOKEN_NAME: &str = "mansio";
 
 /// The one partition of every topic.
 const PARTITION: u32 = 0;
@@ -62,11 +83,38 @@ impl Ensured {
 /// A [`Broker`] backed by an Iggy server.
 #[derive(Debug)]
 pub struct IggyBroker {
-    client: IggyClient,
+    /// The admin identity.
+    client: Arc<IggyClient>,
+    address: String,
+    connect_timeout: Duration,
     retention: Retention,
     durability: DurabilityPolicy,
     locate_window: u32,
     ensured: Ensured,
+    /// The clients signed in with a principal's credential.
+    sessions: Sessions,
+    /// The scopes of every user made, to apply again when a topic is made.
+    users: Users,
+    /// Held while permissions are worked out and applied, so that a user made
+    /// while a topic is being made is not left without it.
+    permissions: AsyncMutex<()>,
+    /// Set once the stream of the server's own records exists.
+    system_ready: OnceCell<()>,
+}
+
+/// A client for the address, not yet connected and signed in as nobody.
+fn new_client(address: &str) -> Result<IggyClient, BrokerError> {
+    IggyClientBuilder::new()
+        .with_tcp()
+        .with_server_address(address.to_owned())
+        .build()
+        .map_err(map_iggy)
+}
+
+/// End a client that is no longer used. Whether Iggy hears about it does not
+/// matter.
+async fn end(client: &IggyClient) {
+    let _ = client.shutdown().await;
 }
 
 impl IggyBroker {
@@ -97,24 +145,127 @@ impl IggyBroker {
                 ))
             })?
             .map_err(map_iggy)?;
-        info!(address = %config.address, "connected to Iggy");
+        info!(address = %config.address, user = %config.username, "connected to Iggy");
         Ok(Self {
-            client,
+            client: Arc::new(client),
+            address: config.address,
+            connect_timeout: config.connect_timeout,
             retention: config.retention,
             durability: config.durability,
             locate_window: config.locate_window,
             ensured: Ensured::default(),
+            sessions: Sessions::default(),
+            users: Users::default(),
+            permissions: AsyncMutex::new(()),
+            system_ready: OnceCell::new(),
         })
     }
 
-    /// Close the connection.
+    /// Close the connections.
     ///
     /// # Errors
     ///
     /// Returns an error if Iggy cannot be told.
     pub async fn shutdown(&self) -> Result<(), BrokerError> {
+        for session in self.sessions.drain() {
+            end(&session.client).await;
+        }
         self.client.shutdown().await.map_err(map_iggy)
     }
+
+    // ---- sessions ---------------------------------------------------------
+
+    /// A client signed in with the credential. Iggy refusing the sign-in, for
+    /// whatever reason it gives, means the credential is not valid: unknown,
+    /// expired, or its user is gone.
+    async fn sign_in(&self, credential: &Credential) -> Result<Session, BrokerError> {
+        let timed_out = || {
+            BrokerError::Unavailable(format!(
+                "no answer from Iggy at {} within {:?}",
+                self.address, self.connect_timeout
+            ))
+        };
+        let client = new_client(&self.address)?;
+        match tokio::time::timeout(self.connect_timeout, client.connect()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                end(&client).await;
+                return Err(map_iggy(error));
+            }
+            Err(_) => {
+                end(&client).await;
+                return Err(timed_out());
+            }
+        }
+        let identity = tokio::time::timeout(
+            self.connect_timeout,
+            client.login_with_personal_access_token(credential.expose()),
+        )
+        .await;
+        match identity {
+            Ok(Ok(identity)) => Ok(Session {
+                client: Arc::new(client),
+                user: BrokerUser(identity.user_id),
+            }),
+            Ok(Err(error)) => {
+                end(&client).await;
+                Err(match map_iggy(error) {
+                    unavailable @ BrokerError::Unavailable(_) => unavailable,
+                    refused => BrokerError::Unauthenticated(refused.to_string()),
+                })
+            }
+            Err(_) => {
+                end(&client).await;
+                Err(timed_out())
+            }
+        }
+    }
+
+    /// The credential's session: the one kept, or a new one that is kept.
+    async fn session(&self, credential: &Credential) -> Result<Session, BrokerError> {
+        let key = credential.digest();
+        if let Some(session) = self.sessions.get(&key) {
+            return Ok(session);
+        }
+        let (kept, spare) = self.sessions.insert(key, self.sign_in(credential).await?);
+        if let Some(spare) = spare {
+            end(&spare.client).await;
+        }
+        Ok(kept)
+    }
+
+    /// The client a call is made on.
+    async fn client_for(&self, caller: &Caller<'_>) -> Result<Arc<IggyClient>, BrokerError> {
+        match caller {
+            Caller::Admin => Ok(Arc::clone(&self.client)),
+            Caller::Credential(credential) => Ok(self.session(credential).await?.client),
+        }
+    }
+
+    /// Turn what Iggy answered a caller into a result. A credential Iggy no
+    /// longer accepts loses its session, so that the next request signs in
+    /// again and is told so.
+    async fn settle<T>(
+        &self,
+        caller: &Caller<'_>,
+        result: Result<T, IggyError>,
+    ) -> Result<T, BrokerError> {
+        match (caller, result) {
+            (_, Ok(value)) => Ok(value),
+            (Caller::Admin, Err(error)) => Err(map_iggy(error)),
+            (Caller::Credential(credential), Err(error)) => {
+                let mapped = map_credential(error);
+                if matches!(mapped, BrokerError::Unauthenticated(_))
+                    && let Some(session) = self.sessions.remove(&credential.digest())
+                {
+                    end(&session.client).await;
+                }
+                Err(mapped)
+            }
+        }
+    }
+
+    // ---- messages ---------------------------------------------------------
 
     /// Find where a message landed by looking through the most recent ones.
     /// Iggy can accept a send without reporting an offset, and the message is
@@ -145,7 +296,12 @@ impl IggyBroker {
 
     /// Send the envelope. The message is stored once this returns `Ok`, with
     /// or without an offset.
-    async fn send(&self, envelope: &Envelope) -> Result<Option<u64>, BrokerError> {
+    async fn send(
+        &self,
+        caller: &Caller<'_>,
+        envelope: &Envelope,
+    ) -> Result<Option<u64>, BrokerError> {
+        let client = self.client_for(caller).await?;
         let stream = stream_id(&envelope.tenant)?;
         let topic = topic_id(&envelope.topic)?;
         let mut message = IggyMessage::builder()
@@ -153,22 +309,23 @@ impl IggyBroker {
             .payload(Bytes::from(envelope.to_json_vec()?))
             .build()
             .map_err(map_iggy)?;
-        let sent = self
-            .client
+        let sent = client
             .send_messages(
                 &stream,
                 &topic,
                 &Partitioning::partition_id(PARTITION),
                 std::slice::from_mut(&mut message),
             )
-            .await
-            .map_err(map_iggy)?;
+            .await;
+        let sent = self.settle(caller, sent).await?;
         if let Some(confirmation) = sent.confirmations.first() {
             return Ok(Some(confirmation.base_offset));
         }
         // Iggy accepted the message but did not say where. Failing now would
         // have the client send it again and store it twice, so a message that
-        // cannot be found is answered without an offset.
+        // cannot be found is answered without an offset. The search reads as
+        // the admin identity: the sender may be allowed to send and not to
+        // read.
         let located = match self.locate(&stream, &topic, envelope.id).await {
             Ok(located) => located,
             Err(error) => {
@@ -188,26 +345,38 @@ impl IggyBroker {
         Ok(located)
     }
 
+    /// Read from the topic. With `max` 0 nothing is returned, and Iggy is
+    /// still asked for the newest message, so that it decides whether the
+    /// topic exists and the caller may read it.
     async fn fetch(
         &self,
+        caller: &Caller<'_>,
         tenant: &TenantId,
         topic: &Topic,
         offset: u64,
         max: u32,
     ) -> Result<Vec<Stored>, BrokerError> {
-        let polled = self
-            .client
+        let client = self.client_for(caller).await?;
+        let (strategy, count) = if max == 0 {
+            (PollingStrategy::last(), 1)
+        } else {
+            (PollingStrategy::offset(offset), max)
+        };
+        let polled = client
             .poll_messages(
                 &stream_id(tenant)?,
                 &topic_id(topic)?,
                 Some(PARTITION),
                 &Consumer::default(),
-                &PollingStrategy::offset(offset),
-                max,
+                &strategy,
+                count,
                 false,
             )
-            .await
-            .map_err(map_iggy)?;
+            .await;
+        let polled = self.settle(caller, polled).await?;
+        if max == 0 {
+            return Ok(Vec::new());
+        }
         polled
             .messages
             .iter()
@@ -227,6 +396,153 @@ impl IggyBroker {
         }
         result
     }
+
+    // ---- streams and topics -----------------------------------------------
+
+    /// Create the stream unless it exists. Whether this call made it.
+    async fn make_stream(&self, name: &str) -> Result<bool, BrokerError> {
+        let id = Identifier::named(name).map_err(map_iggy)?;
+        match self.client.get_stream(&id).await {
+            Ok(Some(_)) => return Ok(false),
+            Ok(None) | Err(IggyError::StreamIdNotFound(_) | IggyError::StreamNameNotFound(_)) => {}
+            Err(error) => return Err(map_iggy(error)),
+        }
+        match self.client.create_stream(name).await {
+            Ok(_) => {
+                info!(stream = name, "created stream");
+                Ok(true)
+            }
+            // Another request created it first.
+            Err(IggyError::StreamNameAlreadyExists(_)) => Ok(false),
+            Err(error) => Err(map_iggy(error)),
+        }
+    }
+
+    /// Create the topic unless it exists. Whether this call made it.
+    async fn make_topic(
+        &self,
+        stream: &str,
+        name: &str,
+        options: &TopicCreateOptions,
+    ) -> Result<bool, BrokerError> {
+        let stream_id = Identifier::named(stream).map_err(map_iggy)?;
+        let id = Identifier::named(name).map_err(map_iggy)?;
+        match self.client.get_topic(&stream_id, &id).await {
+            Ok(Some(_)) => return Ok(false),
+            Ok(None) | Err(IggyError::TopicIdNotFound(..) | IggyError::TopicNameNotFound(..)) => {}
+            Err(error) => return Err(map_iggy(error)),
+        }
+        match self.client.create_topic(&stream_id, name, options).await {
+            Ok(_) => {
+                info!(stream, topic = name, "created topic");
+                Ok(true)
+            }
+            // Another request created it first.
+            Err(IggyError::TopicNameAlreadyExists(..)) => Ok(false),
+            Err(error) => Err(map_iggy(error)),
+        }
+    }
+
+    // ---- the server's own records -----------------------------------------
+
+    /// Make the stream and topic for the server's own records, once.
+    async fn ensure_system(&self) -> Result<(), BrokerError> {
+        self.system_ready
+            .get_or_try_init(|| async {
+                self.make_stream(SYSTEM_STREAM).await?;
+                self.make_topic(SYSTEM_STREAM, SYSTEM_TOPIC, &system_topic_options())
+                    .await?;
+                Ok::<(), BrokerError>(())
+            })
+            .await
+            .map(|_| ())
+    }
+
+    // ---- users ------------------------------------------------------------
+
+    /// The stream's number and its topics' numbers and names.
+    async fn stream_topics(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<(u32, Vec<(u32, Topic)>), BrokerError> {
+        let stream = stream_id(tenant)?;
+        let details = match self.client.get_stream(&stream).await {
+            Ok(Some(details)) => details,
+            Ok(None) | Err(IggyError::StreamIdNotFound(_) | IggyError::StreamNameNotFound(_)) => {
+                return Err(BrokerError::NotFound(format!("tenant {tenant}")));
+            }
+            Err(error) => return Err(map_iggy(error)),
+        };
+        let topics = self.client.get_topics(&stream).await.map_err(map_iggy)?;
+        let named = topics
+            .iter()
+            .filter_map(|topic| Some((topic.id, topic.name.parse().ok()?)))
+            .collect();
+        Ok((details.id, named))
+    }
+
+    /// Give the user the permissions its scopes work out to on the topics the
+    /// tenant has now. The caller holds the permissions lock.
+    async fn apply(
+        &self,
+        user: BrokerUser,
+        tenant: &TenantId,
+        grants: &[Grant],
+    ) -> Result<(), BrokerError> {
+        let (stream, topics) = self.stream_topics(tenant).await?;
+        let granted = permissions(stream, &topics, grants);
+        self.client
+            .update_permissions(&user_id(user)?, Some(granted))
+            .await
+            .map_err(map_iggy)
+    }
+
+    /// A topic of the tenant was found or made: open it to the users whose
+    /// scopes cover it.
+    async fn open_to_users(&self, tenant: &TenantId) -> Result<(), BrokerError> {
+        let _held = self.permissions.lock().await;
+        for (user, grants) in self.users.of_tenant(tenant) {
+            match self.apply(user, tenant, &grants).await {
+                Ok(()) => {}
+                Err(BrokerError::NotFound(why)) => {
+                    warn!(%tenant, %user, %why, "a user the broker was told about is gone");
+                    self.users.remove(user);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Sign in as the new user, make its token, and sign out.
+    async fn mint_token(
+        &self,
+        name: &str,
+        password: &Credential,
+        ttl: Option<Duration>,
+    ) -> Result<Credential, BrokerError> {
+        let client = new_client(&self.address)?;
+        let expiry = ttl.map_or(IggyExpiry::NeverExpire, |ttl| {
+            IggyExpiry::ExpireDuration(IggyDuration::from(ttl))
+        });
+        let minted = tokio::time::timeout(self.connect_timeout, async {
+            client.connect().await?;
+            client.login_user(name, password.expose()).await?;
+            client
+                .create_personal_access_token(TOKEN_NAME, expiry)
+                .await
+        })
+        .await;
+        end(&client).await;
+        match minted {
+            Ok(Ok(raw)) => Ok(Credential::new(raw.token)),
+            Ok(Err(error)) => Err(map_iggy(error)),
+            Err(_) => Err(BrokerError::Unavailable(format!(
+                "no answer from Iggy at {} within {:?}",
+                self.address, self.connect_timeout
+            ))),
+        }
+    }
 }
 
 /// Where the message with this id is, if it is among `messages`.
@@ -245,6 +561,25 @@ fn stream_id(tenant: &TenantId) -> Result<Identifier, BrokerError> {
 
 fn topic_id(topic: &Topic) -> Result<Identifier, BrokerError> {
     Identifier::named(&topic.to_string()).map_err(map_iggy)
+}
+
+/// A user by its number, which no other user can share.
+fn user_id(user: BrokerUser) -> Result<Identifier, BrokerError> {
+    Identifier::numeric(user.0).map_err(map_iggy)
+}
+
+/// How the topic of the server's own records is created: kept forever, no size
+/// cap, and written to stable storage before it is confirmed, because losing a
+/// record loses a principal.
+fn system_topic_options() -> TopicCreateOptions {
+    TopicCreateOptions {
+        partitions_count: Some(1),
+        message_expiry: Some(IggyExpiry::NeverExpire),
+        max_topic_size: Some(MaxTopicSize::Unlimited),
+        durability: IggyDurability::Persisted,
+        consumer_offset_durability: IggyDurability::Persisted,
+        ..TopicCreateOptions::default()
+    }
 }
 
 fn expiry(retention: &Retention, topic: &Topic) -> IggyExpiry {
@@ -321,6 +656,20 @@ fn map_iggy(error: IggyError) -> BrokerError {
     }
 }
 
+/// What Iggy said to a request made for a credential: not signed in, not
+/// allowed, or something else.
+fn map_credential(error: IggyError) -> BrokerError {
+    let text = error.to_string();
+    match error {
+        IggyError::Unauthorized => BrokerError::Forbidden(text),
+        IggyError::Unauthenticated
+        | IggyError::InvalidCredentials
+        | IggyError::InvalidPersonalAccessToken
+        | IggyError::PersonalAccessTokenExpired(..) => BrokerError::Unauthenticated(text),
+        other => map_iggy(other),
+    }
+}
+
 #[async_trait]
 impl Broker for IggyBroker {
     async fn tenants(&self) -> Result<Vec<TenantId>, BrokerError> {
@@ -347,81 +696,175 @@ impl Broker for IggyBroker {
         if self.ensured.has_stream(tenant) {
             return Ok(());
         }
-        let stream = stream_id(tenant)?;
-        match self.client.get_stream(&stream).await {
-            Ok(Some(_)) => {
-                self.ensured.add_stream(tenant);
-                return Ok(());
-            }
-            Ok(None) | Err(IggyError::StreamIdNotFound(_) | IggyError::StreamNameNotFound(_)) => {}
-            Err(error) => return Err(map_iggy(error)),
-        }
-        match self.client.create_stream(tenant.as_str()).await {
-            Ok(_) => {
-                info!(%tenant, "created stream");
-                self.ensured.add_stream(tenant);
-                Ok(())
-            }
-            // Another request created it first.
-            Err(IggyError::StreamNameAlreadyExists(_)) => {
-                self.ensured.add_stream(tenant);
-                Ok(())
-            }
-            Err(error) => Err(map_iggy(error)),
-        }
+        self.make_stream(tenant.as_str()).await?;
+        self.ensured.add_stream(tenant);
+        Ok(())
     }
 
     async fn ensure_topic(&self, tenant: &TenantId, topic: &Topic) -> Result<(), BrokerError> {
         if self.ensured.has_topic(tenant, topic) {
             return Ok(());
         }
-        let stream = stream_id(tenant)?;
-        let id = topic_id(topic)?;
-        match self.client.get_topic(&stream, &id).await {
-            Ok(Some(_)) => {
-                self.ensured.add_topic(tenant, topic);
-                return Ok(());
-            }
-            Ok(None) | Err(IggyError::TopicIdNotFound(..) | IggyError::TopicNameNotFound(..)) => {}
-            Err(error) => return Err(map_iggy(error)),
-        }
         let options = topic_options(&self.retention, &self.durability, topic);
-        match self
-            .client
-            .create_topic(&stream, &topic.to_string(), &options)
-            .await
-        {
-            Ok(_) => {
-                info!(%tenant, %topic, "created topic");
-                self.ensured.add_topic(tenant, topic);
-                Ok(())
-            }
-            // Another request created it first.
-            Err(IggyError::TopicNameAlreadyExists(..)) => {
-                self.ensured.add_topic(tenant, topic);
-                Ok(())
-            }
-            Err(error) => Err(map_iggy(error)),
-        }
+        self.make_topic(tenant.as_str(), &topic.to_string(), &options)
+            .await?;
+        // Whether the topic was made now or found, the users whose scopes
+        // cover it may not have it yet: it may have been made just before a
+        // restart, or by a request that did not get as far as this.
+        self.open_to_users(tenant).await?;
+        self.ensured.add_topic(tenant, topic);
+        Ok(())
     }
 
-    async fn publish(&self, envelope: &Envelope) -> Result<Option<u64>, BrokerError> {
-        let result = self.send(envelope).await;
+    async fn publish(
+        &self,
+        caller: &Caller<'_>,
+        envelope: &Envelope,
+    ) -> Result<Option<u64>, BrokerError> {
+        let result = self.send(caller, envelope).await;
         self.forget_if_missing(&envelope.tenant, result)
     }
 
     async fn poll(
         &self,
+        caller: &Caller<'_>,
         tenant: &TenantId,
         topic: &Topic,
         offset: u64,
         max: u32,
     ) -> Result<Vec<Stored>, BrokerError> {
+        let result = self.fetch(caller, tenant, topic, offset, max).await;
+        self.forget_if_missing(tenant, result)
+    }
+
+    async fn system_append(&self, record: &[u8]) -> Result<(), BrokerError> {
+        self.ensure_system().await?;
+        let mut message = IggyMessage::builder()
+            .payload(Bytes::copy_from_slice(record))
+            .build()
+            .map_err(map_iggy)?;
+        self.client
+            .send_messages(
+                &Identifier::named(SYSTEM_STREAM).map_err(map_iggy)?,
+                &Identifier::named(SYSTEM_TOPIC).map_err(map_iggy)?,
+                &Partitioning::partition_id(PARTITION),
+                std::slice::from_mut(&mut message),
+            )
+            .await
+            .map_err(map_iggy)?;
+        Ok(())
+    }
+
+    async fn system_read(&self, offset: u64, max: u32) -> Result<Vec<SystemRecord>, BrokerError> {
         if max == 0 {
             return Ok(Vec::new());
         }
-        let result = self.fetch(tenant, topic, offset, max).await;
-        self.forget_if_missing(tenant, result)
+        self.ensure_system().await?;
+        let polled = self
+            .client
+            .poll_messages(
+                &Identifier::named(SYSTEM_STREAM).map_err(map_iggy)?,
+                &Identifier::named(SYSTEM_TOPIC).map_err(map_iggy)?,
+                Some(PARTITION),
+                &Consumer::default(),
+                &PollingStrategy::offset(offset),
+                max,
+                false,
+            )
+            .await
+            .map_err(map_iggy)?;
+        Ok(polled
+            .messages
+            .iter()
+            .map(|message| SystemRecord {
+                offset: message.header.offset,
+                payload: message.payload.to_vec(),
+            })
+            .collect())
+    }
+
+    async fn create_user(
+        &self,
+        tenant: &TenantId,
+        name: &str,
+        grants: &[Grant],
+        ttl: Option<Duration>,
+    ) -> Result<Minted, BrokerError> {
+        let _held = self.permissions.lock().await;
+        let (stream, topics) = self.stream_topics(tenant).await?;
+        // Nobody is told this password: it is used once, to sign in as the
+        // user and make its token, and then dropped.
+        let password = Credential::random();
+        let made = self
+            .client
+            .create_user(
+                name,
+                password.expose(),
+                UserStatus::Active,
+                Some(permissions(stream, &topics, grants)),
+            )
+            .await
+            .map_err(map_iggy)?;
+        let user = BrokerUser(made.id);
+        self.users.set(user, tenant, grants);
+        match self.mint_token(name, &password, ttl).await {
+            Ok(credential) => Ok(Minted { user, credential }),
+            Err(error) => {
+                self.users.remove(user);
+                if let Err(cleanup) = self.client.delete_user(&user_id(user)?).await {
+                    warn!(%user, error = %cleanup, "a user without a token could not be deleted");
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn set_grants(
+        &self,
+        user: BrokerUser,
+        tenant: &TenantId,
+        grants: &[Grant],
+    ) -> Result<(), BrokerError> {
+        let _held = self.permissions.lock().await;
+        self.apply(user, tenant, grants).await?;
+        self.users.set(user, tenant, grants);
+        Ok(())
+    }
+
+    async fn delete_user(&self, user: BrokerUser) -> Result<(), BrokerError> {
+        match self.client.delete_user(&user_id(user)?).await {
+            Ok(()) | Err(IggyError::ResourceNotFound(_)) => {}
+            Err(error) => return Err(map_iggy(error)),
+        }
+        self.users.remove(user);
+        for session in self.sessions.remove_user(user) {
+            end(&session.client).await;
+        }
+        Ok(())
+    }
+
+    async fn identify(&self, credential: &Credential) -> Result<BrokerUser, BrokerError> {
+        let Some(open) = self.sessions.get(&credential.digest()) else {
+            return Ok(self.session(credential).await?.user);
+        };
+        // The session is in use and must not be signed in again under the
+        // requests on it, so Iggy is asked on a client of its own.
+        match self.sign_in(credential).await {
+            Ok(checked) => {
+                end(&checked.client).await;
+                Ok(checked.user)
+            }
+            Err(error @ BrokerError::Unauthenticated(_)) => {
+                if let Some(gone) = self.sessions.remove(&credential.digest()) {
+                    end(&gone.client).await;
+                }
+                Err(error)
+            }
+            Err(error) => {
+                warn!(user = %open.user, %error, "a credential could not be checked");
+                Err(error)
+            }
+        }
     }
 }
 
@@ -521,6 +964,61 @@ mod tests {
             map_iggy(IggyError::InvalidCredentials),
             BrokerError::Rejected(_)
         ));
+    }
+
+    #[test]
+    fn what_iggy_says_to_a_credential_is_sorted_into_refusals() {
+        // Signed in, and not allowed.
+        assert!(matches!(
+            map_credential(IggyError::Unauthorized),
+            BrokerError::Forbidden(_)
+        ));
+        // Not signed in, or a token Iggy does not accept.
+        for error in [
+            IggyError::Unauthenticated,
+            IggyError::InvalidCredentials,
+            IggyError::InvalidPersonalAccessToken,
+            IggyError::PersonalAccessTokenExpired("mansio".to_owned(), 7),
+        ] {
+            assert!(
+                matches!(map_credential(error), BrokerError::Unauthenticated(_)),
+                "refused as unauthenticated"
+            );
+        }
+        // The rest is as for the admin.
+        assert!(matches!(
+            map_credential(IggyError::Disconnected),
+            BrokerError::Unavailable(_)
+        ));
+        assert!(matches!(
+            map_credential(IggyError::TopicNameNotFound("t".into(), "s".into())),
+            BrokerError::NotFound(_)
+        ));
+        // For the admin, the same Unauthorized is the server's own fault.
+        assert!(matches!(
+            map_iggy(IggyError::Unauthorized),
+            BrokerError::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn the_topic_of_the_servers_own_records_is_kept_forever_and_written_to_disk() {
+        let options = system_topic_options();
+        assert_eq!(options.partitions_count, Some(1));
+        assert_eq!(options.message_expiry, Some(IggyExpiry::NeverExpire));
+        assert_eq!(options.max_topic_size, Some(MaxTopicSize::Unlimited));
+        assert_eq!(options.durability, IggyDurability::Persisted);
+        assert_eq!(
+            options.consumer_offset_durability,
+            IggyDurability::Persisted
+        );
+    }
+
+    #[test]
+    fn the_stream_of_the_servers_own_records_cannot_be_a_tenant() {
+        assert!(SYSTEM_STREAM.parse::<TenantId>().is_err());
+        assert!(SYSTEM_TOPIC.parse::<Topic>().is_err());
+        assert!(user_id(BrokerUser(7)).is_ok());
     }
 
     #[test]

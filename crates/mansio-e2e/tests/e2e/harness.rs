@@ -10,6 +10,11 @@
 //!
 //! Every test uses a tenant of its own, so tests do not see each other's
 //! messages on a shared server.
+//!
+//! The tests of credentials also talk to the broker without going through the
+//! server. In process that is the `MemoryBroker`. Against a live server it is
+//! Iggy, at `MANSIO_E2E_IGGY_ADDRESS`, which is then required: without it
+//! those tests fail.
 
 use std::future::Future;
 use std::io;
@@ -18,9 +23,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail, ensure};
+use iggy::prelude::{
+    Client, IggyClientBuilder, IggyError, IggyMessage, MessageClient, Partitioning,
+    PersonalAccessTokenClient,
+};
 use mansio_core::api::{Claimed, EffectiveSettings, Polled, Published};
-use mansio_core::{Envelope, EventId, MemoryBroker, Timestamp};
-use mansio_server::{Auth, FileSink, Server, WorkSettings};
+use mansio_core::{
+    Broker, BrokerError, Caller, Credential, Envelope, EventId, MemoryBroker, Timestamp,
+};
+use mansio_server::{Auth, CredentialSettings, FileSink, Server, WorkSettings};
 use reqwest::{Method, StatusCode};
 use secrecy::SecretString;
 use serde_json::{Value, json};
@@ -49,6 +60,16 @@ fn local_work_settings() -> WorkSettings {
     }
 }
 
+/// The credential settings of the in-process server: seconds-scale, so that
+/// an expiry, a recheck and a sweep take seconds.
+fn local_credential_settings() -> CredentialSettings {
+    CredentialSettings {
+        agent_ttl: Duration::from_secs(3),
+        recheck: Duration::from_secs(1),
+        sweep: Duration::from_secs(1),
+    }
+}
+
 /// A server running in this process. It stops when dropped.
 struct LocalServer {
     base: String,
@@ -65,7 +86,8 @@ impl LocalServer {
         );
         let server = Server::new(broker.clone(), auth)
             .with_sink(Arc::new(FileSink::open(sink).await?))
-            .with_work_settings(local_work_settings());
+            .with_work_settings(local_work_settings())
+            .with_credential_settings(local_credential_settings());
         let task = tokio::spawn(server.serve(listener, std::future::pending()));
         Ok(Self { base, task })
     }
@@ -236,13 +258,23 @@ impl Target {
         Ok(serde_json::from_value(response)?)
     }
 
-    /// Everything in a topic, in order.
+    /// Everything in a topic, in order. A topic nobody has published to is
+    /// not found by the server, and holds nothing.
     pub async fn read(&self, topic: &str) -> anyhow::Result<Vec<Envelope>> {
         let mut all = Vec::new();
         let mut offset = 0;
         loop {
             let query = format!("offset={offset}&count={}", self.settings.poll_max_count);
-            let page = self.poll(topic, &query).await?;
+            let uri = format!("{}?{query}", self.messages_uri(topic));
+            let (status, response) = self.authed(Method::GET, &uri, None).await?;
+            if status == StatusCode::NOT_FOUND {
+                return Ok(all);
+            }
+            ensure!(
+                status == StatusCode::OK,
+                "poll answered {status}: {response}"
+            );
+            let page: Polled = serde_json::from_value(response)?;
             let Some(last) = page.messages.last() else {
                 return Ok(all);
             };
@@ -432,6 +464,391 @@ impl Target {
     /// show that something does not happen.
     pub fn settle(&self) -> Duration {
         Duration::from_millis(self.settings.tick_millis.saturating_mul(3) + 300)
+    }
+
+    // ---- credentials ------------------------------------------------------
+
+    /// `principals_create`, answering whatever the server says.
+    pub async fn create_principal(&self, body: &Value) -> anyhow::Result<(StatusCode, Value)> {
+        let uri = format!("{}/v1/principals", self.base);
+        self.authed(Method::POST, &uri, Some(body)).await
+    }
+
+    /// Issue a credential, which must be accepted. An agent's lasts ten
+    /// minutes unless `ttl_seconds` says otherwise, so that a test that is not
+    /// about expiry never meets one; other kinds do not expire unless asked.
+    pub async fn issue(
+        &self,
+        kind: &str,
+        name: &str,
+        scopes: &Value,
+        ttl_seconds: Option<u64>,
+    ) -> anyhow::Result<Issued> {
+        let ttl = ttl_seconds.or((kind == "agent").then_some(600));
+        self.issue_with(kind, name, scopes, ttl).await
+    }
+
+    /// Issue a credential with exactly the `ttl_seconds` given, or none, which
+    /// leaves the expiry to the server's settings.
+    pub async fn issue_with(
+        &self,
+        kind: &str,
+        name: &str,
+        scopes: &Value,
+        ttl_seconds: Option<u64>,
+    ) -> anyhow::Result<Issued> {
+        let mut body = json!({
+            "kind": kind,
+            "name": name,
+            "tenant": self.tenant,
+            "scopes": scopes,
+        });
+        if let Some(ttl) = ttl_seconds {
+            body["ttl_seconds"] = json!(ttl);
+        }
+        let (status, response) = self.create_principal(&body).await?;
+        ensure!(
+            status == StatusCode::CREATED,
+            "principals_create answered {status}: {response}"
+        );
+        let token = response["credential"]
+            .as_str()
+            .context("the answer carries the credential")?
+            .to_owned();
+        Ok(Issued {
+            id: response["principal"]["id"]
+                .as_str()
+                .context("the answer carries the principal id")?
+                .to_owned(),
+            principal: response["principal"].clone(),
+            token,
+            http: self.http.clone(),
+            base: self.base.clone(),
+            tenant: self.tenant.clone(),
+        })
+    }
+
+    /// `principals_revoke`, answering whatever the server says.
+    pub async fn revoke(&self, id: &str) -> anyhow::Result<(StatusCode, Value)> {
+        let uri = format!("{}/v1/principals/{id}", self.base);
+        self.authed(Method::DELETE, &uri, None).await
+    }
+
+    /// `principals_list` for this tenant.
+    pub async fn principals(&self) -> anyhow::Result<Vec<Value>> {
+        let uri = format!("{}/v1/principals?tenant={}", self.base, self.tenant);
+        let (status, response) = self.authed(Method::GET, &uri, None).await?;
+        ensure!(
+            status == StatusCode::OK,
+            "principals_list answered {status}: {response}"
+        );
+        Ok(response["principals"].as_array().context("a list")?.clone())
+    }
+
+    /// Make sure a topic of a tenant exists, by publishing to it as the admin.
+    pub async fn seed(&self, tenant: &str, topic: &str) -> anyhow::Result<()> {
+        let uri = format!("{}/v1/tenants/{tenant}/topics/{topic}/messages", self.base);
+        let body = json!({"source": "e2e", "type": "e2e.seed"});
+        let (status, response) = self.authed(Method::POST, &uri, Some(&body)).await?;
+        ensure!(
+            status == StatusCode::CREATED,
+            "seeding {topic} answered {status}: {response}"
+        );
+        Ok(())
+    }
+
+    /// Seed a work queue of this tenant with an item.
+    pub async fn seed_queue(&self, queue: &str) -> anyhow::Result<()> {
+        self.work_publish(queue, &job(0)).await.map(|_| ())
+    }
+
+    // ---- the broker, not through the server ---------------------------------
+
+    /// Whether the broker lets the credential send a message to the topic of
+    /// the tenant, asked of the broker itself and not of mansio-server. In
+    /// process that is the memory broker; against a live server it is Iggy at
+    /// `MANSIO_E2E_IGGY_ADDRESS`, which must be set.
+    pub async fn broker_send(
+        &self,
+        token: &str,
+        tenant: &str,
+        topic: &str,
+    ) -> anyhow::Result<Outcome> {
+        let envelope = Envelope::new(
+            EventId::generate(),
+            "e2e".parse()?,
+            "e2e.direct".parse()?,
+            tenant.parse()?,
+            topic.parse()?,
+            "agent:direct".parse()?,
+        );
+        if let Some((broker, _)) = &self.local {
+            let credential = Credential::new(token);
+            return Ok(
+                match broker
+                    .publish(&Caller::Credential(&credential), &envelope)
+                    .await
+                {
+                    Ok(_) => Outcome::Accepted,
+                    Err(error) => outcome_of(&error),
+                },
+            );
+        }
+        let client = iggy_client(&iggy_address()?).await?;
+        let outcome = match client.login_with_personal_access_token(token).await {
+            Err(_) => Outcome::Unauthenticated,
+            Ok(_) => {
+                let mut message = IggyMessage::builder()
+                    .id(envelope.id.as_u128())
+                    .payload(envelope.to_json_vec()?.into())
+                    .build()?;
+                match client
+                    .send_messages(
+                        &iggy::prelude::Identifier::named(tenant)?,
+                        &iggy::prelude::Identifier::named(topic)?,
+                        &Partitioning::partition_id(0),
+                        std::slice::from_mut(&mut message),
+                    )
+                    .await
+                {
+                    Ok(_) => Outcome::Accepted,
+                    Err(error) => iggy_outcome(error),
+                }
+            }
+        };
+        let _ = client.shutdown().await;
+        Ok(outcome)
+    }
+
+    /// Whether the broker still signs in as the credential, asked of the
+    /// broker itself: [`Outcome::Accepted`] if it does.
+    pub async fn broker_login(&self, token: &str) -> anyhow::Result<Outcome> {
+        if let Some((broker, _)) = &self.local {
+            return Ok(match broker.identify(&Credential::new(token)).await {
+                Ok(_) => Outcome::Accepted,
+                Err(error) => outcome_of(&error),
+            });
+        }
+        let client = iggy_client(&iggy_address()?).await?;
+        let outcome = match client.login_with_personal_access_token(token).await {
+            Ok(_) => Outcome::Accepted,
+            Err(_) => Outcome::Unauthenticated,
+        };
+        let _ = client.shutdown().await;
+        Ok(outcome)
+    }
+
+    /// Whether the broker lets the credential read the server's own records,
+    /// where the registry of principals is kept. Only Iggy can be asked: in
+    /// process the records have no reader but the server, and `None` comes
+    /// back.
+    pub async fn broker_read_registry(&self, token: &str) -> anyhow::Result<Option<Outcome>> {
+        if self.local.is_some() {
+            return Ok(None);
+        }
+        let client = iggy_client(&iggy_address()?).await?;
+        let outcome = match client.login_with_personal_access_token(token).await {
+            Err(_) => Outcome::Unauthenticated,
+            Ok(_) => {
+                match client
+                    .poll_messages(
+                        &iggy::prelude::Identifier::named(mansio_iggy::SYSTEM_STREAM)?,
+                        &iggy::prelude::Identifier::named(mansio_iggy::SYSTEM_TOPIC)?,
+                        Some(0),
+                        &iggy::prelude::Consumer::default(),
+                        &iggy::prelude::PollingStrategy::offset(0),
+                        10,
+                        false,
+                    )
+                    .await
+                {
+                    Ok(_) => Outcome::Accepted,
+                    Err(error) => iggy_outcome(error),
+                }
+            }
+        };
+        let _ = client.shutdown().await;
+        Ok(Some(outcome))
+    }
+}
+
+/// What a broker said to a credential. A credential that cannot sign in is
+/// not authenticated, whatever the reason Iggy gives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// It did what was asked.
+    Accepted,
+    /// The credential is valid and the broker's permissions refuse it.
+    Forbidden,
+    /// The credential is not valid: unknown, expired or revoked.
+    Unauthenticated,
+    /// Anything else, which a test treats as a failure to be explained.
+    Other(String),
+}
+
+fn outcome_of(error: &BrokerError) -> Outcome {
+    match error {
+        BrokerError::Forbidden(_) => Outcome::Forbidden,
+        BrokerError::Unauthenticated(_) => Outcome::Unauthenticated,
+        other => Outcome::Other(other.to_string()),
+    }
+}
+
+fn iggy_outcome(error: IggyError) -> Outcome {
+    match error {
+        IggyError::Unauthorized => Outcome::Forbidden,
+        IggyError::Unauthenticated
+        | IggyError::InvalidCredentials
+        | IggyError::InvalidPersonalAccessToken
+        | IggyError::PersonalAccessTokenExpired(..) => Outcome::Unauthenticated,
+        other => Outcome::Other(other.to_string()),
+    }
+}
+
+/// Iggy's address for the tests that talk to it. Without it those tests
+/// fail: a run against a live server that cannot reach Iggy has not shown that
+/// Iggy refuses anything.
+fn iggy_address() -> anyhow::Result<String> {
+    std::env::var("MANSIO_E2E_IGGY_ADDRESS")
+        .ok()
+        .filter(|address| !address.is_empty())
+        .context(
+            "MANSIO_E2E_IGGY_ADDRESS must be set when MANSIO_E2E_URL is: these tests ask Iggy itself",
+        )
+}
+
+/// A client connected to Iggy and signed in as nobody.
+async fn iggy_client(address: &str) -> anyhow::Result<iggy::prelude::IggyClient> {
+    let client = IggyClientBuilder::new()
+        .with_tcp()
+        .with_server_address(address.to_owned())
+        .build()?;
+    tokio::time::timeout(SLACK, client.connect())
+        .await
+        .context("Iggy did not answer in time")??;
+    Ok(client)
+}
+
+/// A credential that was issued, and the means to use it.
+pub struct Issued {
+    pub id: String,
+    pub principal: Value,
+    pub token: String,
+    http: reqwest::Client,
+    base: String,
+    tenant: String,
+}
+
+impl Issued {
+    async fn call(
+        &self,
+        method: Method,
+        uri: &str,
+        body: Option<&Value>,
+    ) -> anyhow::Result<(StatusCode, Value)> {
+        let mut request = self.http.request(method, uri).bearer_auth(&self.token);
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let bytes = response.bytes().await?;
+        Ok((
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        ))
+    }
+
+    fn tenant_uri(&self, tenant: &str, rest: &str) -> String {
+        format!("{}/v1/tenants/{tenant}/{rest}", self.base)
+    }
+
+    /// The generic publish route.
+    pub async fn publish(&self, topic: &str) -> anyhow::Result<(StatusCode, Value)> {
+        self.publish_to(&self.tenant, topic).await
+    }
+
+    /// The generic publish route, in a tenant of the caller's choosing.
+    pub async fn publish_to(
+        &self,
+        tenant: &str,
+        topic: &str,
+    ) -> anyhow::Result<(StatusCode, Value)> {
+        let uri = self.tenant_uri(tenant, &format!("topics/{topic}/messages"));
+        let body = json!({"source": "e2e", "type": "e2e.credential"});
+        self.call(Method::POST, &uri, Some(&body)).await
+    }
+
+    /// The generic poll route.
+    pub async fn poll(&self, topic: &str) -> anyhow::Result<(StatusCode, Value)> {
+        let uri = self.tenant_uri(&self.tenant, &format!("topics/{topic}/messages?offset=0"));
+        self.call(Method::GET, &uri, None).await
+    }
+
+    /// `work_publish`.
+    pub async fn work_publish(&self, queue: &str) -> anyhow::Result<(StatusCode, Value)> {
+        let uri = self.tenant_uri(&self.tenant, &format!("work/{queue}/items"));
+        self.call(Method::POST, &uri, Some(&job(1))).await
+    }
+
+    /// `work_pull`.
+    pub async fn pull(&self, queue: &str) -> anyhow::Result<(StatusCode, Value)> {
+        let uri = self.tenant_uri(&self.tenant, &format!("work/{queue}/pull"));
+        self.call(Method::POST, &uri, Some(&json!({"consumer": "worker"})))
+            .await
+    }
+
+    /// `work_ack` of a claim that `pull` answered with.
+    pub async fn ack(&self, queue: &str, claim: &Value) -> anyhow::Result<(StatusCode, Value)> {
+        let item = claim["item"]["itemid"]
+            .as_str()
+            .context("a claim names its item")?;
+        let uri = self.tenant_uri(&self.tenant, &format!("work/{queue}/items/{item}/ack"));
+        let body = json!({"lease_id": claim["lease_id"]});
+        self.call(Method::POST, &uri, Some(&body)).await
+    }
+
+    /// `alerts_ack`.
+    pub async fn alert_ack(&self, alert: &str) -> anyhow::Result<(StatusCode, Value)> {
+        let uri = self.tenant_uri(&self.tenant, &format!("alerts/{alert}/ack"));
+        self.call(Method::POST, &uri, None).await
+    }
+
+    /// `alerts_publish`.
+    pub async fn alert_publish(&self) -> anyhow::Result<(StatusCode, Value)> {
+        let uri = self.tenant_uri(&self.tenant, "alerts");
+        let body = json!({"source": "e2e", "type": "disk.full"});
+        self.call(Method::POST, &uri, Some(&body)).await
+    }
+
+    /// The admin API with this credential: `principals_list`.
+    pub async fn list_principals(&self) -> anyhow::Result<(StatusCode, Value)> {
+        let uri = format!("{}/v1/principals", self.base);
+        self.call(Method::GET, &uri, None).await
+    }
+
+    /// The admin API with this credential: `principals_create`.
+    pub async fn create_principal(&self) -> anyhow::Result<(StatusCode, Value)> {
+        let uri = format!("{}/v1/principals", self.base);
+        let body = json!({
+            "kind": "agent",
+            "name": "sneaky",
+            "tenant": self.tenant,
+            "scopes": [{"topic": "facts.*", "verbs": ["publish", "subscribe"]}]
+        });
+        self.call(Method::POST, &uri, Some(&body)).await
+    }
+
+    /// The admin API with this credential: `principals_revoke`.
+    pub async fn revoke_principal(&self, id: &str) -> anyhow::Result<(StatusCode, Value)> {
+        let uri = format!("{}/v1/principals/{id}", self.base);
+        self.call(Method::DELETE, &uri, None).await
+    }
+
+    /// `GET /v1/settings`.
+    pub async fn settings(&self) -> anyhow::Result<(StatusCode, Value)> {
+        let uri = format!("{}/v1/settings", self.base);
+        self.call(Method::GET, &uri, None).await
     }
 }
 

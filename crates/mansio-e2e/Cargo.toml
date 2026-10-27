@@ -10,7 +10,9 @@ publish = false
 
 [dev-dependencies]
 anyhow.workspace = true
+iggy.workspace = true
 mansio-core.workspace = true
+mansio-iggy.workspace = true
 mansio-server.workspace = true
 reqwest.workspace = true
 secrecy.workspace = true
