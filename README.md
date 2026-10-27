@@ -266,9 +266,12 @@ storage, so a 201 survives a crash of the host. With `replicated`, Iggy
 answers after its quorum commit without that barrier; on one node that is a
 write to the operating system, and a crash of the host can lose the messages
 acknowledged since the last flush, after the sink has already recorded them.
-`persisted` costs write latency, and Iggy's server setting
-`wal_group_commit_delay_micros` tunes that cost. mansio sets both Iggy's
-`durability` and `consumer_offset_durability` on the topics it creates.
+`persisted` costs write latency. Iggy's flush thresholds,
+`messages_required_to_save` and `size_of_messages_required_to_save`, set how
+much its journal holds before a flush, and they do not weaken `persisted`.
+See [Iggy's durability documentation](https://iggy.apache.org/docs). mansio
+sets both Iggy's `durability` and `consumer_offset_durability` on the topics
+it creates, and leaves the flush thresholds at Iggy's defaults.
 
 ### mansio (CLI)
 
