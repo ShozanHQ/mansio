@@ -66,14 +66,42 @@ impl Item {
     }
 }
 
+/// The ids of items that are done. An item is named by the id of its first
+/// message, which is a UUID, so an id is kept as the 16 bytes of one; an id
+/// that is not a UUID (it can only have come from outside) is kept as text.
+#[derive(Debug, Default)]
+struct Finished {
+    uuids: HashSet<u128>,
+    other: HashSet<ItemId>,
+}
+
+impl Finished {
+    fn uuid(id: &ItemId) -> Option<u128> {
+        id.as_str().parse::<EventId>().ok().map(|id| id.as_u128())
+    }
+
+    fn insert(&mut self, id: &ItemId) {
+        match Self::uuid(id) {
+            Some(uuid) => self.uuids.insert(uuid),
+            None => self.other.insert(id.clone()),
+        };
+    }
+
+    fn contains(&self, id: &ItemId) -> bool {
+        match Self::uuid(id) {
+            Some(uuid) => self.uuids.contains(&uuid),
+            None => self.other.contains(id),
+        }
+    }
+}
+
 /// The items of one queue. Open items are kept whole; an item that is done
 /// (acknowledged, or dead) leaves only its id, so that the id is not used
 /// again.
 #[derive(Debug, Default)]
 pub(crate) struct Queue {
     items: HashMap<ItemId, Item>,
-    /// The ids of items that are done.
-    finished: HashSet<ItemId>,
+    finished: Finished,
     /// `(order, id)` of every item in [`Phase::Ready`], so that the oldest
     /// is the first.
     ready: BTreeSet<(u64, ItemId)>,
@@ -136,7 +164,7 @@ impl Queue {
     /// The item is done: drop it and remember its id.
     pub(crate) fn finish(&mut self, id: &ItemId) {
         self.remove(id);
-        self.finished.insert(id.clone());
+        self.finished.insert(id);
     }
 
     pub(crate) fn set_phase(&mut self, id: &ItemId, phase: Phase) {
@@ -319,6 +347,25 @@ mod tests {
         // Finishing what is not there still reserves the id.
         queue.finish(&b);
         assert!(queue.knows(&b));
+    }
+
+    #[test]
+    fn the_ids_of_finished_items_are_kept_as_sixteen_bytes() {
+        let mut queue = Queue::default();
+        let uuid = EventId::generate();
+        let id: ItemId = uuid.to_string().parse().unwrap();
+        queue.finish(&id);
+        assert!(queue.knows(&id));
+        assert!(queue.finished.uuids.contains(&uuid.as_u128()));
+        assert!(queue.finished.other.is_empty());
+        assert!(!queue.knows(&EventId::generate().to_string().parse().unwrap()));
+
+        // An id from outside that is not a UUID is still remembered.
+        let odd: ItemId = "build-7".parse().unwrap();
+        assert!(!queue.knows(&odd));
+        queue.finish(&odd);
+        assert!(queue.knows(&odd));
+        assert_eq!(queue.finished.other.len(), 1);
     }
 
     #[test]

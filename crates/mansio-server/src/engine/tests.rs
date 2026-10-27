@@ -46,13 +46,22 @@ fn consumer(name: &str) -> ConsumerName {
 struct FlakyBroker {
     inner: MemoryBroker,
     failing: StdMutex<HashSet<String>>,
+    refused: StdMutex<HashSet<String>>,
     lost: StdMutex<HashSet<String>>,
     corrupt: StdMutex<Option<(Topic, u64)>>,
 }
 
 impl FlakyBroker {
-    fn fail(&self, topic: &str) {
-        self.failing.lock().unwrap().insert(topic.to_owned());
+    /// Publishes to the topic, or of the event type, fail as if the broker
+    /// could not be reached: whether the message was stored is not known.
+    fn fail(&self, what: &str) {
+        self.failing.lock().unwrap().insert(what.to_owned());
+    }
+
+    /// Publishes to the topic, or of the event type, are refused outright:
+    /// the message was not stored.
+    fn refuse(&self, what: &str) {
+        self.refused.lock().unwrap().insert(what.to_owned());
     }
 
     /// The next publish to the topic, or of the event type, is stored and then
@@ -69,6 +78,7 @@ impl FlakyBroker {
 
     fn heal(&self) {
         self.failing.lock().unwrap().clear();
+        self.refused.lock().unwrap().clear();
         self.lost.lock().unwrap().clear();
         *self.corrupt.lock().unwrap() = None;
     }
@@ -100,6 +110,14 @@ impl Broker for FlakyBroker {
         };
         if refused {
             return Err(BrokerError::Unavailable("injected".to_owned()));
+        }
+        let rejected = {
+            let refused = self.refused.lock().unwrap();
+            refused.contains(&envelope.topic.to_string())
+                || refused.contains(envelope.event_type.as_str())
+        };
+        if rejected {
+            return Err(BrokerError::Rejected("refused".to_owned()));
         }
         let stored = self.inner.publish(envelope).await;
         let lost = {
@@ -1206,7 +1224,7 @@ async fn one_item_whose_retry_keeps_failing_does_not_stall_the_rest_of_the_tenan
     )
     .await
     .unwrap();
-    rig.broker.fail("poison.job");
+    rig.broker.refuse("poison.job");
     rig.fail("two", &healthy, &ok.lease_id).await.unwrap();
 
     for _ in 0..20 {
@@ -1329,4 +1347,252 @@ async fn a_dead_fact_rebuilt_after_a_restart_is_the_one_the_crashed_server_wrote
     let dead = facts.last().unwrap();
     assert_eq!(dead.event_type.as_str(), "mansio.work.dead");
     assert_eq!(dead.id, recorded);
+}
+
+// ---- what a failure costs ------------------------------------------------------
+
+/// Counts the rebuilds of a tenant's state (one `topics` call each) and the
+/// polls, and otherwise leaves everything to the broker under it.
+#[derive(Debug)]
+struct Counting {
+    inner: Arc<FlakyBroker>,
+    rebuilds: AtomicU64,
+    polls: AtomicU64,
+}
+
+impl Counting {
+    fn new(inner: Arc<FlakyBroker>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            rebuilds: AtomicU64::new(0),
+            polls: AtomicU64::new(0),
+        })
+    }
+
+    fn rebuilds(&self) -> u64 {
+        self.rebuilds.load(Ordering::SeqCst)
+    }
+
+    fn polls(&self) -> u64 {
+        self.polls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl Broker for Counting {
+    async fn tenants(&self) -> Result<Vec<TenantId>, BrokerError> {
+        self.inner.tenants().await
+    }
+
+    async fn topics(&self, tenant: &TenantId) -> Result<Vec<Topic>, BrokerError> {
+        self.rebuilds.fetch_add(1, Ordering::SeqCst);
+        self.inner.topics(tenant).await
+    }
+
+    async fn ensure_tenant(&self, tenant: &TenantId) -> Result<(), BrokerError> {
+        self.inner.ensure_tenant(tenant).await
+    }
+
+    async fn ensure_topic(&self, tenant: &TenantId, topic: &Topic) -> Result<(), BrokerError> {
+        self.inner.ensure_topic(tenant, topic).await
+    }
+
+    async fn publish(&self, envelope: &Envelope) -> Result<Option<u64>, BrokerError> {
+        self.inner.publish(envelope).await
+    }
+
+    async fn poll(
+        &self,
+        tenant: &TenantId,
+        topic: &Topic,
+        offset: u64,
+        max: u32,
+    ) -> Result<Vec<Stored>, BrokerError> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        self.inner.poll(tenant, topic, offset, max).await
+    }
+}
+
+/// An engine over a counting broker and a clock moved by hand.
+fn counted_engine(page: u32) -> (Engine, Arc<FlakyBroker>, Arc<Counting>, Arc<ManualClock>) {
+    let flaky: Arc<FlakyBroker> = Arc::default();
+    let counting = Counting::new(Arc::clone(&flaky));
+    let clock = Arc::new(ManualClock::new(START));
+    let engine = Engine::new(
+        counting.clone(),
+        Arc::new(LogSink::default()),
+        clock.clone(),
+        settings(),
+        page,
+    );
+    (engine, flaky, counting, clock)
+}
+
+#[tokio::test]
+async fn a_broker_that_cannot_be_reached_costs_at_most_one_rebuild_per_tick() {
+    let (engine, flaky, counting, clock) = counted_engine(100);
+    for n in 0..50 {
+        let id = EventId::generate();
+        engine
+            .work_publish(item_envelope(id, &format!("job-{n}")))
+            .await
+            .unwrap();
+    }
+    for _ in 0..50 {
+        engine
+            .work_pull(&tenant(), &queue(), &agent("a"), &consumer("w"))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    // Every lease runs out, and nothing can be written.
+    flaky.fail("facts.work");
+    clock.advance(Duration::from_secs(11));
+    for tick in 0..5 {
+        let before = counting.rebuilds();
+        engine.tick().await;
+        let rebuilt = counting.rebuilds() - before;
+        assert!(
+            rebuilt <= 1,
+            "tick {tick}: {rebuilt} rebuilds with 50 tasks failing"
+        );
+        clock.advance(Duration::from_secs(1));
+    }
+
+    // Once it can, every lease is expired and every item comes back.
+    flaky.heal();
+    for _ in 0..3 {
+        engine.tick().await;
+        clock.advance(Duration::from_secs(5));
+    }
+    engine.tick().await;
+    let mut claimed = 0;
+    while engine
+        .work_pull(&tenant(), &queue(), &agent("b"), &consumer("w"))
+        .await
+        .unwrap()
+        .is_some()
+    {
+        claimed += 1;
+    }
+    assert_eq!(claimed, 50);
+}
+
+#[tokio::test]
+async fn a_refusal_rebuilds_nothing_and_a_lost_answer_at_most_once_per_tick() {
+    for (unknown, most) in [(false, 0), (true, 1)] {
+        let (engine, flaky, counting, clock) = counted_engine(100);
+        let poison = EventId::generate();
+        let mut message = item_envelope(poison, "poison");
+        message.event_type = "poison.job".parse().unwrap();
+        engine.work_publish(message).await.unwrap();
+        let claim = engine
+            .work_pull(&tenant(), &queue(), &agent("a"), &consumer("w"))
+            .await
+            .unwrap()
+            .unwrap();
+        engine
+            .work_fail(
+                &tenant(),
+                &queue(),
+                &poison.to_string().parse().unwrap(),
+                &agent("a"),
+                &claim.lease_id,
+                "x",
+            )
+            .await
+            .unwrap();
+        if unknown {
+            flaky.fail("poison.job");
+        } else {
+            flaky.refuse("poison.job");
+        }
+        let before = counting.rebuilds();
+        let mut worst = 0;
+        for _ in 0..20 {
+            clock.advance(Duration::from_millis(500));
+            let at = counting.rebuilds();
+            engine.tick().await;
+            worst = worst.max(counting.rebuilds() - at);
+        }
+        let total = counting.rebuilds() - before;
+        assert!(
+            worst <= most,
+            "unknown outcome {unknown}: {worst} rebuilds in one tick, {total} in 20"
+        );
+        if !unknown {
+            assert_eq!(total, 0, "a refusal is a definite answer");
+        }
+    }
+}
+
+#[tokio::test]
+async fn stepping_over_an_unreadable_message_does_not_read_the_page_again() {
+    let page = 100;
+    let (writer, flaky, counting, _) = counted_engine(page);
+    for n in 0..page {
+        writer
+            .work_publish(item_envelope(EventId::generate(), &format!("job-{n}")))
+            .await
+            .unwrap();
+    }
+    // The last message of the first page cannot be read.
+    flaky.corrupt("work.builds", u64::from(page) - 1);
+    drop(writer);
+
+    let before = counting.polls();
+    let reader = Engine::new(
+        counting.clone(),
+        Arc::new(LogSink::default()),
+        Arc::new(ManualClock::new(START)),
+        settings(),
+        page,
+    );
+    reader.recover().await.unwrap();
+    let polls = counting.polls() - before;
+    // The page that failed, one poll for each message in it, and the end.
+    assert!(polls <= u64::from(page) + 2, "{polls} polls");
+    let claimed = {
+        let mut n = 0;
+        while reader
+            .work_pull(&tenant(), &queue(), &agent("a"), &consumer("w"))
+            .await
+            .unwrap()
+            .is_some()
+        {
+            n += 1;
+        }
+        n
+    };
+    assert_eq!(claimed, page - 1, "every message but the unreadable one");
+}
+
+#[tokio::test]
+async fn an_alert_keeps_the_time_it_was_accepted_when_the_state_is_rebuilt() {
+    let rig = Rig::new();
+    let id = EventId::generate();
+    // A producer's time from long ago, accepted now.
+    rig.engine
+        .publish(alert_envelope(id, START - 86_400_000))
+        .await
+        .unwrap();
+
+    // Something unrelated fails in a way that leaves the outcome unknown, so
+    // the state is rebuilt.
+    rig.broker.lose_the_answer("work.builds");
+    let lost = rig
+        .engine
+        .work_publish(item_envelope(EventId::generate(), "x"))
+        .await;
+    assert!(lost.is_err());
+    rig.pass(1).await;
+    assert!(
+        alert_facts(&rig).await.is_empty(),
+        "the alert was accepted a second ago"
+    );
+    rig.pass(28).await;
+    assert!(alert_facts(&rig).await.is_empty());
+    rig.pass(1).await;
+    assert_eq!(alert_facts(&rig).await, ["resurfaced"]);
 }

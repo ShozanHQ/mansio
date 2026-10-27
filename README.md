@@ -184,7 +184,16 @@ curl ... -d '{"lease_id":"<uuid>","reason":"out of memory"}' \
   `dead` at once instead, and to nowhere else.
 - An item id is used once. `work_publish` answers 409 for an id the queue has
   already had, open or done, so resending finished work does not run it
-  again. The server keeps the id of every finished item.
+  again. The server keeps the id of every finished item, 16 bytes each, and
+  of every acknowledged alert. They are rebuilt from the topics when the
+  server starts, so what bounds them is `MANSIO_RETENTION_WORK_SECONDS` and
+  `MANSIO_RETENTION_ALERTS_SECONDS`: with the default, which keeps everything,
+  they only grow, and an id older than the retention can be used again.
+- A client that gets a 503 from `work_publish` or `alerts_publish` cannot tell
+  whether the message was stored. It sends it again with the same `id`: a 409
+  then means the first attempt was stored, and there is nothing to resend.
+  Without an `id` the resend is a new item. A 502 is a refusal: nothing was
+  stored.
 - A restarted server rebuilds all of this from `work.<queue>`, `facts.work`
   and `dead`, so it drops no item and republishes none twice. A publish that
   fails may still have been stored, so the server rebuilds the tenant from the
@@ -221,7 +230,9 @@ published gets a `mansio.alert.resurfaced` envelope on `facts.alert`, and
 another after each further interval, until it is acknowledged. The interval is
 counted from the server's clock when it accepts the alert, not from the `time`
 the producer wrote. An alert id is used once: publishing an id the tenant
-already has is a 409, so a resend cannot reopen an acknowledged alert.
+already has is a 409, so a resend cannot reopen an acknowledged alert. As for
+work, a client that gets a 503 sends the alert again with the same `id`, and
+a 409 means the first attempt was stored.
 
 ### One server per broker
 
