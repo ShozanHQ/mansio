@@ -12,11 +12,22 @@
 #                        change it before the first start or remove the
 #                        iggy-data volume
 #
-# The work settings can be set the same way. Empty means the default:
+# The work settings, and a few more that tests turn down, can be set the same
+# way. Empty means the default:
 #
 #   MANSIO_LEASE_SECONDS, MANSIO_MAX_ATTEMPTS, MANSIO_BACKOFF_BASE_SECONDS,
 #   MANSIO_BACKOFF_CAP_SECONDS, MANSIO_ALERT_RESURFACE_SECONDS,
-#   MANSIO_TICK_MILLIS
+#   MANSIO_TICK_MILLIS, MANSIO_POLL_DEFAULT_COUNT, MANSIO_POLL_MAX_COUNT,
+#   MANSIO_IGGY_SEGMENT_SIZE_BYTES, MANSIO_RETENTION_ALERTS_SECONDS
+#
+# On start mansio-server replays the topics of every tenant before it answers
+# anything, /healthz included, so a big log keeps /healthz dark for a while.
+# Docker ignores failed health checks during the start period of the check
+# (60s here), and the first one that passes ends it. For a log that takes
+# longer to replay than that, set MANSIO_HEALTH_START_PERIOD, for example 5m.
+#
+# Iggy removes expired messages in a pass every IGGY_DATA_MAINTENANCE_MESSAGES_INTERVAL
+# (a minute by default). Only the retention test turns it down.
 #
 # The sink file lives in the "sink" volume. To keep it in a directory on the
 # host instead, so that something outside the container can read it, set
@@ -44,6 +55,7 @@ services:
       IGGY_ROOT_USERNAME: ${IGGY_ROOT_USERNAME:-iggy}
       IGGY_ROOT_PASSWORD: ${IGGY_ROOT_PASSWORD:-iggy}
       IGGY_PATH: local_data
+      IGGY_DATA_MAINTENANCE_MESSAGES_INTERVAL: ${IGGY_DATA_MAINTENANCE_MESSAGES_INTERVAL:-1 m}
       # The image binds loopback unless told otherwise.
       IGGY_TCP_ADDRESS: 0.0.0.0:8090
       # The name other containers reach it by.
@@ -78,6 +90,10 @@ services:
       MANSIO_BACKOFF_CAP_SECONDS: ${MANSIO_BACKOFF_CAP_SECONDS:-}
       MANSIO_ALERT_RESURFACE_SECONDS: ${MANSIO_ALERT_RESURFACE_SECONDS:-}
       MANSIO_TICK_MILLIS: ${MANSIO_TICK_MILLIS:-}
+      MANSIO_POLL_DEFAULT_COUNT: ${MANSIO_POLL_DEFAULT_COUNT:-}
+      MANSIO_POLL_MAX_COUNT: ${MANSIO_POLL_MAX_COUNT:-}
+      MANSIO_IGGY_SEGMENT_SIZE_BYTES: ${MANSIO_IGGY_SEGMENT_SIZE_BYTES:-}
+      MANSIO_RETENTION_ALERTS_SECONDS: ${MANSIO_RETENTION_ALERTS_SECONDS:-}
     ports:
       - "127.0.0.1:7070:7070"
     volumes:
@@ -87,7 +103,9 @@ services:
       interval: 5s
       timeout: 3s
       retries: 12
-      start_period: 5s
+      # A start replays every tenant's topics before the server answers, and
+      # /healthz is dark until it has. Failures in this period do not count.
+      start_period: ${MANSIO_HEALTH_START_PERIOD:-60s}
 
 volumes:
   iggy-data:

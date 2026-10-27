@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail, ensure};
 use mansio_core::api::{Claimed, EffectiveSettings, Polled, Published};
 use mansio_core::{Envelope, EventId, MemoryBroker, Timestamp};
-use mansio_server::{Auth, FileSink, Server, WorkSettings};
+use mansio_server::{Auth, FileSink, Limits, Server, WorkSettings};
 use reqwest::{Method, StatusCode};
 use secrecy::SecretString;
 use serde_json::{Value, json};
@@ -52,6 +52,23 @@ fn local_work_settings() -> WorkSettings {
     }
 }
 
+/// What the in-process server runs with: the API limits and the work
+/// settings.
+#[derive(Debug, Clone, Copy)]
+pub struct LocalSettings {
+    pub limits: Limits,
+    pub work: WorkSettings,
+}
+
+impl Default for LocalSettings {
+    fn default() -> Self {
+        Self {
+            limits: Limits::default(),
+            work: local_work_settings(),
+        }
+    }
+}
+
 /// A server running in this process. It stops when dropped.
 struct LocalServer {
     base: String,
@@ -61,7 +78,11 @@ struct LocalServer {
 }
 
 impl LocalServer {
-    async fn start(broker: &Arc<MemoryBroker>, sink: &Path) -> anyhow::Result<Self> {
+    async fn start(
+        broker: &Arc<MemoryBroker>,
+        sink: &Path,
+        settings: LocalSettings,
+    ) -> anyhow::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let base = format!("http://{}", listener.local_addr()?);
         let auth = Auth::new(
@@ -70,7 +91,8 @@ impl LocalServer {
         );
         let server = Server::new(broker.clone(), auth)
             .with_sink(Arc::new(FileSink::open(sink).await?))
-            .with_work_settings(local_work_settings())?;
+            .with_limits(settings.limits)
+            .with_work_settings(settings.work)?;
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn(server.serve(listener, async move {
             let _ = stopped.await;
@@ -112,8 +134,9 @@ pub struct Target {
     pub tenant: String,
     pub settings: EffectiveSettings,
     sink: Option<PathBuf>,
-    /// The in-process broker and server, if there is one.
-    local: Option<(Arc<MemoryBroker>, Option<LocalServer>)>,
+    /// The in-process broker and server, if there is one, and what the server
+    /// runs with.
+    local: Option<(Arc<MemoryBroker>, Option<LocalServer>, LocalSettings)>,
 }
 
 impl Drop for Target {
@@ -125,8 +148,33 @@ impl Drop for Target {
 }
 
 impl Target {
+    /// A server to test against, and a tenant of its own on it: the live
+    /// server if `MANSIO_E2E_URL` is set, else one in this process.
     pub async fn start() -> anyhow::Result<Self> {
-        let tenant = format!("e2e-{}", EventId::generate().to_string().replace('-', ""));
+        Self::open(None, LocalSettings::default(), false).await
+    }
+
+    /// As [`Target::start`], with `settings` for the server in this process.
+    /// A live server runs with what it was started with.
+    pub async fn start_with(settings: LocalSettings) -> anyhow::Result<Self> {
+        Self::open(None, settings, false).await
+    }
+
+    /// The live server, which must be there: a test that needs one fails,
+    /// rather than passing without testing anything, when `MANSIO_E2E_URL` is
+    /// not set. With `tenant` it uses that one, as a second pass does after
+    /// a first on the same server; else a new one.
+    pub async fn live(tenant: Option<&str>) -> anyhow::Result<Self> {
+        Self::open(tenant.map(str::to_owned), LocalSettings::default(), true).await
+    }
+
+    async fn open(
+        tenant: Option<String>,
+        settings: LocalSettings,
+        live_only: bool,
+    ) -> anyhow::Result<Self> {
+        let tenant = tenant
+            .unwrap_or_else(|| format!("e2e-{}", EventId::generate().to_string().replace('-', "")));
         let http = reqwest::Client::new();
         if let Some(url) = std::env::var("MANSIO_E2E_URL")
             .ok()
@@ -135,7 +183,7 @@ impl Target {
             let token = std::env::var("MANSIO_TOKEN")
                 .context("MANSIO_TOKEN must be set when MANSIO_E2E_URL is")?;
             let base = url.trim_end_matches('/').to_owned();
-            let settings = read_settings(&http, &base, &token).await?;
+            let effective = read_settings(&http, &base, &token).await?;
             let sink = std::env::var_os("MANSIO_E2E_SINK_PATH")
                 .filter(|path| !path.is_empty())
                 .map(PathBuf::from);
@@ -144,23 +192,27 @@ impl Target {
                 token,
                 http,
                 tenant,
-                settings,
+                settings: effective,
                 sink,
                 local: None,
             });
         }
+        ensure!(
+            !live_only,
+            "MANSIO_E2E_URL is not set: this test runs against a live server and Iggy"
+        );
         let sink = std::env::temp_dir().join(format!("mansio-{tenant}.jsonl"));
         let broker = Arc::new(MemoryBroker::new());
-        let server = LocalServer::start(&broker, &sink).await?;
-        let settings = read_settings(&http, &server.base, LOCAL_TOKEN).await?;
+        let server = LocalServer::start(&broker, &sink, settings).await?;
+        let effective = read_settings(&http, &server.base, LOCAL_TOKEN).await?;
         Ok(Self {
             base: server.base.clone(),
             token: LOCAL_TOKEN.to_owned(),
             http,
             tenant,
-            settings,
+            settings: effective,
             sink: Some(sink),
-            local: Some((broker, Some(server))),
+            local: Some((broker, Some(server), settings)),
         })
     }
 
@@ -173,7 +225,7 @@ impl Target {
     /// Stop the in-process server, and wait until it and its timer are gone.
     /// The broker and the sink file stay.
     pub async fn stop_server(&mut self) -> anyhow::Result<()> {
-        let (_, server) = self.local.as_mut().context("the server is not local")?;
+        let (_, server, _) = self.local.as_mut().context("the server is not local")?;
         server
             .take()
             .context("the server is already stopped")?
@@ -185,9 +237,9 @@ impl Target {
     /// the last one used.
     pub async fn start_server(&mut self) -> anyhow::Result<()> {
         let sink = self.sink.clone().context("no sink file")?;
-        let (broker, server) = self.local.as_mut().context("the server is not local")?;
+        let (broker, server, settings) = self.local.as_mut().context("the server is not local")?;
         ensure!(server.is_none(), "the server is running");
-        let started = LocalServer::start(broker, &sink).await?;
+        let started = LocalServer::start(broker, &sink, *settings).await?;
         self.base = started.base.clone();
         *server = Some(started);
         Ok(())

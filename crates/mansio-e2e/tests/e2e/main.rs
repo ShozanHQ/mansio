@@ -10,6 +10,7 @@
 mod alerts;
 mod harness;
 mod ordering;
+mod passes;
 mod restart;
 mod work;
 

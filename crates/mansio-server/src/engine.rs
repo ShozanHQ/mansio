@@ -228,14 +228,15 @@ impl Engine {
 
     /// Publish an envelope to a topic: the generic messages route.
     ///
-    /// Work goes through [`Engine::work_publish`], and `facts.work` and
-    /// `facts.alert` are written by the engine alone.
+    /// Work goes through [`Engine::work_publish`], and `facts.work`,
+    /// `facts.alert` and `dead` are written by the engine alone.
     ///
     /// # Errors
     ///
     /// Returns 400 for those topics, 409 for an alert whose id is already
-    /// taken, 503 if the sink or the broker is unavailable, and 502 if the
-    /// broker refuses.
+    /// taken, 503 if the sink or the broker is unavailable or does not say
+    /// whether it stored the message, and 502 if the broker names a refusal
+    /// that comes before it stores anything.
     pub async fn publish(&self, envelope: Envelope) -> Result<Published, ApiError> {
         match &envelope.topic {
             Topic::Work(_) => {
@@ -243,7 +244,11 @@ impl Engine {
                     "work is published with work_publish, not to a work topic directly".to_owned(),
                 ));
             }
-            topic if *topic == Topic::facts_work() || *topic == Topic::facts_alert() => {
+            topic
+                if *topic == Topic::facts_work()
+                    || *topic == Topic::facts_alert()
+                    || *topic == Topic::Dead =>
+            {
                 return Err(ApiError::BadRequest(format!(
                     "{topic} is written by mansio and cannot be published to"
                 )));
@@ -725,9 +730,10 @@ impl Engine {
     }
 }
 
-/// Whether a failed publish may still have stored the message. Only an error
-/// about reaching the broker may: a refusal, a missing topic or an invalid
-/// envelope all come before anything is stored.
+/// Whether a failed publish may still have stored the message. Only an
+/// `Unavailable` may: a refusal the broker named, a missing topic and an
+/// invalid envelope all come before anything is stored, and a broker maps
+/// every error that does not say so to `Unavailable`.
 fn outcome_unknown(error: &BrokerError) -> bool {
     matches!(error, BrokerError::Unavailable(_))
 }
