@@ -55,7 +55,12 @@ async fn a_restarted_server_keeps_the_lease_and_claims_the_item_again_exactly_on
 
     // The lease the old server gave out is not the item's now.
     let (status, _) = target
-        .ack(QUEUE, &item_of(&first)?, &first.lease_id.to_string())
+        .ack(
+            QUEUE,
+            &item_of(&first)?,
+            first.consumer.as_str(),
+            &first.lease_id.to_string(),
+        )
         .await?;
     assert_eq!(status, StatusCode::FORBIDDEN);
     target.ack_claim(QUEUE, &second).await?;

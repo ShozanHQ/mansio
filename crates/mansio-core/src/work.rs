@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::envelope::Timestamp;
-use crate::id::{ConsumerName, EventId, LeaseId, Principal, Segment};
+use crate::id::{ConsumerName, EventId, LeaseFingerprint, Principal, Segment};
 
 /// A transition of a work item, recorded as an envelope on `facts.work` with
 /// the item id as its `subject`.
@@ -117,9 +117,10 @@ pub struct WorkFact {
     pub previous_message_id: Option<EventId>,
     /// The attempt this is about, from 1.
     pub attempt: u32,
-    /// The lease, on `claimed`, `acked`, `failed` and `expired`.
+    /// The lease, on `claimed`, `acked`, `failed` and `expired`: a fingerprint
+    /// of its id, which is the holder's proof and so is not recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lease_id: Option<LeaseId>,
+    pub lease: Option<LeaseFingerprint>,
     /// The principal holding the lease.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holder: Option<Principal>,
@@ -150,7 +151,7 @@ impl WorkFact {
             message_id,
             previous_message_id: None,
             attempt,
-            lease_id: None,
+            lease: None,
             holder: None,
             consumer: None,
             expires_at: None,

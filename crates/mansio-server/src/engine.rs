@@ -42,7 +42,8 @@ use crate::error::ApiError;
 use crate::facts::Facts;
 use crate::recover;
 use crate::settings::WorkSettings;
-use crate::state::{Item, Lease, Phase, TenantState, Then, backoff, held_lease};
+pub use crate::state::Holder;
+use crate::state::{Item, Lease, Phase, Remembered, TenantState, Then, backoff, held_lease};
 
 type Held = OwnedMutexGuard<TenantState>;
 
@@ -111,6 +112,17 @@ impl Engine {
             tenants: StdMutex::default(),
             discovered: AtomicBool::new(false),
         }
+    }
+
+    /// The tenants the engine holds state for, in order. A tenant is held from
+    /// the first request that reaches the engine, so a refused request must
+    /// not reach it.
+    #[cfg(test)]
+    pub(crate) fn tracked_tenants(&self) -> Vec<TenantId> {
+        let tenants = self.tenants.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut names: Vec<TenantId> = tenants.keys().cloned().collect();
+        names.sort();
+        names
     }
 
     /// The settings the engine runs with.
@@ -194,15 +206,16 @@ impl Engine {
     /// sink, set the record on it, publish it. The caller holds the tenant's
     /// lock, which is what keeps the sink and the topic in the same order.
     ///
-    /// The broker is asked, as the admin identity, to make sure the tenant and
-    /// the topic exist each time; it remembers what it has found, and
-    /// recreates what was deleted. The publish is made as `caller`, so that
-    /// the broker holds a credential to its scopes.
-    async fn append_as(
+    /// Everything is published as the admin identity: a credential never
+    /// writes. The server has already checked the caller's `publish` scope,
+    /// and has set the principal from the credential and whatever else a caller
+    /// may not set. The broker is asked to make sure the tenant and the topic
+    /// exist each time; it remembers what it has found, and recreates what was
+    /// deleted.
+    async fn append(
         &self,
         held: &mut TenantState,
         mut envelope: Envelope,
-        caller: &Caller<'_>,
     ) -> Result<Published, ApiError> {
         self.broker.ensure_tenant(&envelope.tenant).await?;
         self.broker
@@ -213,7 +226,7 @@ impl Engine {
         {
             envelope.record = Some(record);
         }
-        let offset = match self.broker.publish(caller, &envelope).await {
+        let offset = match self.broker.publish(&Caller::Admin, &envelope).await {
             Ok(offset) => offset,
             Err(error) => {
                 if outcome_unknown(&error) {
@@ -229,16 +242,6 @@ impl Engine {
         Ok(Published { offset, envelope })
     }
 
-    /// What the engine publishes itself: transitions and republished items,
-    /// as the admin identity.
-    async fn append(
-        &self,
-        held: &mut TenantState,
-        envelope: Envelope,
-    ) -> Result<Published, ApiError> {
-        self.append_as(held, envelope, &Caller::Admin).await
-    }
-
     /// Record a fact the server makes outside the work and alert engine, such
     /// as the issue of a credential: in the sink, then on its topic, in order
     /// with everything else for the tenant.
@@ -252,31 +255,27 @@ impl Engine {
         self.append(&mut held, fact).await
     }
 
-    /// Publish an envelope to a topic as `caller`: the generic messages route.
+    /// Publish an envelope to a topic: the generic messages route.
     ///
     /// Work goes through [`Engine::work_publish`], and `facts.work`,
-    /// `facts.alert` and `facts.principal` are written by the server alone.
-    /// What the caller is allowed to publish is for the route to decide
-    /// before it gets here, and for the broker to enforce.
+    /// `facts.alert`, `facts.principal` and `dead` are written by the server
+    /// alone. Whether the caller may publish here is for the route to decide
+    /// before it gets here.
     ///
     /// # Errors
     ///
-    /// Returns 400 for those topics, 403 if the broker does not let the
-    /// credential send there, 409 for an alert whose id is already taken, 503
-    /// if the sink or the broker is unavailable, and 502 if the broker
-    /// refuses.
-    pub async fn publish(
-        &self,
-        caller: &Caller<'_>,
-        envelope: Envelope,
-    ) -> Result<Published, ApiError> {
+    /// Returns 400 for those topics, 409 for an alert whose id is already
+    /// taken, 503 if the sink or the broker is unavailable or does not say
+    /// whether it stored the message, and 502 if the broker names a refusal
+    /// that comes before it stores anything.
+    pub async fn publish(&self, envelope: Envelope) -> Result<Published, ApiError> {
         match &envelope.topic {
             Topic::Work(_) => {
                 return Err(ApiError::BadRequest(
                     "work is published with work_publish, not to a work topic directly".to_owned(),
                 ));
             }
-            topic if is_written_by_mansio(topic) => {
+            topic if topic.is_written_by_mansio() => {
                 return Err(ApiError::BadRequest(format!(
                     "{topic} is written by mansio and cannot be published to"
                 )));
@@ -289,7 +288,7 @@ impl Engine {
             self.broker
                 .ensure_topic(&envelope.tenant, &envelope.topic)
                 .await?;
-            let offset = self.broker.publish(caller, &envelope).await?;
+            let offset = self.broker.publish(&Caller::Admin, &envelope).await?;
             return Ok(Published { offset, envelope });
         }
         let mut held = self.lock(&envelope.tenant).await?;
@@ -303,7 +302,7 @@ impl Engine {
                 envelope.id
             )));
         }
-        let stored = self.append_as(&mut held, envelope, caller).await?;
+        let stored = self.append(&mut held, envelope).await?;
         if is_alert {
             // Timed from now, not from the `time` the producer wrote.
             held.alerts
@@ -319,11 +318,7 @@ impl Engine {
     ///
     /// Returns 409 if the queue has an item with the id, open or done, and
     /// the errors of [`Engine::publish`].
-    pub async fn work_publish(
-        &self,
-        caller: &Caller<'_>,
-        envelope: Envelope,
-    ) -> Result<Published, ApiError> {
+    pub async fn work_publish(&self, envelope: Envelope) -> Result<Published, ApiError> {
         let (Topic::Work(queue), Some(item)) = (envelope.topic.clone(), envelope.item_id.clone())
         else {
             return Err(ApiError::Internal);
@@ -334,7 +329,7 @@ impl Engine {
                 "{queue} already has an item with id {item}: an id is not used again, even when the item is done"
             )));
         }
-        let stored = self.append_as(&mut held, envelope, caller).await?;
+        let stored = self.append(&mut held, envelope).await?;
         held.queue_mut(&queue)
             .insert(item, stored.envelope.clone(), Phase::Ready);
         Ok(stored)
@@ -346,9 +341,13 @@ impl Engine {
     /// name `consumer`. `None` if nothing can be claimed.
     ///
     /// A consumer (the principal and the name together) that already holds a
-    /// live lease on the queue is given that lease again, with the same id and
-    /// expiry, and nothing is recorded. So a client whose answer was lost, and
-    /// that asks again, does not leave an item leased to nobody. To work on
+    /// live lease on the queue is given that lease again, not another item.
+    /// So a client whose answer was lost, and that asks again, does not leave
+    /// an item leased to nobody. The lease keeps its id and its expiry and
+    /// nothing is recorded. The one case that cannot be answered so is a
+    /// lease the server has only read back from its facts, which do not say
+    /// the id: it is given a new id on the same item with the same expiry, and
+    /// that is recorded as a `claimed` fact of the same attempt. To work on
     /// several items at once, pull under several names.
     ///
     /// # Errors
@@ -364,52 +363,116 @@ impl Engine {
     ) -> Result<Option<Claimed>, ApiError> {
         let mut held = self.lock(tenant).await?;
         let now = self.clock.now_millis();
-        if let Some((item, lease)) = held
+        let existing = held
             .queues
             .get(queue)
             .and_then(|q| q.held_by(principal, consumer, now))
-        {
-            return Ok(Some(Claimed {
-                lease_id: lease.id,
-                expires_at: timestamp(lease.expires_at)?,
-                item: item.message.clone(),
-            }));
+            .map(|(id, item, lease)| (id.clone(), item.message.clone(), lease.clone()));
+        if let Some((id, message, lease)) = existing {
+            return self
+                .give_again(&mut held, tenant, queue, id, message, lease, now)
+                .await
+                .map(Some);
         }
-        let Some((id, message, attempt)) = held
+        let Some((id, message)) = held
             .queues
             .get(queue)
             .and_then(|q| q.oldest_ready().and_then(|id| Some((id, q.get(id)?))))
-            .map(|(id, item)| (id.clone(), item.message.clone(), item.attempt()))
+            .map(|(id, item)| (id.clone(), item.message.clone()))
         else {
             return Ok(None);
         };
 
+        let lease_id = LeaseId::generate();
         let lease = Lease {
-            id: LeaseId::generate(),
+            fingerprint: lease_id.fingerprint(),
+            id: Some(Remembered(lease_id)),
             holder: principal.clone(),
             consumer: consumer.clone(),
             expires_at: now.saturating_add(millis(self.settings.lease)),
         };
-        let mut data = WorkFact::new(queue.clone(), message.id, attempt);
-        data.lease_id = Some(lease.id);
-        data.holder = Some(lease.holder.clone());
-        data.consumer = Some(lease.consumer.clone());
-        data.expires_at = Some(timestamp(lease.expires_at)?);
-        let fact = self
-            .facts
-            .work(tenant, WorkEvent::Claimed, principal, now, &id, &data)?;
-        self.append(&mut held, fact).await?;
-
+        self.record_claim(&mut held, tenant, queue, &id, &message, &lease, now)
+            .await?;
         held.queue_mut(queue)
             .set_phase(&id, Phase::Leased(lease.clone()));
         Ok(Some(Claimed {
-            lease_id: lease.id,
+            lease_id,
+            consumer: lease.consumer.clone(),
             expires_at: timestamp(lease.expires_at)?,
             item: message,
         }))
     }
 
-    /// Complete an item. Only the holder, presenting the lease id, may.
+    /// Record that `lease` is held on the item, as a `claimed` fact.
+    async fn record_claim(
+        &self,
+        held: &mut TenantState,
+        tenant: &TenantId,
+        queue: &Segment,
+        item: &ItemId,
+        message: &Envelope,
+        lease: &Lease,
+        now: i64,
+    ) -> Result<(), ApiError> {
+        let mut data = WorkFact::new(queue.clone(), message.id, message.attempt.unwrap_or(1));
+        data.lease = Some(lease.fingerprint);
+        data.holder = Some(lease.holder.clone());
+        data.consumer = Some(lease.consumer.clone());
+        data.expires_at = Some(timestamp(lease.expires_at)?);
+        let fact = self.facts.work(
+            tenant,
+            WorkEvent::Claimed,
+            &lease.holder,
+            now,
+            item,
+            &data,
+        )?;
+        self.append(held, fact).await?;
+        Ok(())
+    }
+
+    /// The lease a consumer already holds, handed to it again.
+    async fn give_again(
+        &self,
+        held: &mut TenantState,
+        tenant: &TenantId,
+        queue: &Segment,
+        item: ItemId,
+        message: Envelope,
+        lease: Lease,
+        now: i64,
+    ) -> Result<Claimed, ApiError> {
+        let expires_at = timestamp(lease.expires_at)?;
+        if let Some(Remembered(lease_id)) = lease.id {
+            return Ok(Claimed {
+                lease_id,
+                consumer: lease.consumer,
+                expires_at,
+                item: message,
+            });
+        }
+        // Read back from the facts, which keep a fingerprint of the id and not
+        // the id: this is a new id for the same lease.
+        let lease_id = LeaseId::generate();
+        let renewed = Lease {
+            fingerprint: lease_id.fingerprint(),
+            id: Some(Remembered(lease_id)),
+            ..lease
+        };
+        self.record_claim(held, tenant, queue, &item, &message, &renewed, now)
+            .await?;
+        held.queue_mut(queue)
+            .set_phase(&item, Phase::Leased(renewed.clone()));
+        Ok(Claimed {
+            lease_id,
+            consumer: renewed.consumer,
+            expires_at,
+            item: message,
+        })
+    }
+
+    /// Complete an item. Only the holder, naming the consumer and presenting
+    /// the lease id, may.
     ///
     /// # Errors
     ///
@@ -421,14 +484,14 @@ impl Engine {
         tenant: &TenantId,
         queue: &Segment,
         item: &ItemId,
-        principal: &Principal,
-        lease_id: &LeaseId,
+        holder: Holder<'_>,
     ) -> Result<Published, ApiError> {
         let mut held = self.lock(tenant).await?;
         let now = self.clock.now_millis();
+        let principal = holder.principal;
         let fact = {
             let open = open_item(&held, queue, item)?;
-            let lease = held_lease(open, principal, lease_id, now)?;
+            let lease = held_lease(open, holder, now)?;
             let data = lease_fact(queue, open, lease);
             self.facts
                 .work(tenant, WorkEvent::Acked, principal, now, item, &data)?
@@ -438,8 +501,8 @@ impl Engine {
         Ok(stored)
     }
 
-    /// Give an item back as failed. Only the holder, presenting the lease id,
-    /// may. The item is republished after a backoff, or goes to `dead` if it
+    /// Give an item back as failed. Only the holder, naming the consumer and
+    /// presenting the lease id, may. The item is republished after a backoff, or goes to `dead` if it
     /// has used its attempts.
     ///
     /// # Errors
@@ -450,15 +513,15 @@ impl Engine {
         tenant: &TenantId,
         queue: &Segment,
         item: &ItemId,
-        principal: &Principal,
-        lease_id: &LeaseId,
+        holder: Holder<'_>,
         reason: &str,
     ) -> Result<Published, ApiError> {
         let mut held = self.lock(tenant).await?;
         let now = self.clock.now_millis();
+        let principal = holder.principal;
         let (fact, next, due) = {
             let open = open_item(&held, queue, item)?;
-            let lease = held_lease(open, principal, lease_id, now)?;
+            let lease = held_lease(open, holder, now)?;
             let (next, retry_at) = self.decide(open.attempt(), now);
             let mut data = lease_fact(queue, open, lease);
             data.reason = Some(reason.to_owned());
@@ -779,17 +842,10 @@ impl Engine {
     }
 }
 
-/// Whether the server writes the topic itself, so that nobody else may.
-fn is_written_by_mansio(topic: &Topic) -> bool {
-    *topic == Topic::facts_work()
-        || *topic == Topic::facts_alert()
-        || *topic == Topic::facts_principal()
-        || *topic == Topic::facts_webhook()
-}
-
-/// Whether a failed publish may still have stored the message. Only an error
-/// about reaching the broker may: a refusal, a missing topic or an invalid
-/// envelope all come before anything is stored.
+/// Whether a failed publish may still have stored the message. Only an
+/// `Unavailable` may: a refusal the broker named, a missing topic and an
+/// invalid envelope all come before anything is stored, and a broker maps
+/// every error that does not say so to `Unavailable`.
 fn outcome_unknown(error: &BrokerError) -> bool {
     matches!(error, BrokerError::Unavailable(_))
 }
@@ -810,7 +866,7 @@ fn open_item<'a>(
 /// The `data` of a fact about an item under a lease.
 fn lease_fact(queue: &Segment, item: &Item, lease: &Lease) -> WorkFact {
     let mut data = WorkFact::new(queue.clone(), item.message.id, item.attempt());
-    data.lease_id = Some(lease.id);
+    data.lease = Some(lease.fingerprint);
     data.holder = Some(lease.holder.clone());
     data.consumer = Some(lease.consumer.clone());
     data.expires_at = Timestamp::from_unix_millis(lease.expires_at).ok();

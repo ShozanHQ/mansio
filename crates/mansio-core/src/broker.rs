@@ -25,10 +25,10 @@ pub struct Stored {
 
 /// Who a read or a write is for.
 ///
-/// The broker enforces permissions on a credential: what its scopes do not
-/// allow is refused by the broker, however the request was made. Creating
-/// streams, topics and users is the admin identity's alone and has no caller
-/// argument.
+/// The broker enforces permissions on a credential: it may read what its
+/// scopes cover and nothing else, and write nothing, however the request is
+/// made. Creating streams, topics and users is the admin identity's alone and
+/// has no caller argument.
 #[derive(Debug, Clone, Copy)]
 pub enum Caller<'a> {
     /// The server's own identity, which may read and write every topic.
@@ -80,6 +80,15 @@ impl SystemLog {
             SystemLog::Webhooks => "webhooks",
         }
     }
+}
+
+/// A user of the broker, by number and name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerUserInfo {
+    /// The broker's number for it.
+    pub user: BrokerUser,
+    /// Its name.
+    pub name: String,
 }
 
 /// A record the server keeps in the broker where no credential can reach it.
@@ -142,7 +151,9 @@ pub trait Broker: Send + Sync {
     async fn ensure_topic(&self, tenant: &TenantId, topic: &Topic) -> Result<(), BrokerError>;
 
     /// Append the envelope to the topic named in it, as `caller`, and return
-    /// its offset.
+    /// its offset. A credential writes nothing: it is held to reading, and the
+    /// server writes for it as the admin, with the principal stamped from the
+    /// credential.
     ///
     /// `None` means the broker accepted and stored the message but could not
     /// say where it landed. The caller must not publish it again.
@@ -153,9 +164,12 @@ pub trait Broker: Send + Sync {
     /// # Errors
     ///
     /// Returns [`BrokerError::NotFound`] if the tenant or topic does not
-    /// exist, [`BrokerError::Forbidden`] if the credential may not send there,
-    /// [`BrokerError::Unauthenticated`] if it is not valid, or an error if the
-    /// broker cannot be reached or refuses.
+    /// exist, [`BrokerError::Forbidden`] for a credential, which may not send
+    /// anywhere, [`BrokerError::Unauthenticated`] if it is not valid,
+    /// [`BrokerError::Rejected`] if the broker named a refusal that comes before
+    /// it stores anything (the message was not stored), or
+    /// [`BrokerError::Unavailable`] for any other failure, after which the
+    /// message may have been stored.
     async fn publish(
         &self,
         caller: &Caller<'_>,
@@ -163,9 +177,11 @@ pub trait Broker: Send + Sync {
     ) -> Result<Option<u64>, BrokerError>;
 
     /// Read up to `max` envelopes from `offset` on, in publish order, as
-    /// `caller`. An offset past the end returns nothing. A `max` of 0 reads
-    /// nothing, and still checks that the topic exists and that the caller
-    /// may read it.
+    /// `caller`. An offset past the end returns nothing. An offset below the
+    /// first message the broker still holds, because retention deleted the head
+    /// of the topic, reads from that first message: a reader that starts at 0
+    /// sees what is left. A `max` of 0 reads nothing, and still checks that the
+    /// topic exists and that the caller may read it.
     ///
     /// # Errors
     ///
@@ -211,20 +227,21 @@ pub trait Broker: Send + Sync {
     }
 
     /// The offset of the last message the named consumer committed on the
-    /// topic, as `caller`, or `None` if it has committed none. The broker
-    /// keeps it, so it survives a restart of the server. A consumer belongs
-    /// to a tenant and a topic, and its name is the whole of its identity.
+    /// topic, or `None` if it has committed none. The broker keeps it, so it
+    /// survives a restart of the server. A consumer belongs to a tenant and a
+    /// topic, and its name is the whole of its identity.
+    ///
+    /// This is the admin identity's, like listing: the server first reads the
+    /// topic as the caller, so that the broker holds the caller to its right to
+    /// read it, and only then asks for the consumer.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::NotFound`] if the tenant or topic does not
-    /// exist, [`BrokerError::Forbidden`] if the credential may not read the
-    /// topic, [`BrokerError::Unauthenticated`] if it is not valid, or an
-    /// error if the broker cannot be reached, refuses, or keeps no consumer
-    /// offsets.
+    /// exist, or an error if the broker cannot be reached, refuses, or keeps
+    /// no consumer offsets.
     async fn consumer_offset(
         &self,
-        _caller: &Caller<'_>,
         _tenant: &TenantId,
         _topic: &Topic,
         _consumer: &ConsumerName,
@@ -233,15 +250,16 @@ pub trait Broker: Send + Sync {
     }
 
     /// Store `offset` as the last message the named consumer has handled on
-    /// the topic, as `caller`, replacing what it was. Any offset may be
-    /// stored, so a consumer can be set back to read again.
+    /// the topic, replacing what it was. Any offset may be stored, so a
+    /// consumer can be set back to read again. Like every write it is the
+    /// admin identity's.
     ///
     /// # Errors
     ///
-    /// As [`Broker::consumer_offset`].
+    /// As [`Broker::consumer_offset`]; a failure other than a refusal that
+    /// comes first may have stored the offset.
     async fn commit_offset(
         &self,
-        _caller: &Caller<'_>,
         _tenant: &TenantId,
         _topic: &Topic,
         _consumer: &ConsumerName,
@@ -285,6 +303,16 @@ pub trait Broker: Send + Sync {
         _grants: &[Grant],
     ) -> Result<(), BrokerError> {
         Err(unsupported("users"))
+    }
+
+    /// Every user the broker has, the server's own and the ones made for
+    /// principals alike. A broker without users has none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the broker cannot be reached or refuses.
+    async fn list_users(&self) -> Result<Vec<BrokerUserInfo>, BrokerError> {
+        Ok(Vec::new())
     }
 
     /// Delete the user and every credential of it, and end its sessions. A

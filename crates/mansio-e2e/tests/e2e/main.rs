@@ -14,6 +14,7 @@ mod credentials;
 mod events;
 mod harness;
 mod ordering;
+mod passes;
 mod receiver;
 mod restart;
 mod surfaces;

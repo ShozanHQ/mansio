@@ -125,6 +125,11 @@ const CONSUMER_PULL: Param = required(
     Kind::Text,
     "The name this consumer pulls under. A consumer that holds a live lease is given it again.",
 );
+const CONSUMER_HELD: Param = required(
+    "consumer",
+    Kind::Text,
+    "The consumer name the lease was taken under: the consumer of the work_pull answer.",
+);
 const CONSUMER_NAMED: Param = required(
     "consumer",
     Kind::Text,
@@ -217,8 +222,8 @@ impl Op {
             Op::Poll => "Print the envelopes in a topic from an offset, one JSON object per line.",
             Op::Watch => "Stream the envelopes of a topic as they arrive, one JSON object per line. With --consumer the position is kept by the broker, so a restart resumes at the next envelope; stop with SIGINT or SIGTERM.",
             Op::WorkPublish => "Publish a work item to a queue and print it as stored. The item is named by its id.",
-            Op::WorkPull => "Claim the oldest claimable item of a queue under a lease and print the item and the lease. Prints nothing if there is none. A consumer that holds a live lease is given it again.",
-            Op::WorkAck => "Complete an item you claimed, presenting its lease.",
+            Op::WorkPull => "Claim the oldest claimable item of a queue under a lease and print the lease id, the consumer, the expiry and the item. Prints nothing if there is none. A consumer that holds a live lease is given it again, so asking again after a lost answer is safe.",
+            Op::WorkAck => "Complete an item you claimed, naming the consumer and presenting the lease.",
             Op::WorkFail => "Give an item you claimed back as failed. It is tried again after a backoff, or goes to the dead topic when its attempts are used.",
             Op::AlertsPublish => "Publish an alert and print it as stored. Its id is the alert's id.",
             Op::AlertsAck => "Acknowledge an alert, once.",
@@ -264,12 +269,14 @@ impl Op {
                 TENANT,
                 QUEUE,
                 required("item", Kind::Text, "The item id."),
+                CONSUMER_HELD,
                 required("lease_id", Kind::Text, "The lease the item was claimed under."),
             ],
             Op::WorkFail => vec![
                 TENANT,
                 QUEUE,
                 required("item", Kind::Text, "The item id."),
+                CONSUMER_HELD,
                 required("lease_id", Kind::Text, "The lease the item was claimed under."),
                 required("reason", Kind::Text, "Why it failed."),
             ],
@@ -648,11 +655,15 @@ pub async fn run(
             let queue: Segment = args.parse("queue")?;
             let item = args.text("item").context("item is required")?;
             let lease: mansio_core::LeaseId = args.parse("lease_id")?;
+            let consumer: ConsumerName = args.parse("consumer")?;
             let (verb, body) = if op == Op::WorkAck {
-                ("ack", json!({ "lease_id": lease }))
+                ("ack", json!({ "lease_id": lease, "consumer": consumer }))
             } else {
                 let reason = args.text("reason").context("reason is required")?;
-                ("fail", json!({ "lease_id": lease, "reason": reason }))
+                (
+                    "fail",
+                    json!({ "lease_id": lease, "consumer": consumer, "reason": reason }),
+                )
             };
             let reply = client
                 .call(

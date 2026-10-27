@@ -12,18 +12,19 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use iggy::prelude::{
     AutoLogin, Client, Consumer, ConsumerOffsetClient, Credentials, Durability as IggyDurability,
-    Identifier, IggyClient, IggyClientBuilder, IggyDuration, IggyError, IggyExpiry, IggyMessage,
+    Identifier, IggyByteSize, IggyClient, IggyClientBuilder, IggyDuration, IggyError, IggyExpiry,
+    IggyMessage,
     MaxTopicSize, MessageClient, Partitioning, PersonalAccessTokenClient, PollingStrategy,
     StreamClient, TopicClient, TopicCreateOptions, UserClient, UserStatus,
 };
 use mansio_core::{
-    Broker, BrokerError, BrokerUser, Caller, ConsumerName, Credential, Envelope, EventId, Grant,
-    Minted, Stored, SystemLog, SystemRecord, TenantId, Topic,
+    Broker, BrokerError, BrokerUser, BrokerUserInfo, Caller, ConsumerName, Credential, Envelope,
+    EventId, Grant, Minted, Stored, SystemLog, SystemRecord, TenantId, Topic,
 };
 use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use tracing::{info, warn};
 
-use crate::access::{Users, permissions};
+use crate::access::{Users, no_permissions, permissions};
 use crate::config::{Durability, DurabilityPolicy, IggyConfig, Retention};
 use crate::sessions::{Session, Sessions};
 
@@ -105,6 +106,7 @@ pub struct IggyBroker {
     connect_timeout: Duration,
     retention: Retention,
     durability: DurabilityPolicy,
+    segment_size_bytes: u64,
     locate_window: u32,
     ensured: Ensured,
     /// The clients signed in with a principal's credential.
@@ -127,6 +129,17 @@ fn new_client(address: &str) -> Result<IggyClient, BrokerError> {
         .map_err(map_iggy)
 }
 
+/// What applying a user's permissions came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Applied {
+    /// The permissions its scopes work out to are set.
+    Done,
+    /// Its tenant's stream is not there, and it has no permissions.
+    NoStream,
+    /// There is no such user.
+    NoUser,
+}
+
 /// End a client that is no longer used. Whether Iggy hears about it does not
 /// matter.
 async fn end(client: &IggyClient) {
@@ -140,8 +153,7 @@ impl IggyBroker {
     /// # Errors
     ///
     /// Returns [`BrokerError::Unavailable`] if Iggy does not answer within
-    /// the connect timeout, and [`BrokerError::Rejected`] if it refuses the
-    /// credentials.
+    /// the connect timeout or the sign-in fails.
     pub async fn connect(config: IggyConfig) -> Result<Self, BrokerError> {
         let client = IggyClientBuilder::new()
             .with_tcp()
@@ -168,6 +180,7 @@ impl IggyBroker {
             connect_timeout: config.connect_timeout,
             retention: config.retention,
             durability: config.durability,
+            segment_size_bytes: config.segment_size_bytes,
             locate_window: config.locate_window,
             ensured: Ensured::default(),
             sessions: Sessions::default(),
@@ -225,10 +238,7 @@ impl IggyBroker {
             }),
             Ok(Err(error)) => {
                 end(&client).await;
-                Err(match map_iggy(error) {
-                    unavailable @ BrokerError::Unavailable(_) => unavailable,
-                    refused => BrokerError::Unauthenticated(refused.to_string()),
-                })
+                Err(login_failure(error))
             }
             Err(_) => {
                 end(&client).await;
@@ -405,7 +415,12 @@ impl IggyBroker {
         if self.ensured.has_stream(tenant) {
             return Ok(());
         }
-        self.make_stream(tenant.as_str()).await?;
+        if self.make_stream(tenant.as_str()).await? {
+            // Iggy may give a new stream the number of one that was deleted,
+            // and permissions name streams by number: whoever held the old
+            // number must not hold the new stream.
+            self.refresh_users().await?;
+        }
         self.ensured.add_stream(tenant);
         Ok(())
     }
@@ -420,7 +435,12 @@ impl IggyBroker {
         if self.ensured.has_topic(tenant, topic) {
             return Ok(());
         }
-        let options = topic_options(&self.retention, &self.durability, topic);
+        let options = topic_options(
+            &self.retention,
+            &self.durability,
+            self.segment_size_bytes,
+            topic,
+        );
         self.make_topic(tenant.as_str(), &topic.to_string(), &options)
             .await?;
         // Whether the topic was made now or found, the users whose scopes
@@ -496,16 +516,17 @@ impl IggyBroker {
 
     // ---- users ------------------------------------------------------------
 
-    /// The stream's number and its topics' numbers and names.
+    /// The stream's number and its topics' numbers and names, or `None` if
+    /// there is no stream.
     async fn stream_topics(
         &self,
         tenant: &TenantId,
-    ) -> Result<(u32, Vec<(u32, Topic)>), BrokerError> {
+    ) -> Result<Option<(u32, Vec<(u32, Topic)>)>, BrokerError> {
         let stream = stream_id(tenant)?;
         let details = match self.client.get_stream(&stream).await {
             Ok(Some(details)) => details,
             Ok(None) | Err(IggyError::StreamIdNotFound(_) | IggyError::StreamNameNotFound(_)) => {
-                return Err(BrokerError::NotFound(format!("tenant {tenant}")));
+                return Ok(None);
             }
             Err(error) => return Err(map_iggy(error)),
         };
@@ -514,37 +535,55 @@ impl IggyBroker {
             .iter()
             .filter_map(|topic| Some((topic.id, topic.name.parse().ok()?)))
             .collect();
-        Ok((details.id, named))
+        Ok(Some((details.id, named)))
     }
 
     /// Give the user the permissions its scopes work out to on the topics the
-    /// tenant has now. The caller holds the permissions lock.
+    /// tenant has now, or none if the tenant's stream is gone. The caller
+    /// holds the permissions lock.
     async fn apply(
         &self,
         user: BrokerUser,
         tenant: &TenantId,
         grants: &[Grant],
-    ) -> Result<(), BrokerError> {
-        let (stream, topics) = self.stream_topics(tenant).await?;
-        let granted = permissions(stream, &topics, grants);
-        self.client
+    ) -> Result<Applied, BrokerError> {
+        let (granted, applied) = match self.stream_topics(tenant).await? {
+            Some((stream, topics)) => (permissions(stream, &topics, grants), Applied::Done),
+            None => (no_permissions(), Applied::NoStream),
+        };
+        match self
+            .client
             .update_permissions(&user_id(user)?, Some(granted))
             .await
-            .map_err(map_iggy)
+        {
+            Ok(()) => Ok(applied),
+            Err(IggyError::ResourceNotFound(_)) => Ok(Applied::NoUser),
+            Err(error) => Err(map_iggy(error)),
+        }
     }
 
-    /// A topic of the tenant was found or made: open it to the users whose
-    /// scopes cover it.
+    /// A topic of the tenant was found or made: work out again what every
+    /// user of the tenant may read, which includes the topic if their scopes
+    /// cover it.
     async fn open_to_users(&self, tenant: &TenantId) -> Result<(), BrokerError> {
         let _held = self.permissions.lock().await;
         for (user, grants) in self.users.of_tenant(tenant) {
-            match self.apply(user, tenant, &grants).await {
-                Ok(()) => {}
-                Err(BrokerError::NotFound(why)) => {
-                    warn!(%tenant, %user, %why, "a user the broker was told about is gone");
-                    self.users.remove(user);
-                }
-                Err(error) => return Err(error),
+            if self.apply(user, tenant, &grants).await? == Applied::NoUser {
+                warn!(%tenant, %user, "a user the broker was told about is gone");
+                self.users.remove(user);
+            }
+        }
+        Ok(())
+    }
+
+    /// A stream was made: work out again what every user of every tenant may
+    /// read. A user whose stream is not there gets no permissions.
+    async fn refresh_users(&self) -> Result<(), BrokerError> {
+        let _held = self.permissions.lock().await;
+        for (user, tenant, grants) in self.users.all() {
+            if self.apply(user, &tenant, &grants).await? == Applied::NoUser {
+                warn!(%tenant, %user, "a user the broker was told about is gone");
+                self.users.remove(user);
             }
         }
         Ok(())
@@ -641,17 +680,20 @@ fn iggy_durability(durability: Durability) -> IggyDurability {
 }
 
 /// How a topic is created: one partition, the retention and durability of its
-/// kind, and no size cap when it keeps messages forever, so that a default
-/// cap on the server never trims it.
+/// kind, the configured segment size (none leaves it to Iggy), and no size cap
+/// when it keeps messages forever, so that a default cap on the server never
+/// trims it.
 fn topic_options(
     retention: &Retention,
     durability: &DurabilityPolicy,
+    segment_size_bytes: u64,
     topic: &Topic,
 ) -> TopicCreateOptions {
     let durability = iggy_durability(durability.for_kind(topic.kind()));
     TopicCreateOptions {
         partitions_count: Some(1),
         message_expiry: Some(expiry(retention, topic)),
+        segment_size: (segment_size_bytes > 0).then(|| IggyByteSize::new(segment_size_bytes)),
         max_topic_size: retention
             .for_kind(topic.kind())
             .is_none()
@@ -680,6 +722,16 @@ fn decode(tenant: &TenantId, topic: &Topic, message: &IggyMessage) -> Result<Sto
     Ok(Stored { offset, envelope })
 }
 
+/// Sort what the Iggy SDK reports into what the engine acts on.
+///
+/// `Rejected` says nothing was stored, so it is an allowlist: the statuses
+/// that Iggy, or the SDK before it sends, gives for a request it has refused
+/// outright. Every other error is `Unavailable`, the answer that has a client
+/// send again with the same id. The TCP client writes and flushes a request
+/// before it reads the reply, and a reply that cannot be read fails after the
+/// write: a frame of the wrong size or shape is `InvalidCommand`, an eviction
+/// whose reason is unreadable is `Unauthenticated`, a status code it does not
+/// know is `Error`. None of those says whether the write was applied.
 fn map_iggy(error: IggyError) -> BrokerError {
     let text = error.to_string();
     match error {
@@ -688,6 +740,26 @@ fn map_iggy(error: IggyError) -> BrokerError {
         | IggyError::TopicIdNotFound(..)
         | IggyError::TopicNameNotFound(..)
         | IggyError::ResourceNotFound(_) => BrokerError::NotFound(text),
+        IggyError::Unauthorized
+        | IggyError::InvalidIdentifier
+        | IggyError::InvalidStreamName
+        | IggyError::InvalidStreamId
+        | IggyError::InvalidTopicName
+        | IggyError::InvalidTopicId
+        | IggyError::InvalidMessagesCount
+        | IggyError::TooBigMessagePayload => BrokerError::Rejected(text),
+        _ => BrokerError::Unavailable(text),
+    }
+}
+
+/// Why Iggy would not sign in with a token. Whatever the reason it gives, the
+/// token is not valid (unknown, expired, or its user is gone), unless the
+/// answer is about reaching Iggy, which says nothing about the token. Nothing
+/// is written by a sign-in, so unlike `map_iggy` there is no outcome to be
+/// unsure of.
+fn login_failure(error: IggyError) -> BrokerError {
+    let text = error.to_string();
+    match error {
         IggyError::Disconnected
         | IggyError::CannotEstablishConnection
         | IggyError::ClientShutdown
@@ -696,7 +768,7 @@ fn map_iggy(error: IggyError) -> BrokerError {
         | IggyError::TransientNotCommitted
         | IggyError::TransientNotAccepted
         | IggyError::TaskTimeout => BrokerError::Unavailable(text),
-        _ => BrokerError::Rejected(text),
+        _ => BrokerError::Unauthenticated(text),
     }
 }
 
@@ -775,13 +847,12 @@ impl Broker for IggyBroker {
 
     async fn consumer_offset(
         &self,
-        caller: &Caller<'_>,
         tenant: &TenantId,
         topic: &Topic,
         consumer: &ConsumerName,
     ) -> Result<Option<u64>, BrokerError> {
-        let client = self.client_for(caller).await?;
-        let stored = client
+        let stored = self
+            .client
             .get_consumer_offset(
                 &named_consumer(consumer)?,
                 &stream_id(tenant)?,
@@ -793,24 +864,20 @@ impl Broker for IggyBroker {
             Ok(info) => Ok(info.map(|info| info.stored_offset)),
             // A consumer that has stored nothing is not an error.
             Err(IggyError::ConsumerOffsetNotFound(_)) => Ok(None),
-            Err(error) => self.settle(caller, Err(error)).await,
+            Err(error) => Err(map_iggy(error)),
         };
-        match caller {
-            Caller::Admin => self.ensured.forget_if_missing(tenant, result),
-            Caller::Credential(_) => result,
-        }
+        self.ensured.forget_if_missing(tenant, result)
     }
 
     async fn commit_offset(
         &self,
-        caller: &Caller<'_>,
         tenant: &TenantId,
         topic: &Topic,
         consumer: &ConsumerName,
         offset: u64,
     ) -> Result<(), BrokerError> {
-        let client = self.client_for(caller).await?;
-        let stored = client
+        let result = self
+            .client
             .store_consumer_offset(
                 &named_consumer(consumer)?,
                 &stream_id(tenant)?,
@@ -818,12 +885,9 @@ impl Broker for IggyBroker {
                 Some(PARTITION),
                 offset,
             )
-            .await;
-        let result = self.settle(caller, stored).await;
-        match caller {
-            Caller::Admin => self.ensured.forget_if_missing(tenant, result),
-            Caller::Credential(_) => result,
-        }
+            .await
+            .map_err(map_iggy);
+        self.ensured.forget_if_missing(tenant, result)
     }
 
     async fn system_append(&self, log: SystemLog, record: &[u8]) -> Result<(), BrokerError> {
@@ -884,23 +948,31 @@ impl Broker for IggyBroker {
         grants: &[Grant],
         ttl: Option<Duration>,
     ) -> Result<Minted, BrokerError> {
-        let _held = self.permissions.lock().await;
-        let (stream, topics) = self.stream_topics(tenant).await?;
         // Nobody is told this password: it is used once, to sign in as the
         // user and make its token, and then dropped.
         let password = Credential::random();
-        let made = self
-            .client
-            .create_user(
-                name,
-                password.expose(),
-                UserStatus::Active,
-                Some(permissions(stream, &topics, grants)),
-            )
-            .await
-            .map_err(map_iggy)?;
-        let user = BrokerUser(made.id);
-        self.users.set(user, tenant, grants);
+        let user = {
+            // Held until the user is remembered, so that a topic made in the
+            // meantime is opened to it; not held for the sign-in and the token.
+            let _held = self.permissions.lock().await;
+            let (stream, topics) = self
+                .stream_topics(tenant)
+                .await?
+                .ok_or_else(|| BrokerError::NotFound(format!("tenant {tenant}")))?;
+            let made = self
+                .client
+                .create_user(
+                    name,
+                    password.expose(),
+                    UserStatus::Active,
+                    Some(permissions(stream, &topics, grants)),
+                )
+                .await
+                .map_err(map_iggy)?;
+            let user = BrokerUser(made.id);
+            self.users.set(user, tenant, grants);
+            user
+        };
         match self.mint_token(name, &password, ttl).await {
             Ok(credential) => Ok(Minted { user, credential }),
             Err(error) => {
@@ -920,9 +992,25 @@ impl Broker for IggyBroker {
         grants: &[Grant],
     ) -> Result<(), BrokerError> {
         let _held = self.permissions.lock().await;
-        self.apply(user, tenant, grants).await?;
-        self.users.set(user, tenant, grants);
-        Ok(())
+        match self.apply(user, tenant, grants).await? {
+            Applied::Done => {
+                self.users.set(user, tenant, grants);
+                Ok(())
+            }
+            Applied::NoStream => Err(BrokerError::NotFound(format!("tenant {tenant}"))),
+            Applied::NoUser => Err(BrokerError::NotFound(format!("user {user}"))),
+        }
+    }
+
+    async fn list_users(&self) -> Result<Vec<BrokerUserInfo>, BrokerError> {
+        let users = self.client.get_users().await.map_err(map_iggy)?;
+        Ok(users
+            .into_iter()
+            .map(|found| BrokerUserInfo {
+                user: BrokerUser(found.id),
+                name: found.username,
+            })
+            .collect())
     }
 
     async fn delete_user(&self, user: BrokerUser) -> Result<(), BrokerError> {
@@ -1050,14 +1138,51 @@ mod tests {
             map_iggy(IggyError::CannotEstablishConnection),
             BrokerError::Unavailable(_)
         ));
-        assert!(matches!(
-            map_iggy(IggyError::Unauthorized),
-            BrokerError::Rejected(_)
-        ));
-        assert!(matches!(
-            map_iggy(IggyError::InvalidCredentials),
-            BrokerError::Rejected(_)
-        ));
+    }
+
+    #[test]
+    fn only_a_named_refusal_that_precedes_the_write_is_rejected() {
+        for refusal in [
+            IggyError::Unauthorized,
+            IggyError::InvalidIdentifier,
+            IggyError::InvalidStreamName,
+            IggyError::InvalidStreamId,
+            IggyError::InvalidTopicName,
+            IggyError::InvalidTopicId,
+            IggyError::InvalidMessagesCount,
+            IggyError::TooBigMessagePayload,
+        ] {
+            let text = refusal.to_string();
+            assert!(
+                matches!(map_iggy(refusal), BrokerError::Rejected(why) if why == text),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_error_that_can_follow_the_write_is_never_a_refusal() {
+        // What the TCP client raises once it has written a request and cannot
+        // make sense of the reply (a frame it cannot read, a status it does
+        // not know, an eviction whose reason it maps to a sign-in error): the
+        // outcome is not known, and a 502 would have the client believe
+        // nothing was stored.
+        for after_the_write in [
+            IggyError::InvalidCommand,
+            IggyError::Error,
+            IggyError::Unauthenticated,
+            IggyError::EmptyResponse,
+            IggyError::StaleClient,
+            IggyError::TransientNotCommitted,
+            IggyError::InvalidCredentials,
+            IggyError::CannotAppendMessage,
+        ] {
+            let text = after_the_write.to_string();
+            assert!(
+                matches!(map_iggy(after_the_write), BrokerError::Unavailable(why) if why == text),
+                "{text}"
+            );
+        }
     }
 
     #[test]
@@ -1093,6 +1218,35 @@ mod tests {
             map_iggy(IggyError::Unauthorized),
             BrokerError::Rejected(_)
         ));
+    }
+
+    #[test]
+    fn a_sign_in_iggy_refuses_is_an_invalid_token_unless_iggy_was_not_reached() {
+        for refused in [
+            IggyError::InvalidPersonalAccessToken,
+            IggyError::PersonalAccessTokenExpired("mansio".to_owned(), 7),
+            IggyError::Unauthenticated,
+            IggyError::InvalidCredentials,
+            IggyError::ResourceNotFound("user".to_owned()),
+            IggyError::Error,
+        ] {
+            let text = refused.to_string();
+            assert!(
+                matches!(login_failure(refused), BrokerError::Unauthenticated(why) if why == text),
+                "{text}"
+            );
+        }
+        for unreached in [
+            IggyError::Disconnected,
+            IggyError::CannotEstablishConnection,
+            IggyError::TcpError,
+            IggyError::TaskTimeout,
+        ] {
+            assert!(matches!(
+                login_failure(unreached),
+                BrokerError::Unavailable(_)
+            ));
+        }
     }
 
     #[test]
@@ -1173,7 +1327,7 @@ mod tests {
         let retention = Retention::default();
         let policy = DurabilityPolicy::default();
         for name in ["facts.build", "work.builds", "alerts", "dead"] {
-            let options = topic_options(&retention, &policy, &name.parse().unwrap());
+            let options = topic_options(&retention, &policy, 0, &name.parse().unwrap());
             assert_eq!(options.durability, IggyDurability::Persisted, "{name}");
             assert_eq!(
                 options.consumer_offset_durability,
@@ -1181,7 +1335,7 @@ mod tests {
                 "{name}"
             );
         }
-        let options = topic_options(&retention, &policy, &Topic::Presence);
+        let options = topic_options(&retention, &policy, 0, &Topic::Presence);
         assert_eq!(options.durability, IggyDurability::Replicated);
         assert_eq!(
             options.consumer_offset_durability,
@@ -1195,9 +1349,14 @@ mod tests {
             durable: Durability::Replicated,
             presence: Durability::Persisted,
         };
-        let facts = topic_options(&Retention::default(), &policy, &"facts.x".parse().unwrap());
+        let facts = topic_options(
+            &Retention::default(),
+            &policy,
+            0,
+            &"facts.x".parse().unwrap(),
+        );
         assert_eq!(facts.durability, IggyDurability::Replicated);
-        let presence = topic_options(&Retention::default(), &policy, &Topic::Presence);
+        let presence = topic_options(&Retention::default(), &policy, 0, &Topic::Presence);
         assert_eq!(presence.durability, IggyDurability::Persisted);
     }
 
@@ -1209,12 +1368,12 @@ mod tests {
         };
         let policy = DurabilityPolicy::default();
 
-        let kept = topic_options(&retention, &policy, &"work.builds".parse().unwrap());
+        let kept = topic_options(&retention, &policy, 0, &"work.builds".parse().unwrap());
         assert_eq!(kept.partitions_count, Some(1));
         assert_eq!(kept.message_expiry, Some(IggyExpiry::NeverExpire));
         assert_eq!(kept.max_topic_size, Some(MaxTopicSize::Unlimited));
 
-        let expiring = topic_options(&retention, &policy, &Topic::Presence);
+        let expiring = topic_options(&retention, &policy, 0, &Topic::Presence);
         assert_eq!(expiring.partitions_count, Some(1));
         assert_eq!(
             expiring.message_expiry,
@@ -1223,6 +1382,20 @@ mod tests {
             )))
         );
         assert_eq!(expiring.max_topic_size, None);
+    }
+
+    #[test]
+    fn the_segment_size_reaches_the_topic_and_zero_leaves_it_to_iggy() {
+        let (retention, policy) = (Retention::default(), DurabilityPolicy::default());
+        let topic: Topic = "alerts".parse().unwrap();
+        assert_eq!(
+            topic_options(&retention, &policy, 0, &topic).segment_size,
+            None
+        );
+        assert_eq!(
+            topic_options(&retention, &policy, 1024 * 1024, &topic).segment_size,
+            Some(IggyByteSize::new(1024 * 1024))
+        );
     }
 
     #[test]

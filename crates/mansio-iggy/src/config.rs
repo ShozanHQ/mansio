@@ -18,6 +18,30 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 pub const DEFAULT_LOCATE_WINDOW: u32 = 100;
 /// Default retention of `presence`, which is ephemeral.
 pub const DEFAULT_PRESENCE_RETENTION: Duration = Duration::from_secs(60 * 60);
+/// Smallest segment size Iggy admits for a topic.
+pub const MIN_SEGMENT_SIZE_BYTES: u64 = 1024 * 1024;
+/// Largest segment size Iggy admits for a topic, and what it uses when none
+/// is given.
+pub const MAX_SEGMENT_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Whether `bytes` is a segment size to give Iggy: 0, which leaves it to Iggy,
+/// or a multiple of 512 from [`MIN_SEGMENT_SIZE_BYTES`] to
+/// [`MAX_SEGMENT_SIZE_BYTES`].
+///
+/// # Errors
+///
+/// Returns what is wrong with it.
+pub fn check_segment_size(bytes: u64) -> Result<(), &'static str> {
+    if bytes == 0 {
+        Ok(())
+    } else if !(MIN_SEGMENT_SIZE_BYTES..=MAX_SEGMENT_SIZE_BYTES).contains(&bytes) {
+        Err("must be 0, or from 1048576 (1 MiB) to 1073741824 (1 GiB)")
+    } else if !bytes.is_multiple_of(512) {
+        Err("must be a multiple of 512")
+    } else {
+        Ok(())
+    }
+}
 
 /// How long Iggy keeps messages, per kind of topic. `None` keeps them
 /// forever.
@@ -147,11 +171,17 @@ pub struct IggyConfig {
     pub retention: Retention,
     /// When Iggy confirms a write, per kind of topic.
     pub durability: DurabilityPolicy,
+    /// The segment size of the topics mansio creates, in bytes; see
+    /// [`check_segment_size`]. Zero leaves it to Iggy, which uses 1 GiB. Iggy
+    /// applies retention to whole segments that have filled and rolled, never
+    /// to the one it is writing, so this is also how coarsely retention
+    /// trims a topic.
+    pub segment_size_bytes: u64,
 }
 
 impl IggyConfig {
-    /// A configuration with the default timeout, search window, retention and
-    /// durability.
+    /// A configuration with the default timeout, search window, retention,
+    /// durability and segment size.
     #[must_use]
     pub fn new(
         address: impl Into<String>,
@@ -166,6 +196,7 @@ impl IggyConfig {
             locate_window: DEFAULT_LOCATE_WINDOW,
             retention: Retention::default(),
             durability: DurabilityPolicy::default(),
+            segment_size_bytes: 0,
         }
     }
 }
@@ -219,6 +250,30 @@ mod tests {
         ] {
             assert_eq!(policy.for_kind(kind), Durability::Persisted);
         }
+    }
+
+    #[test]
+    fn a_segment_size_is_zero_or_a_multiple_of_512_within_iggys_bounds() {
+        for bytes in [
+            0,
+            MIN_SEGMENT_SIZE_BYTES,
+            3 * 1024 * 1024,
+            MAX_SEGMENT_SIZE_BYTES,
+        ] {
+            assert_eq!(check_segment_size(bytes), Ok(()), "{bytes}");
+        }
+        for bytes in [
+            1,
+            MIN_SEGMENT_SIZE_BYTES - 512,
+            MIN_SEGMENT_SIZE_BYTES + 1,
+            MAX_SEGMENT_SIZE_BYTES + 512,
+        ] {
+            assert!(check_segment_size(bytes).is_err(), "{bytes}");
+        }
+        assert_eq!(
+            IggyConfig::new("h:1", "u", SecretString::from("p".to_owned())).segment_size_bytes,
+            0
+        );
     }
 
     #[test]

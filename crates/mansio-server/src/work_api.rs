@@ -10,11 +10,21 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use mansio_core::api::{AckRequest, FailRequest, Published, PullRequest};
-use mansio_core::{Action, BrokerError, ItemId, Segment, TenantId, Topic};
+use mansio_core::{Action, BrokerError, ConsumerName, ItemId, LeaseId, Segment, TenantId, Topic};
 
 use crate::app::{AppState, Origin, build_envelope, parse_body, parse_part, read_body};
-use crate::auth::Authenticated;
+use crate::auth::{Actor, Authenticated};
+use crate::engine::Holder;
 use crate::error::ApiError;
+
+/// Who the request says holds the lease.
+fn holder<'a>(actor: &'a Actor, consumer: &'a ConsumerName, lease_id: &'a LeaseId) -> Holder<'a> {
+    Holder {
+        principal: actor.principal(),
+        consumer,
+        lease_id,
+    }
+}
 
 fn path_error(rejection: &PathRejection) -> ApiError {
     ApiError::BadRequest(rejection.body_text())
@@ -45,7 +55,7 @@ pub(crate) async fn work_publish(
     )?;
     let published = state
         .engine
-        .work_publish(&actor.caller(), envelope)
+        .work_publish(envelope)
         .await
         .map_err(|error| error.logged(&tenant, &topic))?;
     Ok((StatusCode::CREATED, Json(published)))
@@ -107,7 +117,12 @@ pub(crate) async fn work_ack(
     let request: AckRequest = parse_body(&read_body(&state, body)?)?;
     let published = state
         .engine
-        .work_ack(&tenant, &queue, &item, actor.principal(), &request.lease_id)
+        .work_ack(
+            &tenant,
+            &queue,
+            &item,
+            holder(&actor, &request.consumer, &request.lease_id),
+        )
         .await
         .map_err(|error| error.logged(&tenant, &Topic::Work(queue.clone())))?;
     Ok(Json(published))
@@ -137,8 +152,7 @@ pub(crate) async fn work_fail(
             &tenant,
             &queue,
             &item,
-            actor.principal(),
-            &request.lease_id,
+            holder(&actor, &request.consumer, &request.lease_id),
             &request.reason,
         )
         .await
@@ -169,7 +183,7 @@ pub(crate) async fn alerts_publish(
     )?;
     let published = state
         .engine
-        .publish(&actor.caller(), envelope)
+        .publish(envelope)
         .await
         .map_err(|error| error.logged(&tenant, &Topic::Alerts))?;
     Ok((StatusCode::CREATED, Json(published)))

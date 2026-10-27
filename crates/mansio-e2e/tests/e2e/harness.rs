@@ -32,7 +32,8 @@ use mansio_core::{
     Broker, BrokerError, Caller, Credential, Envelope, EventId, MemoryBroker, Timestamp,
 };
 use mansio_server::{
-    Auth, CredentialSettings, FileSink, Server, StreamSettings, WebhookSettings, WorkSettings,
+    Auth, CredentialSettings, FileSink, Limits, Server, StreamSettings, WebhookSettings,
+    WorkSettings,
 };
 use reqwest::{Method, StatusCode};
 use secrecy::SecretString;
@@ -95,6 +96,29 @@ fn local_webhook_settings() -> WebhookSettings {
     }
 }
 
+/// What the in-process server runs with: the API limits, the work settings,
+/// the credential settings, and how streams and webhooks behave.
+#[derive(Debug, Clone, Copy)]
+pub struct LocalSettings {
+    pub limits: Limits,
+    pub work: WorkSettings,
+    pub credentials: CredentialSettings,
+    pub streams: StreamSettings,
+    pub webhooks: WebhookSettings,
+}
+
+impl Default for LocalSettings {
+    fn default() -> Self {
+        Self {
+            limits: Limits::default(),
+            work: local_work_settings(),
+            credentials: local_credential_settings(),
+            streams: local_stream_settings(),
+            webhooks: local_webhook_settings(),
+        }
+    }
+}
+
 /// A server running in this process. It stops when dropped.
 struct LocalServer {
     base: String,
@@ -104,7 +128,11 @@ struct LocalServer {
 }
 
 impl LocalServer {
-    async fn start(broker: &Arc<MemoryBroker>, sink: &Path) -> anyhow::Result<Self> {
+    async fn start(
+        broker: &Arc<MemoryBroker>,
+        sink: &Path,
+        settings: LocalSettings,
+    ) -> anyhow::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let base = format!("http://{}", listener.local_addr()?);
         let auth = Auth::new(
@@ -113,10 +141,11 @@ impl LocalServer {
         );
         let server = Server::new(broker.clone(), auth)
             .with_sink(Arc::new(FileSink::open(sink).await?))
-            .with_work_settings(local_work_settings())?
-            .with_credential_settings(local_credential_settings())
-            .with_stream_settings(local_stream_settings())?
-            .with_webhook_settings(local_webhook_settings())?;
+            .with_limits(settings.limits)
+            .with_work_settings(settings.work)?
+            .with_credential_settings(settings.credentials)
+            .with_stream_settings(settings.streams)?
+            .with_webhook_settings(settings.webhooks)?;
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn(server.serve(listener, async move {
             let _ = stopped.await;
@@ -158,8 +187,9 @@ pub struct Target {
     pub tenant: String,
     pub settings: EffectiveSettings,
     sink: Option<PathBuf>,
-    /// The in-process broker and server, if there is one.
-    local: Option<(Arc<MemoryBroker>, Option<LocalServer>)>,
+    /// The in-process broker and server, if there is one, and what the server
+    /// runs with.
+    local: Option<(Arc<MemoryBroker>, Option<LocalServer>, LocalSettings)>,
 }
 
 impl Drop for Target {
@@ -171,8 +201,33 @@ impl Drop for Target {
 }
 
 impl Target {
+    /// A server to test against, and a tenant of its own on it: the live
+    /// server if `MANSIO_E2E_URL` is set, else one in this process.
     pub async fn start() -> anyhow::Result<Self> {
-        let tenant = format!("e2e-{}", EventId::generate().to_string().replace('-', ""));
+        Self::open(None, LocalSettings::default(), false).await
+    }
+
+    /// As [`Target::start`], with `settings` for the server in this process.
+    /// A live server runs with what it was started with.
+    pub async fn start_with(settings: LocalSettings) -> anyhow::Result<Self> {
+        Self::open(None, settings, false).await
+    }
+
+    /// The live server, which must be there: a test that needs one fails,
+    /// rather than passing without testing anything, when `MANSIO_E2E_URL` is
+    /// not set. With `tenant` it uses that one, as a second pass does after
+    /// a first on the same server; else a new one.
+    pub async fn live(tenant: Option<&str>) -> anyhow::Result<Self> {
+        Self::open(tenant.map(str::to_owned), LocalSettings::default(), true).await
+    }
+
+    async fn open(
+        tenant: Option<String>,
+        settings: LocalSettings,
+        live_only: bool,
+    ) -> anyhow::Result<Self> {
+        let tenant = tenant
+            .unwrap_or_else(|| format!("e2e-{}", EventId::generate().to_string().replace('-', "")));
         let http = reqwest::Client::new();
         if let Some(url) = std::env::var("MANSIO_E2E_URL")
             .ok()
@@ -181,7 +236,7 @@ impl Target {
             let token = std::env::var("MANSIO_TOKEN")
                 .context("MANSIO_TOKEN must be set when MANSIO_E2E_URL is")?;
             let base = url.trim_end_matches('/').to_owned();
-            let settings = read_settings(&http, &base, &token).await?;
+            let effective = read_settings(&http, &base, &token).await?;
             let sink = std::env::var_os("MANSIO_E2E_SINK_PATH")
                 .filter(|path| !path.is_empty())
                 .map(PathBuf::from);
@@ -190,23 +245,27 @@ impl Target {
                 token,
                 http,
                 tenant,
-                settings,
+                settings: effective,
                 sink,
                 local: None,
             });
         }
+        ensure!(
+            !live_only,
+            "MANSIO_E2E_URL is not set: this test runs against a live server and Iggy"
+        );
         let sink = std::env::temp_dir().join(format!("mansio-{tenant}.jsonl"));
         let broker = Arc::new(MemoryBroker::new());
-        let server = LocalServer::start(&broker, &sink).await?;
-        let settings = read_settings(&http, &server.base, LOCAL_TOKEN).await?;
+        let server = LocalServer::start(&broker, &sink, settings).await?;
+        let effective = read_settings(&http, &server.base, LOCAL_TOKEN).await?;
         Ok(Self {
             base: server.base.clone(),
             token: LOCAL_TOKEN.to_owned(),
             http,
             tenant,
-            settings,
+            settings: effective,
             sink: Some(sink),
-            local: Some((broker, Some(server))),
+            local: Some((broker, Some(server), settings)),
         })
     }
 
@@ -219,7 +278,7 @@ impl Target {
     /// Stop the in-process server, and wait until it and its timer are gone.
     /// The broker and the sink file stay.
     pub async fn stop_server(&mut self) -> anyhow::Result<()> {
-        let (_, server) = self.local.as_mut().context("the server is not local")?;
+        let (_, server, _) = self.local.as_mut().context("the server is not local")?;
         server
             .take()
             .context("the server is already stopped")?
@@ -231,9 +290,9 @@ impl Target {
     /// the last one used.
     pub async fn start_server(&mut self) -> anyhow::Result<()> {
         let sink = self.sink.clone().context("no sink file")?;
-        let (broker, server) = self.local.as_mut().context("the server is not local")?;
+        let (broker, server, settings) = self.local.as_mut().context("the server is not local")?;
         ensure!(server.is_none(), "the server is running");
-        let started = LocalServer::start(broker, &sink).await?;
+        let started = LocalServer::start(broker, &sink, *settings).await?;
         self.base = started.base.clone();
         *server = Some(started);
         Ok(())
@@ -375,11 +434,12 @@ impl Target {
         &self,
         queue: &str,
         item: &str,
+        consumer: &str,
         lease: &str,
     ) -> anyhow::Result<(StatusCode, Value)> {
         let uri = self.tenant_uri(&format!("work/{queue}/items/{item}/ack"));
-        self.authed(Method::POST, &uri, Some(&json!({ "lease_id": lease })))
-            .await
+        let body = json!({ "lease_id": lease, "consumer": consumer });
+        self.authed(Method::POST, &uri, Some(&body)).await
     }
 
     /// `work_fail`, answering whatever the server says.
@@ -387,18 +447,26 @@ impl Target {
         &self,
         queue: &str,
         item: &str,
+        consumer: &str,
         lease: &str,
         reason: &str,
     ) -> anyhow::Result<(StatusCode, Value)> {
         let uri = self.tenant_uri(&format!("work/{queue}/items/{item}/fail"));
-        let body = json!({ "lease_id": lease, "reason": reason });
+        let body = json!({ "lease_id": lease, "consumer": consumer, "reason": reason });
         self.authed(Method::POST, &uri, Some(&body)).await
     }
 
     /// Ack a claim, which must be accepted.
     pub async fn ack_claim(&self, queue: &str, claim: &Claimed) -> anyhow::Result<Published> {
         let item = item_of(claim)?;
-        let (status, response) = self.ack(queue, &item, &claim.lease_id.to_string()).await?;
+        let (status, response) = self
+            .ack(
+                queue,
+                &item,
+                claim.consumer.as_str(),
+                &claim.lease_id.to_string(),
+            )
+            .await?;
         ensure!(
             status == StatusCode::OK,
             "work_ack answered {status}: {response}"
@@ -415,7 +483,13 @@ impl Target {
     ) -> anyhow::Result<Published> {
         let item = item_of(claim)?;
         let (status, response) = self
-            .fail(queue, &item, &claim.lease_id.to_string(), reason)
+            .fail(
+                queue,
+                &item,
+                claim.consumer.as_str(),
+                &claim.lease_id.to_string(),
+                reason,
+            )
             .await?;
         ensure!(
             status == StatusCode::OK,
@@ -677,77 +751,71 @@ impl Target {
 
     // ---- the broker, not through the server ---------------------------------
 
+    /// Sign in to the broker with the credential, asked of the broker itself
+    /// and not of mansio-server: `None` if the broker will not have it. In
+    /// process the broker is the memory broker; against a live server it is
+    /// Iggy at `MANSIO_E2E_IGGY_ADDRESS`, which must be set.
+    pub async fn broker_session(&self, token: &str) -> anyhow::Result<Option<Direct>> {
+        if let Some((broker, _, _)) = &self.local {
+            let credential = Credential::new(token);
+            return Ok(match broker.identify(&credential).await {
+                Ok(_) => Some(Direct(DirectKind::Memory {
+                    broker: Arc::clone(broker),
+                    credential,
+                })),
+                Err(_) => None,
+            });
+        }
+        let client = iggy_client(&iggy_address()?).await?;
+        Ok(match client.login_with_personal_access_token(token).await {
+            Ok(_) => Some(Direct(DirectKind::Iggy(client))),
+            Err(_) => {
+                let _ = client.shutdown().await;
+                None
+            }
+        })
+    }
+
+    /// Whether the broker still signs in as the credential:
+    /// [`Outcome::Accepted`] if it does.
+    pub async fn broker_login(&self, token: &str) -> anyhow::Result<Outcome> {
+        Ok(match self.broker_session(token).await? {
+            Some(session) => {
+                session.close().await;
+                Outcome::Accepted
+            }
+            None => Outcome::Unauthenticated,
+        })
+    }
+
+    /// Whether the broker lets the credential read the topic of the tenant.
+    pub async fn broker_poll(
+        &self,
+        token: &str,
+        tenant: &str,
+        topic: &str,
+    ) -> anyhow::Result<Outcome> {
+        let Some(session) = self.broker_session(token).await? else {
+            return Ok(Outcome::Unauthenticated);
+        };
+        let outcome = session.poll(tenant, topic).await?;
+        session.close().await;
+        Ok(outcome)
+    }
+
     /// Whether the broker lets the credential send a message to the topic of
-    /// the tenant, asked of the broker itself and not of mansio-server. In
-    /// process that is the memory broker; against a live server it is Iggy at
-    /// `MANSIO_E2E_IGGY_ADDRESS`, which must be set.
+    /// the tenant. It never does: a credential reads, and the server writes.
     pub async fn broker_send(
         &self,
         token: &str,
         tenant: &str,
         topic: &str,
     ) -> anyhow::Result<Outcome> {
-        let envelope = Envelope::new(
-            EventId::generate(),
-            "e2e".parse()?,
-            "e2e.direct".parse()?,
-            tenant.parse()?,
-            topic.parse()?,
-            "agent:direct".parse()?,
-        );
-        if let Some((broker, _)) = &self.local {
-            let credential = Credential::new(token);
-            return Ok(
-                match broker
-                    .publish(&Caller::Credential(&credential), &envelope)
-                    .await
-                {
-                    Ok(_) => Outcome::Accepted,
-                    Err(error) => outcome_of(&error),
-                },
-            );
-        }
-        let client = iggy_client(&iggy_address()?).await?;
-        let outcome = match client.login_with_personal_access_token(token).await {
-            Err(_) => Outcome::Unauthenticated,
-            Ok(_) => {
-                let mut message = IggyMessage::builder()
-                    .id(envelope.id.as_u128())
-                    .payload(envelope.to_json_vec()?.into())
-                    .build()?;
-                match client
-                    .send_messages(
-                        &iggy::prelude::Identifier::named(tenant)?,
-                        &iggy::prelude::Identifier::named(topic)?,
-                        &Partitioning::partition_id(0),
-                        std::slice::from_mut(&mut message),
-                    )
-                    .await
-                {
-                    Ok(_) => Outcome::Accepted,
-                    Err(error) => iggy_outcome(error),
-                }
-            }
+        let Some(session) = self.broker_session(token).await? else {
+            return Ok(Outcome::Unauthenticated);
         };
-        let _ = client.shutdown().await;
-        Ok(outcome)
-    }
-
-    /// Whether the broker still signs in as the credential, asked of the
-    /// broker itself: [`Outcome::Accepted`] if it does.
-    pub async fn broker_login(&self, token: &str) -> anyhow::Result<Outcome> {
-        if let Some((broker, _)) = &self.local {
-            return Ok(match broker.identify(&Credential::new(token)).await {
-                Ok(_) => Outcome::Accepted,
-                Err(error) => outcome_of(&error),
-            });
-        }
-        let client = iggy_client(&iggy_address()?).await?;
-        let outcome = match client.login_with_personal_access_token(token).await {
-            Ok(_) => Outcome::Accepted,
-            Err(_) => Outcome::Unauthenticated,
-        };
-        let _ = client.shutdown().await;
+        let outcome = session.send(tenant, topic).await?;
+        session.close().await;
         Ok(outcome)
     }
 
@@ -770,18 +838,55 @@ impl Target {
         if self.local.is_some() {
             return Ok(None);
         }
-        let client = iggy_client(&iggy_address()?).await?;
-        let outcome = match client.login_with_personal_access_token(token).await {
-            Err(_) => Outcome::Unauthenticated,
-            Ok(_) => {
+        let Some(session) = self.broker_session(token).await? else {
+            return Ok(Some(Outcome::Unauthenticated));
+        };
+        let outcome = session.poll(mansio_iggy::SYSTEM_STREAM, topic).await?;
+        session.close().await;
+        Ok(Some(outcome))
+    }
+}
+
+/// A session with the broker opened with a credential, kept open to show what
+/// the broker does with it later.
+pub struct Direct(DirectKind);
+
+enum DirectKind {
+    Memory {
+        broker: Arc<MemoryBroker>,
+        credential: Credential,
+    },
+    Iggy(iggy::prelude::IggyClient),
+}
+
+impl Direct {
+    /// Read one message of the topic.
+    pub async fn poll(&self, tenant: &str, topic: &str) -> anyhow::Result<Outcome> {
+        Ok(match &self.0 {
+            DirectKind::Memory { broker, credential } => {
+                match broker
+                    .poll(
+                        &Caller::Credential(credential),
+                        &tenant.parse()?,
+                        &topic.parse()?,
+                        0,
+                        1,
+                    )
+                    .await
+                {
+                    Ok(_) => Outcome::Accepted,
+                    Err(error) => outcome_of(&error),
+                }
+            }
+            DirectKind::Iggy(client) => {
                 match client
                     .poll_messages(
-                        &iggy::prelude::Identifier::named(mansio_iggy::SYSTEM_STREAM)?,
+                        &iggy::prelude::Identifier::named(tenant)?,
                         &iggy::prelude::Identifier::named(topic)?,
                         Some(0),
                         &iggy::prelude::Consumer::default(),
                         &iggy::prelude::PollingStrategy::offset(0),
-                        10,
+                        1,
                         false,
                     )
                     .await
@@ -790,9 +895,69 @@ impl Target {
                     Err(error) => iggy_outcome(error),
                 }
             }
-        };
-        let _ = client.shutdown().await;
-        Ok(Some(outcome))
+        })
+    }
+
+    /// Send a message to the topic.
+    pub async fn send(&self, tenant: &str, topic: &str) -> anyhow::Result<Outcome> {
+        let envelope = Envelope::new(
+            EventId::generate(),
+            "e2e".parse()?,
+            "e2e.direct".parse()?,
+            tenant.parse()?,
+            topic.parse()?,
+            "agent:direct".parse()?,
+        );
+        Ok(match &self.0 {
+            DirectKind::Memory { broker, credential } => {
+                match broker
+                    .publish(&Caller::Credential(credential), &envelope)
+                    .await
+                {
+                    Ok(_) => Outcome::Accepted,
+                    Err(error) => outcome_of(&error),
+                }
+            }
+            DirectKind::Iggy(client) => {
+                let mut message = IggyMessage::builder()
+                    .id(envelope.id.as_u128())
+                    .payload(envelope.to_json_vec()?.into())
+                    .build()?;
+                match client
+                    .send_messages(
+                        &iggy::prelude::Identifier::named(tenant)?,
+                        &iggy::prelude::Identifier::named(topic)?,
+                        &Partitioning::partition_id(0),
+                        std::slice::from_mut(&mut message),
+                    )
+                    .await
+                {
+                    Ok(_) => Outcome::Accepted,
+                    Err(error) => iggy_outcome(error),
+                }
+            }
+        })
+    }
+
+    /// Make a token that never expires for the signed-in user, which Iggy lets
+    /// any signed-in user do. `None` in process, where the memory broker has no
+    /// such call, or if Iggy refuses.
+    pub async fn mint_token(&self) -> Option<String> {
+        match &self.0 {
+            DirectKind::Memory { .. } => None,
+            DirectKind::Iggy(client) => client
+                .create_personal_access_token("mine", iggy::prelude::IggyExpiry::NeverExpire)
+                .await
+                .ok()
+                .map(|raw| raw.token),
+        }
+    }
+
+    /// End the session.
+    pub async fn close(self) {
+        if let DirectKind::Iggy(client) = self.0 {
+            let _ = client.shutdown().await;
+        }
     }
 }
 
@@ -935,7 +1100,7 @@ impl Issued {
             .as_str()
             .context("a claim names its item")?;
         let uri = self.tenant_uri(&self.tenant, &format!("work/{queue}/items/{item}/ack"));
-        let body = json!({"lease_id": claim["lease_id"]});
+        let body = json!({"lease_id": claim["lease_id"], "consumer": claim["consumer"]});
         self.call(Method::POST, &uri, Some(&body)).await
     }
 

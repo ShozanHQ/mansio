@@ -43,16 +43,27 @@ All notable changes to mansio are listed here. The format follows
   `MANSIO_TICK_MILLIS`.
 - `Broker::tenants` and `Broker::topics`, so a server can find what to take up
   again on start.
+- `MANSIO_IGGY_SEGMENT_SIZE_BYTES`, the segment size of the topics mansio
+  creates. Iggy applies retention to whole segments that have filled and
+  rolled.
+- Two-pass end-to-end tests that restart mansio-server between the passes, run
+  by the CI `e2e` job against Iggy: a queue longer than a page with a claimed
+  item, and an `alerts` topic that retention has trimmed.
 - Credentials. The admin API (`principals_create`, `principals_list`,
   `principals_revoke`: `POST /v1/principals`, `GET /v1/principals?tenant=`,
   `DELETE /v1/principals/{id}`) issues a credential to a principal with scopes
   (topic patterns and the verbs `publish`, `subscribe`, `claim`, `ack`,
-  `approve`). The credential is a personal access token of an Iggy user with
-  permissions on exactly its tenant's stream and the topics its scopes cover,
-  so the broker refuses the rest. It expires (an agent's always does), a
-  revocation deletes the user, and a sweep revokes the expired. Each issue and
-  revoke is recorded on `facts.principal` and in the sink first, and the
-  principals are kept in a log in the broker that no credential can read.
+  `approve`). The credential is a personal access token of an Iggy user that
+  may read exactly the topics of its tenant that its scopes cover and send to
+  nothing: every write goes through the server, which checks the `publish`
+  scope, stamps the principal from the credential and writes as its own admin
+  identity. A scope may not grant `publish` on a topic only mansio writes
+  (`facts.work`, `facts.alert`, `facts.principal`, `dead`). The credential
+  expires (an agent's always does), a revocation deletes the user, and a sweep
+  revokes the expired. Each issue and revoke is recorded on `facts.principal`
+  and in the sink first, and the principals are kept in a log in the broker
+  that no credential can read. On start the server deletes every broker user it
+  made for a principal that no record owns.
 - `MemoryBroker` holds users, scopes and expiring credentials as Iggy does, so
   credentials are tested without Iggy.
 - `mansio-server provision-admin`, which makes the Iggy user the server acts
@@ -63,23 +74,39 @@ All notable changes to mansio are listed here. The format follows
 
 ### Changed
 
+- A broker error is a 502 only when it is a refusal the broker named before it
+  stores anything (not found, unauthorized, an invalid identifier, a message
+  count or payload size it refuses). Every other Iggy error is a 503, because
+  the Iggy client writes a request before it reads the reply, and a reply it
+  cannot read says nothing about whether the write was applied. A 503 is
+  resent with the same id, and the engine rebuilds the tenant's state after
+  one.
 - Every durable publish holds a per-tenant lock across the sink record and the
   broker publish, so the sink sees a tenant's messages in the order its topics
   hold them.
-- The generic messages route refuses `work.<queue>`, `facts.work` and
-  `facts.alert`.
+- The generic messages route refuses `work.<queue>`, `facts.work`,
+  `facts.alert` and `dead`.
 - An item id and an alert id are used once: resending one the queue or tenant
   has had is a 409.
 - After a publish fails, which may still have stored the message, the engine
   rebuilds the tenant's state from its topics.
 - `Server::with_work_settings` checks the settings and returns an error.
 - `compose.yaml` passes the work settings through, and keeps the sink file in
-  `MANSIO_SINK_DIR` when it is set.- Every request is authenticated by its bearer credential and acts through the
-  broker as that credential; the bootstrap `MANSIO_TOKEN` is the admin's.
-  `Broker::publish` and `Broker::poll` take a `Caller`, and `Server::build`
-  returns the routes, the engine and the credentials as `Parts`.
+  `MANSIO_SINK_DIR` when it is set. The health check of mansio-server has a
+  start period of `MANSIO_HEALTH_START_PERIOD` (60s), because a start replays
+  every tenant's topics before `/healthz` answers.
+- Every request is authenticated by its bearer credential; the bootstrap
+  `MANSIO_TOKEN` is the admin's. Reads go through the broker as that
+  credential. `Broker::publish` and `Broker::poll` take a `Caller`, and a
+  credential's publish is refused by the broker. `Server::build` returns the
+  routes, the engine and the credentials as `Parts`.
+- The `facts.work` facts record a fingerprint of a lease (`lease`), never its
+  id, which is the holder's proof and was readable by every subscriber of
+  `facts.*`. The holder is the principal, the consumer name and the lease id:
+  `work_ack` and `work_fail` name the `consumer`, and `work_pull` answers with
+  it.
 - A read no longer makes a stream or a topic: a topic nobody has published to is
-  a 404. The generic messages route also refuses `facts.principal`.
+  a 404. The generic messages route also refuses `facts.principal` and `dead`.
 - mansio-server no longer acts as Iggy's root user. `MANSIO_IGGY_USERNAME`
   defaults to `mansio`, the user `iggy-admin` makes; the root password is given
   to Iggy and `iggy-admin` only. `compose.yaml` publishes Iggy's TCP port on

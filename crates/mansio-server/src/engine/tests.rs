@@ -162,6 +162,7 @@ impl Broker for FlakyBroker {
 #[derive(Debug, Default)]
 struct LogSink {
     seen: StdMutex<Vec<(String, EventId)>>,
+    envelopes: StdMutex<Vec<Envelope>>,
     calls: AtomicU64,
     slow_start: bool,
 }
@@ -174,6 +175,7 @@ impl Sink for LogSink {
             .lock()
             .unwrap()
             .push((envelope.topic.to_string(), envelope.id));
+        self.envelopes.lock().unwrap().push(envelope.clone());
         if self.slow_start {
             // The record is made; the answer is slow. Without a lock, a later
             // publish overtakes an earlier one on its way to the broker.
@@ -197,6 +199,25 @@ impl LogSink {
     fn all(&self) -> Vec<(String, EventId)> {
         self.seen.lock().unwrap().clone()
     }
+
+    fn all_envelopes(&self) -> Vec<Envelope> {
+        self.envelopes.lock().unwrap().clone()
+    }
+}
+
+/// The consumer name each lease was taken under, so that an ack or a fail can
+/// name it as the holder must. Lease ids are random, so tests do not meet each
+/// other's.
+static TAKEN_AS: std::sync::LazyLock<StdMutex<std::collections::HashMap<LeaseId, ConsumerName>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn taken_as(lease: &LeaseId) -> ConsumerName {
+    TAKEN_AS
+        .lock()
+        .unwrap()
+        .get(lease)
+        .cloned()
+        .unwrap_or_else(|| consumer("w1"))
 }
 
 struct Rig {
@@ -257,7 +278,7 @@ impl Rig {
     async fn publish_item(&self, name: &str) -> ItemId {
         let id = EventId::generate();
         self.engine
-            .work_publish(&Caller::Admin, item_envelope(id, name))
+            .work_publish(item_envelope(id, name))
             .await
             .unwrap();
         id.to_string().parse().unwrap()
@@ -272,21 +293,46 @@ impl Rig {
 
     /// A pull by `who` under the consumer name given.
     async fn pull_as(&self, who: &str, name: &str) -> Option<Claimed> {
-        self.engine
+        let claim = self
+            .engine
             .work_pull(&tenant(), &queue(), &agent(who), &consumer(name))
             .await
+            .unwrap()?;
+        TAKEN_AS
+            .lock()
             .unwrap()
+            .insert(claim.lease_id, claim.consumer.clone());
+        Some(claim)
     }
 
     async fn ack(&self, who: &str, item: &ItemId, lease: &LeaseId) -> Result<Published, ApiError> {
         self.engine
-            .work_ack(&tenant(), &queue(), item, &agent(who), lease)
+            .work_ack(
+                &tenant(),
+                &queue(),
+                item,
+                Holder {
+                    principal: &agent(who),
+                    consumer: &taken_as(lease),
+                    lease_id: lease,
+                },
+            )
             .await
     }
 
     async fn fail(&self, who: &str, item: &ItemId, lease: &LeaseId) -> Result<Published, ApiError> {
         self.engine
-            .work_fail(&tenant(), &queue(), item, &agent(who), lease, "it broke")
+            .work_fail(
+                &tenant(),
+                &queue(),
+                item,
+                Holder {
+                    principal: &agent(who),
+                    consumer: &taken_as(lease),
+                    lease_id: lease,
+                },
+                "it broke",
+            )
             .await
     }
 
@@ -359,7 +405,8 @@ async fn a_claim_hands_out_the_oldest_item_and_hides_it_from_everyone_else() {
     assert_eq!(claimed["holder"], "agent:one");
     assert_eq!(claimed["consumer"], "w1");
     assert_eq!(claimed["attempt"], 1);
-    assert_eq!(claimed["lease_id"], one.lease_id.to_string());
+    assert_eq!(claimed["lease"], one.lease_id.fingerprint().to_string());
+    assert!(claimed.get("lease_id").is_none(), "the id is not recorded");
     assert_eq!(claimed["message_id"], one.item.id.to_string());
     assert_eq!(facts[0].principal, agent("one"));
 }
@@ -418,13 +465,36 @@ async fn a_lease_that_has_run_out_is_not_given_again() {
 }
 
 #[tokio::test]
-async fn a_restarted_server_gives_a_consumer_the_lease_it_held() {
+async fn a_restarted_server_gives_a_consumer_a_new_id_for_the_lease_it_held() {
     let rig = Rig::new();
-    rig.publish_item("first").await;
+    let item = rig.publish_item("first").await;
     rig.publish_item("second").await;
     let claim = rig.pull_as("one", "worker").await.unwrap();
+
+    // The facts keep a fingerprint of the lease id and not the id, so a server
+    // that has only read them cannot say it again. It gives the same item, the
+    // same expiry and a new id, and records that.
     let rig = rig.restart().await;
-    assert_eq!(rig.pull_as("one", "worker").await.unwrap(), claim);
+    let again = rig.pull_as("one", "worker").await.unwrap();
+    assert_eq!(again.item, claim.item);
+    assert_eq!(again.expires_at, claim.expires_at);
+    assert_ne!(again.lease_id, claim.lease_id);
+    assert_eq!(rig.transitions().await, ["claimed", "claimed"]);
+    assert!(matches!(
+        rig.ack("one", &item, &claim.lease_id).await,
+        Err(ApiError::Forbidden(_))
+    ));
+
+    // Asked once more it is the same lease, and nothing more is recorded.
+    assert_eq!(rig.pull_as("one", "worker").await.unwrap(), again);
+    assert_eq!(rig.transitions().await, ["claimed", "claimed"]);
+
+    // The new id is the lease, and survives another restart as a fingerprint.
+    let rig = rig.restart().await;
+    rig.ack("one", &item, &again.lease_id).await.unwrap();
+    assert!(rig.pull_as("one", "worker").await.is_some_and(|next| {
+        next.item.subject.as_ref().map(ToString::to_string) == Some("second".to_owned())
+    }));
 }
 
 #[tokio::test]
@@ -519,7 +589,10 @@ async fn an_unacked_claim_expires_and_the_item_comes_back_one_attempt_on_after_t
     assert_eq!(rig.transitions().await, ["claimed", "expired"]);
     let facts = rig.read(&Topic::facts_work()).await;
     assert_eq!(facts[1].principal.to_string(), "service:mansio-engine");
-    assert_eq!(data(&facts[1])["lease_id"], first.lease_id.to_string());
+    assert_eq!(
+        data(&facts[1])["lease"],
+        first.lease_id.fingerprint().to_string()
+    );
     assert_eq!(data(&facts[1])["holder"], "agent:one");
     assert_eq!(data(&facts[1])["next"], "retry");
     assert_eq!(
@@ -692,11 +765,11 @@ async fn publishing_work_through_the_generic_route_is_refused() {
         Topic::Work(queue()),
         agent("planner"),
     );
-    for topic in ["work.builds", "facts.work", "facts.alert"] {
+    for topic in ["work.builds", "facts.work", "facts.alert", "dead"] {
         message.topic = topic.parse().unwrap();
         assert!(
             matches!(
-                rig.engine.publish(&Caller::Admin, message.clone()).await,
+                rig.engine.publish(message.clone()).await,
                 Err(ApiError::BadRequest(_))
             ),
             "{topic}"
@@ -704,7 +777,29 @@ async fn publishing_work_through_the_generic_route_is_refused() {
     }
     assert!(rig.sink.all().is_empty());
     message.topic = "facts.build".parse().unwrap();
-    assert!(rig.engine.publish(&Caller::Admin, message).await.is_ok());
+    assert!(rig.engine.publish(message).await.is_ok());
+}
+
+/// The replay takes a copy on `dead` for an item's own dead letter, so a copy
+/// a caller could write there would finish an open item without running it.
+#[tokio::test]
+async fn a_crafted_copy_on_dead_cannot_finish_an_open_item() {
+    let rig = Rig::new();
+    let item = rig.publish_item("job").await;
+    let original = rig.read(&Topic::Work(queue())).await.remove(0);
+    let mut crafted = original.clone();
+    crafted.id = EventId::generate();
+    crafted.topic = Topic::Dead;
+    crafted.causation_id = Some(original.id.to_string().parse().unwrap());
+    assert!(matches!(
+        rig.engine.publish(crafted).await,
+        Err(ApiError::BadRequest(_))
+    ));
+    assert!(rig.read(&Topic::Dead).await.is_empty());
+
+    let rig = rig.restart().await;
+    let claimed = rig.pull("one").await.expect("the item is still open");
+    assert_eq!(claimed.item.item_id, Some(item));
 }
 
 #[tokio::test]
@@ -714,11 +809,7 @@ async fn an_item_id_that_is_still_open_cannot_be_published_again() {
     let published = rig.read(&Topic::Work(queue())).await;
     let again = published[0].clone();
     assert_eq!(again.item_id, Some(item));
-    let error = rig
-        .engine
-        .work_publish(&Caller::Admin, again)
-        .await
-        .unwrap_err();
+    let error = rig.engine.work_publish(again).await.unwrap_err();
     assert!(matches!(error, ApiError::Conflict(_)));
     assert_eq!(rig.read(&Topic::Work(queue())).await.len(), 1);
 }
@@ -739,7 +830,7 @@ fn alert_envelope(id: EventId, at: i64) -> Envelope {
 async fn publish_alert(rig: &Rig) -> EventId {
     let id = EventId::generate();
     rig.engine
-        .publish(&Caller::Admin, alert_envelope(id, rig.clock.now_millis()))
+        .publish(alert_envelope(id, rig.clock.now_millis()))
         .await
         .unwrap();
     id
@@ -1083,7 +1174,7 @@ async fn concurrent_publishes_reach_the_sink_in_the_order_they_reach_the_topic()
                 agent("one"),
             );
             message.data = Some(json!({"n": n}));
-            engine.publish(&Caller::Admin, message).await.unwrap();
+            engine.publish(message).await.unwrap();
         }));
     }
     for publish in publishes {
@@ -1147,10 +1238,7 @@ async fn a_work_item_that_was_stored_but_whose_publish_errored_is_still_claimabl
     let rig = Rig::new();
     rig.broker.lose_the_answer("work.builds");
     let id = EventId::generate();
-    let refused = rig
-        .engine
-        .work_publish(&Caller::Admin, item_envelope(id, "job"))
-        .await;
+    let refused = rig.engine.work_publish(item_envelope(id, "job")).await;
     assert!(matches!(refused, Err(ApiError::Unavailable(_))));
     assert_eq!(
         rig.read(&Topic::Work(queue())).await.len(),
@@ -1219,17 +1307,14 @@ async fn an_item_id_is_not_reused_after_the_item_is_done() {
     let rig = Rig::new();
     let id = EventId::generate();
     rig.engine
-        .work_publish(&Caller::Admin, item_envelope(id, "job"))
+        .work_publish(item_envelope(id, "job"))
         .await
         .unwrap();
     let item: ItemId = id.to_string().parse().unwrap();
     let claim = rig.pull("one").await.unwrap();
     rig.ack("one", &item, &claim.lease_id).await.unwrap();
 
-    let again = rig
-        .engine
-        .work_publish(&Caller::Admin, item_envelope(id, "job"))
-        .await;
+    let again = rig.engine.work_publish(item_envelope(id, "job")).await;
     assert!(matches!(again, Err(ApiError::Conflict(_))), "{again:?}");
     assert!(
         rig.pull("two").await.is_none(),
@@ -1238,10 +1323,7 @@ async fn an_item_id_is_not_reused_after_the_item_is_done() {
 
     let rig = rig.restart().await;
     assert!(rig.pull("two").await.is_none());
-    let again = rig
-        .engine
-        .work_publish(&Caller::Admin, item_envelope(id, "job"))
-        .await;
+    let again = rig.engine.work_publish(item_envelope(id, "job")).await;
     assert!(matches!(again, Err(ApiError::Conflict(_))), "{again:?}");
     assert_eq!(rig.read(&Topic::Work(queue())).await.len(), 1);
 }
@@ -1251,7 +1333,7 @@ async fn an_item_id_is_not_reused_after_the_item_is_dead() {
     let rig = Rig::new();
     let id = EventId::generate();
     rig.engine
-        .work_publish(&Caller::Admin, item_envelope(id, "job"))
+        .work_publish(item_envelope(id, "job"))
         .await
         .unwrap();
     let item: ItemId = id.to_string().parse().unwrap();
@@ -1262,16 +1344,10 @@ async fn an_item_id_is_not_reused_after_the_item_is_dead() {
     }
     assert_eq!(rig.read(&Topic::Dead).await.len(), 1);
 
-    let refused = rig
-        .engine
-        .work_publish(&Caller::Admin, item_envelope(id, "job"))
-        .await;
+    let refused = rig.engine.work_publish(item_envelope(id, "job")).await;
     assert!(matches!(refused, Err(ApiError::Conflict(_))));
     let rig = rig.restart().await;
-    let refused = rig
-        .engine
-        .work_publish(&Caller::Admin, item_envelope(id, "job"))
-        .await;
+    let refused = rig.engine.work_publish(item_envelope(id, "job")).await;
     assert!(matches!(refused, Err(ApiError::Conflict(_))));
     assert!(rig.pull("two").await.is_none());
 }
@@ -1280,15 +1356,9 @@ async fn an_item_id_is_not_reused_after_the_item_is_dead() {
 async fn a_resent_alert_is_refused_and_does_not_reopen_it() {
     let rig = Rig::new();
     let id = EventId::generate();
-    rig.engine
-        .publish(&Caller::Admin, alert_envelope(id, START))
-        .await
-        .unwrap();
+    rig.engine.publish(alert_envelope(id, START)).await.unwrap();
     // Unacknowledged, a resend is refused and publishes nothing.
-    let resent = rig
-        .engine
-        .publish(&Caller::Admin, alert_envelope(id, START))
-        .await;
+    let resent = rig.engine.publish(alert_envelope(id, START)).await;
     assert!(matches!(resent, Err(ApiError::Conflict(_))), "{resent:?}");
     assert_eq!(rig.read(&Topic::Alerts).await.len(), 1);
 
@@ -1297,10 +1367,7 @@ async fn a_resent_alert_is_refused_and_does_not_reopen_it() {
         .await
         .unwrap();
     // Acknowledged, a resend does not make it acknowledgeable again.
-    let resent = rig
-        .engine
-        .publish(&Caller::Admin, alert_envelope(id, START))
-        .await;
+    let resent = rig.engine.publish(alert_envelope(id, START)).await;
     assert!(matches!(resent, Err(ApiError::Conflict(_))), "{resent:?}");
     let again = rig.engine.alerts_ack(&tenant(), id, &agent("sam")).await;
     assert!(matches!(again, Err(ApiError::Conflict(_))));
@@ -1322,10 +1389,7 @@ async fn one_item_whose_retry_keeps_failing_does_not_stall_the_rest_of_the_tenan
     let poison = EventId::generate();
     let mut message = item_envelope(poison, "poison");
     message.event_type = "poison.job".parse().unwrap();
-    rig.engine
-        .work_publish(&Caller::Admin, message)
-        .await
-        .unwrap();
+    rig.engine.work_publish(message).await.unwrap();
     let healthy = rig.publish_item("healthy").await;
     let alert = publish_alert(&rig).await;
 
@@ -1365,7 +1429,7 @@ async fn an_alert_with_a_time_in_the_future_is_still_surfaced_again() {
     let id = EventId::generate();
     let tomorrow = START + 86_400_000;
     rig.engine
-        .publish(&Caller::Admin, alert_envelope(id, tomorrow))
+        .publish(alert_envelope(id, tomorrow))
         .await
         .unwrap();
     rig.pass(29).await;
@@ -1553,7 +1617,7 @@ async fn a_broker_that_cannot_be_reached_costs_at_most_one_rebuild_per_tick() {
     for n in 0..50 {
         let id = EventId::generate();
         engine
-            .work_publish(&Caller::Admin, item_envelope(id, &format!("job-{n}")))
+            .work_publish(item_envelope(id, &format!("job-{n}")))
             .await
             .unwrap();
     }
@@ -1610,7 +1674,7 @@ async fn a_refusal_rebuilds_nothing_and_a_lost_answer_at_most_once_per_tick() {
         let poison = EventId::generate();
         let mut message = item_envelope(poison, "poison");
         message.event_type = "poison.job".parse().unwrap();
-        engine.work_publish(&Caller::Admin, message).await.unwrap();
+        engine.work_publish(message).await.unwrap();
         let claim = engine
             .work_pull(&tenant(), &queue(), &agent("a"), &consumer("w"))
             .await
@@ -1621,8 +1685,11 @@ async fn a_refusal_rebuilds_nothing_and_a_lost_answer_at_most_once_per_tick() {
                 &tenant(),
                 &queue(),
                 &poison.to_string().parse().unwrap(),
-                &agent("a"),
-                &claim.lease_id,
+                Holder {
+                    principal: &agent("a"),
+                    consumer: &consumer("w"),
+                    lease_id: &claim.lease_id,
+                },
                 "x",
             )
             .await
@@ -1657,10 +1724,7 @@ async fn stepping_over_an_unreadable_message_does_not_read_the_page_again() {
     let (writer, flaky, counting, _) = counted_engine(page);
     for n in 0..page {
         writer
-            .work_publish(
-                &Caller::Admin,
-                item_envelope(EventId::generate(), &format!("job-{n}")),
-            )
+            .work_publish(item_envelope(EventId::generate(), &format!("job-{n}")))
             .await
             .unwrap();
     }
@@ -1706,7 +1770,7 @@ async fn an_alert_keeps_the_time_it_was_accepted_when_the_state_is_rebuilt() {
     let id = EventId::generate();
     // A producer's time from long ago, accepted now.
     rig.engine
-        .publish(&Caller::Admin, alert_envelope(id, START - 86_400_000))
+        .publish(alert_envelope(id, START - 86_400_000))
         .await
         .unwrap();
 
@@ -1715,7 +1779,7 @@ async fn an_alert_keeps_the_time_it_was_accepted_when_the_state_is_rebuilt() {
     rig.broker.lose_the_answer("work.builds");
     let lost = rig
         .engine
-        .work_publish(&Caller::Admin, item_envelope(EventId::generate(), "x"))
+        .work_publish(item_envelope(EventId::generate(), "x"))
         .await;
     assert!(lost.is_err());
     rig.pass(1).await;
@@ -1727,4 +1791,81 @@ async fn an_alert_keeps_the_time_it_was_accepted_when_the_state_is_rebuilt() {
     assert!(alert_facts(&rig).await.is_empty());
     rig.pass(1).await;
     assert_eq!(alert_facts(&rig).await, ["resurfaced"]);
+}
+
+/// The lease id is the holder's proof, and `facts.work` is readable by anyone
+/// who may subscribe to `facts.*`: neither it nor the sink holds an id.
+#[tokio::test]
+async fn no_fact_and_no_sink_record_holds_a_lease_id() {
+    let rig = Rig::new();
+    let item = rig.publish_item("job").await;
+    let first = rig.pull("one").await.unwrap();
+    rig.fail("one", &item, &first.lease_id).await.unwrap();
+    rig.pass(100).await;
+    let second = rig.pull("one").await.unwrap();
+    rig.pass(100).await; // the second lease expires unanswered
+    rig.pass(10).await; // and its backoff passes
+    let third = rig.pull("one").await.unwrap();
+    rig.ack("one", &item, &third.lease_id).await.unwrap();
+
+    let facts = rig.read(&Topic::facts_work()).await;
+    let transitions = rig.transitions().await;
+    for kind in ["claimed", "failed", "expired", "acked"] {
+        assert!(
+            transitions.iter().any(|t| t == kind),
+            "{kind} in {transitions:?}"
+        );
+    }
+    for claim in [&first, &second, &third] {
+        let id = claim.lease_id.to_string();
+        let bare = id.replace('-', "");
+        let seen = serde_json::to_string(&facts).unwrap();
+        assert!(
+            !seen.contains(&id) && !seen.contains(&bare),
+            "a fact holds {id}"
+        );
+        let recorded = serde_json::to_string(&rig.sink.all_envelopes()).unwrap();
+        assert!(
+            !recorded.contains(&id) && !recorded.contains(&bare),
+            "the sink holds {id}"
+        );
+    }
+    // The facts do say which lease each is about.
+    let leased: Vec<String> = facts
+        .iter()
+        .filter_map(|fact| data(fact)["lease"].as_str().map(str::to_owned))
+        .collect();
+    assert!(leased.contains(&first.lease_id.fingerprint().to_string()));
+    assert!(leased.contains(&third.lease_id.fingerprint().to_string()));
+}
+
+/// A lease is held by a principal consuming under a name: another consumer of
+/// the same principal, with the right lease id, cannot ack or fail it.
+#[tokio::test]
+async fn another_consumer_of_the_same_principal_cannot_ack_or_fail_the_lease() {
+    let rig = Rig::new();
+    let item = rig.publish_item("job").await;
+    let claim = rig.pull("one").await.unwrap();
+    let before = rig.sink.all().len();
+    let principal = agent("one");
+    let holder = |consumer| Holder {
+        principal: &principal,
+        consumer,
+        lease_id: &claim.lease_id,
+    };
+    let others = [consumer("w2"), consumer("W1"), consumer("w")];
+    for other in &others {
+        let refused = rig
+            .engine
+            .work_ack(&tenant(), &queue(), &item, holder(other))
+            .await;
+        assert!(matches!(refused, Err(ApiError::Forbidden(_))), "{other}");
+        let refused = rig
+            .engine
+            .work_fail(&tenant(), &queue(), &item, holder(other), "x")
+            .await;
+        assert!(matches!(refused, Err(ApiError::Forbidden(_))), "{other}");
+    }
+    assert_eq!(rig.sink.all().len(), before, "a refusal records nothing");
+    rig.ack("one", &item, &claim.lease_id).await.unwrap();
 }

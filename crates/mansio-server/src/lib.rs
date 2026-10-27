@@ -43,7 +43,7 @@ pub use app::{AppState, Parts, Server};
 pub use auth::{Actor, Auth, Authenticated};
 pub use clock::{Clock, SystemClock};
 pub use credentials::Credentials;
-pub use engine::Engine;
+pub use engine::{Engine, Holder};
 pub use error::ApiError;
 pub use settings::{
     Backend, CredentialSettings, DEFAULT_LISTEN, DEFAULT_SINK_PATH, DEFAULT_TOKEN_PRINCIPAL,

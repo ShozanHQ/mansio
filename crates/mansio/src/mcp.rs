@@ -167,7 +167,7 @@ pub async fn handle(client: &Client, message: Value) -> Option<Value> {
                     "protocolVersion": version,
                     "capabilities": {"tools": {"listChanged": false}},
                     "serverInfo": {"name": "mansio", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": "Tools to publish to and read from the mansio bus, and to claim, complete and fail work items. A work_pull returns an item and a lease; pass the item's itemid and the lease_id to work_ack or work_fail."
+                    "instructions": "Tools to publish to and read from the mansio bus, and to claim, complete and fail work items. A work_pull returns an item and a lease; pass the item's itemid, the consumer and the lease_id to work_ack or work_fail."
                 }),
             )
         }

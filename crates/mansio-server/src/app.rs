@@ -543,7 +543,7 @@ async fn publish(
     )?;
     let published = state
         .engine
-        .publish(&actor.caller(), envelope)
+        .publish(envelope)
         .await
         .map_err(|error| error.logged(&tenant, &topic))?;
     Ok((StatusCode::CREATED, Json(published)))
@@ -852,6 +852,23 @@ mod tests {
                 URI.replace("facts.build", "work.builds"),
                 MINIMAL.to_owned(),
             ),
+            // The topics the engine writes are not published to: a copy on
+            // `dead` would end an open item.
+            (
+                Method::POST,
+                URI.replace("facts.build", "dead"),
+                MINIMAL.to_owned(),
+            ),
+            (
+                Method::POST,
+                URI.replace("facts.build", "facts.work"),
+                MINIMAL.to_owned(),
+            ),
+            (
+                Method::POST,
+                URI.replace("facts.build", "facts.alert"),
+                MINIMAL.to_owned(),
+            ),
             (
                 Method::POST,
                 item.to_owned(),
@@ -888,22 +905,38 @@ mod tests {
                 "/v1/tenants/acme/work/builds/pull".to_owned(),
                 r#"{"consumer":"w","x":1}"#.to_owned(),
             ),
-            // An ack and a fail carry a lease id, and a fail a reason.
+            // An ack and a fail carry a consumer and a lease id, and a fail a
+            // reason.
             (Method::POST, format!("{item}/i/ack"), "{}".to_owned()),
             (
                 Method::POST,
                 format!("{item}/i/ack"),
-                r#"{"lease_id":"nope"}"#.to_owned(),
+                r#"{"lease_id":"nope","consumer":"w"}"#.to_owned(),
             ),
             (
                 Method::POST,
-                format!("{item}/i/fail"),
+                format!("{item}/i/ack"),
                 format!(r#"{{"lease_id":"{lease}"}}"#),
             ),
             (
                 Method::POST,
+                format!("{item}/i/ack"),
+                format!(r#"{{"lease_id":"{lease}","consumer":"a b"}}"#),
+            ),
+            (
+                Method::POST,
                 format!("{item}/i/fail"),
-                format!(r#"{{"lease_id":"{lease}","reason":" "}}"#),
+                format!(r#"{{"lease_id":"{lease}","consumer":"w"}}"#),
+            ),
+            (
+                Method::POST,
+                format!("{item}/i/fail"),
+                format!(r#"{{"lease_id":"{lease}","reason":"x"}}"#),
+            ),
+            (
+                Method::POST,
+                format!("{item}/i/fail"),
+                format!(r#"{{"lease_id":"{lease}","consumer":"w","reason":" "}}"#),
             ),
             (
                 Method::POST,
@@ -940,7 +973,7 @@ mod tests {
             Method::POST,
             "/v1/tenants/acme/work/builds/items/i/ack",
             Some(TOKEN),
-            r#"{"lease_id":"0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3"}"#,
+            r#"{"lease_id":"0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3","consumer":"w"}"#,
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -1305,5 +1338,92 @@ mod tests {
         let (status, _) = send(&router, Method::POST, URI, Some(TOKEN), MINIMAL).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(!logs.text().contains("WARN"), "{}", logs.text());
+    }
+
+    /// A credential for one tenant asking for another's, on every route that
+    /// names a tenant, is refused before the engine is reached: no state is
+    /// made for a tenant name a request merely carries.
+    #[tokio::test]
+    async fn a_credential_asking_for_another_tenant_makes_no_state_for_it() {
+        let _serial = serial().await;
+        let auth = Auth::new(
+            SecretString::from(TOKEN.to_owned()),
+            "service:mansio".parse().unwrap(),
+        );
+        let parts = Server::new(Arc::new(MemoryBroker::new()), auth).build();
+        let body = serde_json::from_value(json!({
+            "kind": "agent",
+            "name": "worker",
+            "tenant": "acme",
+            "scopes": [
+                {"topic": "facts.*", "verbs": ["publish", "subscribe"]},
+                {"topic": "work.*", "verbs": ["publish", "claim"]},
+                {"topic": "alerts", "verbs": ["publish", "ack"]},
+            ],
+        }))
+        .unwrap();
+        let issued = parts
+            .credentials
+            .create(&"service:mansio".parse().unwrap(), body)
+            .await
+            .unwrap();
+        let token = issued.credential.expose().to_owned();
+        let router = parts.router.clone();
+        let tracked = || parts.engine.tracked_tenants();
+        assert_eq!(tracked(), ["acme".parse::<TenantId>().unwrap()]);
+
+        let lease = "0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3";
+        let alert = "0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b4";
+        for tenant in ["other", "a-tenant-nobody-has-heard-of"] {
+            let base = format!("/v1/tenants/{tenant}");
+            let requests = [
+                (
+                    Method::POST,
+                    format!("{base}/topics/facts.build/messages"),
+                    MINIMAL.to_owned(),
+                ),
+                (
+                    Method::GET,
+                    format!("{base}/topics/facts.build/messages"),
+                    String::new(),
+                ),
+                (
+                    Method::POST,
+                    format!("{base}/work/builds/items"),
+                    MINIMAL.to_owned(),
+                ),
+                (
+                    Method::POST,
+                    format!("{base}/work/builds/pull"),
+                    r#"{"consumer":"w"}"#.to_owned(),
+                ),
+                (
+                    Method::POST,
+                    format!("{base}/work/builds/items/i/ack"),
+                    format!(r#"{{"lease_id":"{lease}","consumer":"w"}}"#),
+                ),
+                (
+                    Method::POST,
+                    format!("{base}/work/builds/items/i/fail"),
+                    format!(r#"{{"lease_id":"{lease}","consumer":"w","reason":"x"}}"#),
+                ),
+                (Method::POST, format!("{base}/alerts"), MINIMAL.to_owned()),
+                (
+                    Method::POST,
+                    format!("{base}/alerts/{alert}/ack"),
+                    String::new(),
+                ),
+            ];
+            for (method, uri, body) in requests {
+                let (status, response) =
+                    send(&router, method.clone(), &uri, Some(&token), &body).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}: {response}");
+            }
+        }
+        assert_eq!(
+            tracked(),
+            ["acme".parse::<TenantId>().unwrap()],
+            "the refused requests made no state"
+        );
     }
 }
