@@ -1,11 +1,13 @@
 //! `mansio watch`: follow a topic and print each envelope as a line.
 //!
-//! With `--consumer` the broker keeps the position. The offset of a line is
+//! With `--consumer` the server keeps the position. The offset of a line is
 //! committed after the line has been written and flushed, so a process that
 //! is stopped at any moment, and started again with the same consumer, prints
 //! every envelope once: none is missed, and none is printed twice unless it
 //! was stopped between the flush and the commit. On SIGINT or SIGTERM the
-//! line being handled is finished and committed, and the exit is 0.
+//! line being handled is finished and committed, and the exit is 0. A second
+//! signal while it finishes ends it at once, without the commit, with the
+//! status 130.
 
 use std::io::{self, Write};
 
@@ -14,16 +16,24 @@ use tokio::sync::watch;
 use crate::client::Client;
 use crate::ops::{WatchArgs, consumer_commit, consumer_state, read_messages};
 
+/// The status of a watch that a second signal ended.
+const KILLED: i32 = 130;
+
 /// Tells the watch to stop when SIGINT or SIGTERM comes.
 struct Stop(watch::Receiver<bool>);
 
 impl Stop {
-    /// Start listening for the signals.
+    /// Start listening for the signals. The first asks the watch to finish the
+    /// line it is on and stop; a second, while it does, ends the process at
+    /// once, for a commit that hangs or a server that does not answer.
     fn listen() -> Self {
         let (sender, receiver) = watch::channel(false);
         tokio::spawn(async move {
-            signalled().await;
+            let mut signals = Signals::new();
+            signals.next().await;
             let _ = sender.send(true);
+            signals.next().await;
+            std::process::exit(KILLED);
         });
         Self(receiver)
     }
@@ -44,25 +54,53 @@ impl Stop {
     }
 }
 
-/// Completes on SIGINT, or on SIGTERM where there is one.
-async fn signalled() {
-    let interrupt = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut signal) => {
-                signal.recv().await;
-            }
-            Err(_) => std::future::pending::<()>().await,
+/// SIGINT and SIGTERM, where there is a SIGTERM, listened to for as long as
+/// this lives: a signal that comes between one wait and the next is not lost.
+#[cfg(unix)]
+struct Signals {
+    interrupt: Option<tokio::signal::unix::Signal>,
+    terminate: Option<tokio::signal::unix::Signal>,
+}
+
+#[cfg(unix)]
+impl Signals {
+    fn new() -> Self {
+        use tokio::signal::unix::{SignalKind, signal};
+        Self {
+            interrupt: signal(SignalKind::interrupt()).ok(),
+            terminate: signal(SignalKind::terminate()).ok(),
         }
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        () = interrupt => {},
-        () = terminate => {},
+    }
+
+    /// Completes at the next SIGINT or SIGTERM. If neither can be listened to,
+    /// never.
+    async fn next(&mut self) {
+        async fn one(signal: &mut Option<tokio::signal::unix::Signal>) {
+            match signal {
+                Some(signal) => {
+                    signal.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        }
+        tokio::select! {
+            () = one(&mut self.interrupt) => {},
+            () = one(&mut self.terminate) => {},
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct Signals;
+
+#[cfg(not(unix))]
+impl Signals {
+    fn new() -> Self {
+        Self
+    }
+
+    async fn next(&mut self) {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

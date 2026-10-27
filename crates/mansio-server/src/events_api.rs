@@ -72,16 +72,22 @@ struct Following {
     waiting: VecDeque<Stored>,
 }
 
-fn events(following: Following) -> impl Stream<Item = Result<Event, Infallible>> {
-    stream::unfold(following, |mut following| async move {
+/// The events of a stream, one for each message, in order. A message that
+/// `encode` cannot make an event of is skipped with a warning that says where
+/// it is, as the reader skips a message it cannot read, and the stream goes on.
+fn events(
+    following: Following,
+    encode: fn(&Stored) -> Option<Event>,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    stream::unfold(following, move |mut following| async move {
         loop {
             if let Some(stored) = following.waiting.pop_front() {
-                let Some(event) = event(&stored) else {
+                let Some(event) = encode(&stored) else {
                     warn!(
                         offset = stored.offset,
-                        "an envelope could not be written as an event"
+                        "an envelope that cannot be written as an event is skipped"
                     );
-                    return None;
+                    continue;
                 };
                 return Some((Ok(event), following));
             }
@@ -141,9 +147,77 @@ pub(crate) async fn events_stream(
             std::future::pending::<()>().await;
         }
     };
-    Ok(Sse::new(events(following).take_until(ended)).keep_alive(
-        KeepAlive::new()
-            .interval(state.streams.sse_keepalive)
-            .text("keep-alive"),
-    ))
+    Ok(
+        Sse::new(events(following, event).take_until(ended)).keep_alive(
+            KeepAlive::new()
+                .interval(state.streams.sse_keepalive)
+                .text("keep-alive"),
+        ),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use mansio_core::{Broker, Caller, Envelope, EventId, MemoryBroker};
+
+    use super::*;
+    use crate::testing::Logs;
+
+    fn tenant() -> TenantId {
+        "acme".parse().unwrap()
+    }
+
+    fn topic() -> Topic {
+        "facts.build".parse().unwrap()
+    }
+
+    /// An encoder that cannot make an event of the message at offset 1.
+    fn not_the_second(stored: &Stored) -> Option<Event> {
+        (stored.offset != 1).then(|| event(stored)).flatten()
+    }
+
+    #[tokio::test]
+    async fn an_envelope_that_cannot_be_written_is_skipped_and_the_stream_goes_on() {
+        let (logs, _guard) = Logs::capture().await;
+        let broker = Arc::new(MemoryBroker::new());
+        broker.ensure_tenant(&tenant()).await.unwrap();
+        broker.ensure_topic(&tenant(), &topic()).await.unwrap();
+        for n in 0..3 {
+            let envelope = Envelope::new(
+                EventId::generate(),
+                "test".parse().unwrap(),
+                format!("t{n}").parse().unwrap(),
+                tenant(),
+                topic(),
+                "service:test".parse().unwrap(),
+            );
+            broker.publish(&Caller::Admin, &envelope).await.unwrap();
+        }
+        let mut tail = Tail::new(broker, tenant(), topic(), 0, 10);
+        let first = tail.read(&Caller::Admin).await.unwrap();
+        let following = Following {
+            tail,
+            actor: Actor::admin("service:mansio".parse().unwrap()),
+            poll: Duration::from_millis(5),
+            waiting: first.into(),
+        };
+
+        // Of three messages, two events: the stream did not end at the second.
+        let made: Vec<_> = tokio::time::timeout(
+            Duration::from_secs(5),
+            events(following, not_the_second).take(2).collect(),
+        )
+        .await
+        .expect("two events");
+        assert_eq!(made.len(), 2);
+        let logged = logs.text();
+        assert_eq!(
+            logged.matches("cannot be written as an event").count(),
+            1,
+            "{logged}"
+        );
+        assert!(logged.contains("offset=1"), "{logged}");
+    }
 }

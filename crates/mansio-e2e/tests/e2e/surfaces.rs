@@ -416,6 +416,115 @@ fn lines_of(child: &mut Child) -> anyhow::Result<Lines<String>> {
     Ok(lines)
 }
 
+/// A server that answers `watch` with one message and never answers the commit
+/// of it, so that `watch` is stuck finishing its line.
+async fn server_that_never_answers_a_commit() -> anyhow::Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let base = format!("http://{}", listener.local_addr()?);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match socket.read(&mut chunk).await {
+                        Ok(n) if n > 0 => head.extend_from_slice(&chunk[..n]),
+                        _ => return,
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).into_owned();
+                let line = head.lines().next().unwrap_or_default().to_owned();
+                let body = if line.starts_with("GET /v1/tenants/t/topics/facts.build/consumers/") {
+                    r#"{"consumer":"c","next":0}"#
+                } else if line.starts_with("GET /v1/tenants/t/topics/facts.build/messages") {
+                    r#"{"messages":[{"offset":0,"envelope":{"id":"first"}}]}"#
+                } else {
+                    // The commit: read, and say nothing.
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    return;
+                };
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+            });
+        }
+    });
+    Ok(base)
+}
+
+/// A second signal while `watch` finishes its line ends it at once, without the
+/// commit it was waiting for, and not with a success.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_second_signal_ends_a_watch_that_is_stuck_finishing_its_line() -> anyhow::Result<()> {
+    let base = server_that_never_answers_a_commit().await?;
+    let mut child = command_at(
+        &base,
+        Some("a-token"),
+        &[
+            "watch",
+            "--tenant",
+            "t",
+            "--topic",
+            "facts.build",
+            "--consumer",
+            "c",
+        ],
+    )?
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()?;
+    let lines = lines_of(&mut child)?;
+    let pid = child.id();
+    let status = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let kill = |signal: &str| -> anyhow::Result<()> {
+            let sent = Command::new("kill")
+                .args([signal, &pid.to_string()])
+                .status()?;
+            ensure!(sent.success(), "kill failed");
+            Ok(())
+        };
+        // It printed the line, and is waiting for the commit to be answered.
+        let first = lines.recv_timeout(SLACK).context("the line")?;
+        ensure!(first.contains("first"), "{first}");
+        std::thread::sleep(Duration::from_millis(300));
+
+        // One signal asks it to finish, which it cannot: it does not exit.
+        kill("-TERM")?;
+        std::thread::sleep(Duration::from_millis(700));
+        ensure!(
+            child.try_wait()?.is_none(),
+            "it ended on the first signal, with the commit not done"
+        );
+
+        // The second ends it, at once.
+        kill("-TERM")?;
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok((status, started.elapsed()));
+            }
+            ensure!(
+                started.elapsed() < Duration::from_secs(5),
+                "it did not end on the second signal"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    })
+    .await??;
+    assert!(!status.0.success(), "a second signal is not a success");
+    assert_eq!(status.0.code(), Some(130));
+    assert!(status.1 < Duration::from_secs(5));
+    Ok(())
+}
+
 /// On SIGTERM, `watch` finishes the line it is on, commits it and exits 0; a
 /// restart with the same consumer prints the rest.
 #[cfg(unix)]
