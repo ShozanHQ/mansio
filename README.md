@@ -193,8 +193,23 @@ curl ... -d '{"lease_id":"<uuid>","reason":"out of memory"}' \
   `MANSIO_BACKOFF_CAP_SECONDS`.
 - When the next attempt would pass `MANSIO_MAX_ATTEMPTS`, the item goes to
   `dead` at once instead, and to nowhere else.
+- An item id is used once. `work_publish` answers 409 for an id the queue has
+  already had, open or done, so resending finished work does not run it
+  again. The server keeps the id of every finished item, 16 bytes each, and
+  of every acknowledged alert. They are rebuilt from the topics when the
+  server starts, so what bounds them is `MANSIO_RETENTION_WORK_SECONDS` and
+  `MANSIO_RETENTION_ALERTS_SECONDS`: with the default, which keeps everything,
+  they only grow, and an id older than the retention can be used again.
+- A client that gets a 503 from `work_publish` or `alerts_publish` cannot tell
+  whether the message was stored. It sends it again with the same `id`: a 409
+  then means the first attempt was stored, and there is nothing to resend.
+  Without an `id` the resend is a new item. A 502 is a refusal: nothing was
+  stored.
 - A restarted server rebuilds all of this from `work.<queue>`, `facts.work`
-  and `dead`, so it drops no item and republishes none twice. Keep
+  and `dead`, so it drops no item and republishes none twice. A publish that
+  fails may still have been stored, so the server rebuilds the tenant from the
+  topics after one; a stored item or acknowledgement is not lost or repeated.
+  A message in a topic that cannot be read is skipped, with a warning. Keep
   `MANSIO_RETENTION_FACTS_SECONDS` no shorter than `MANSIO_RETENTION_WORK_SECONDS`:
   an item whose facts were deleted while its message was not is claimable
   again.
@@ -223,7 +238,18 @@ curl -X POST -H "Authorization: Bearer $MANSIO_TOKEN" \
 
 An alert nobody has acknowledged `MANSIO_ALERT_RESURFACE_SECONDS` after it was
 published gets a `mansio.alert.resurfaced` envelope on `facts.alert`, and
-another after each further interval, until it is acknowledged.
+another after each further interval, until it is acknowledged. The interval is
+counted from the server's clock when it accepts the alert, not from the `time`
+the producer wrote. An alert id is used once: publishing an id the tenant
+already has is a 409, so a resend cannot reopen an acknowledged alert. As for
+work, a client that gets a 503 sends the alert again with the same `id`, and
+a 409 means the first attempt was stored.
+
+### One server per broker
+
+The lock that makes a claim atomic, and the state behind it, are in one
+mansio-server's memory. Run one mansio-server per broker; two on the same
+broker could give the same item to two consumers.
 
 ### Credentials
 
@@ -380,9 +406,12 @@ storage, so a 201 survives a crash of the host. With `replicated`, Iggy
 answers after its quorum commit without that barrier; on one node that is a
 write to the operating system, and a crash of the host can lose the messages
 acknowledged since the last flush, after the sink has already recorded them.
-`persisted` costs write latency, and Iggy's server setting
-`wal_group_commit_delay_micros` tunes that cost. mansio sets both Iggy's
-`durability` and `consumer_offset_durability` on the topics it creates.
+`persisted` costs write latency. Iggy's flush thresholds,
+`messages_required_to_save` and `size_of_messages_required_to_save`, set how
+much its journal holds before a flush, and they do not weaken `persisted`.
+See [Iggy's durability documentation](https://iggy.apache.org/docs). mansio
+sets both Iggy's `durability` and `consumer_offset_durability` on the topics
+it creates, and leaves the flush thresholds at Iggy's defaults.
 
 ### mansio (CLI)
 

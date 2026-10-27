@@ -81,6 +81,7 @@ async fn serve() -> anyhow::Result<()> {
         .with_sink(sink)
         .with_limits(settings.limits)
         .with_work_settings(settings.work)
+        .context("the work settings")?
         .with_credential_settings(settings.credentials)
         .serve(listener, shutdown_signal())
         .await

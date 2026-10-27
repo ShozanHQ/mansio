@@ -78,6 +78,19 @@ impl Ensured {
     fn forget(&self, tenant: &TenantId) {
         self.lock().remove(tenant);
     }
+
+    /// Pass the result of a request for this tenant through, and forget the
+    /// tenant if Iggy says its stream or one of its topics is gone.
+    fn forget_if_missing<T>(
+        &self,
+        tenant: &TenantId,
+        result: Result<T, BrokerError>,
+    ) -> Result<T, BrokerError> {
+        if matches!(result, Err(BrokerError::NotFound(_))) {
+            self.forget(tenant);
+        }
+        result
+    }
 }
 
 /// A [`Broker`] backed by an Iggy server.
@@ -384,17 +397,35 @@ impl IggyBroker {
             .collect()
     }
 
-    /// If Iggy says the stream or topic is gone, check for them again on the
-    /// next request.
-    fn forget_if_missing<T>(
+    /// Make sure the tenant's stream exists, and remember that it does.
+    async fn find_or_create_stream(&self, tenant: &TenantId) -> Result<(), BrokerError> {
+        if self.ensured.has_stream(tenant) {
+            return Ok(());
+        }
+        self.make_stream(tenant.as_str()).await?;
+        self.ensured.add_stream(tenant);
+        Ok(())
+    }
+
+    /// Make sure the topic exists in the tenant's stream, and remember that
+    /// it does.
+    async fn find_or_create_topic(
         &self,
         tenant: &TenantId,
-        result: Result<T, BrokerError>,
-    ) -> Result<T, BrokerError> {
-        if matches!(result, Err(BrokerError::NotFound(_))) {
-            self.ensured.forget(tenant);
+        topic: &Topic,
+    ) -> Result<(), BrokerError> {
+        if self.ensured.has_topic(tenant, topic) {
+            return Ok(());
         }
-        result
+        let options = topic_options(&self.retention, &self.durability, topic);
+        self.make_topic(tenant.as_str(), &topic.to_string(), &options)
+            .await?;
+        // Whether the topic was made now or found, the users whose scopes
+        // cover it may not have it yet: it may have been made just before a
+        // restart, or by a request that did not get as far as this.
+        self.open_to_users(tenant).await?;
+        self.ensured.add_topic(tenant, topic);
+        Ok(())
     }
 
     // ---- streams and topics -----------------------------------------------
@@ -693,27 +724,13 @@ impl Broker for IggyBroker {
     }
 
     async fn ensure_tenant(&self, tenant: &TenantId) -> Result<(), BrokerError> {
-        if self.ensured.has_stream(tenant) {
-            return Ok(());
-        }
-        self.make_stream(tenant.as_str()).await?;
-        self.ensured.add_stream(tenant);
-        Ok(())
+        let result = self.find_or_create_stream(tenant).await;
+        self.ensured.forget_if_missing(tenant, result)
     }
 
     async fn ensure_topic(&self, tenant: &TenantId, topic: &Topic) -> Result<(), BrokerError> {
-        if self.ensured.has_topic(tenant, topic) {
-            return Ok(());
-        }
-        let options = topic_options(&self.retention, &self.durability, topic);
-        self.make_topic(tenant.as_str(), &topic.to_string(), &options)
-            .await?;
-        // Whether the topic was made now or found, the users whose scopes
-        // cover it may not have it yet: it may have been made just before a
-        // restart, or by a request that did not get as far as this.
-        self.open_to_users(tenant).await?;
-        self.ensured.add_topic(tenant, topic);
-        Ok(())
+        let result = self.find_or_create_topic(tenant, topic).await;
+        self.ensured.forget_if_missing(tenant, result)
     }
 
     async fn publish(
@@ -722,7 +739,7 @@ impl Broker for IggyBroker {
         envelope: &Envelope,
     ) -> Result<Option<u64>, BrokerError> {
         let result = self.send(caller, envelope).await;
-        self.forget_if_missing(&envelope.tenant, result)
+        self.ensured.forget_if_missing(&envelope.tenant, result)
     }
 
     async fn poll(
@@ -734,7 +751,7 @@ impl Broker for IggyBroker {
         max: u32,
     ) -> Result<Vec<Stored>, BrokerError> {
         let result = self.fetch(caller, tenant, topic, offset, max).await;
-        self.forget_if_missing(tenant, result)
+        self.ensured.forget_if_missing(tenant, result)
     }
 
     async fn system_append(&self, record: &[u8]) -> Result<(), BrokerError> {
@@ -1147,6 +1164,37 @@ mod tests {
         assert!(ensured.has_stream(&other), "a topic implies its stream");
 
         ensured.forget(&acme);
+        assert!(!ensured.has_stream(&acme) && !ensured.has_topic(&acme, &alerts));
+        assert!(ensured.has_topic(&other, &alerts), "other tenants are kept");
+    }
+
+    #[test]
+    fn a_tenant_is_forgotten_when_its_stream_is_reported_missing() {
+        let ensured = Ensured::default();
+        let acme: TenantId = "acme".parse().unwrap();
+        let other: TenantId = "other".parse().unwrap();
+        let alerts = Topic::Alerts;
+        ensured.add_topic(&acme, &alerts);
+        ensured.add_topic(&other, &alerts);
+
+        let passed = ensured.forget_if_missing::<()>(&acme, Ok(()));
+        assert!(passed.is_ok());
+        assert!(
+            ensured.has_topic(&acme, &alerts),
+            "a success keeps the cache"
+        );
+
+        let outage = ensured
+            .forget_if_missing::<()>(&acme, Err(BrokerError::Unavailable("no answer".into())));
+        assert!(matches!(outage, Err(BrokerError::Unavailable(_))));
+        assert!(
+            ensured.has_topic(&acme, &alerts),
+            "an outage keeps the cache"
+        );
+
+        let missing = ensured
+            .forget_if_missing::<()>(&acme, Err(BrokerError::NotFound("stream acme".into())));
+        assert!(matches!(missing, Err(BrokerError::NotFound(_))));
         assert!(!ensured.has_stream(&acme) && !ensured.has_topic(&acme, &alerts));
         assert!(ensured.has_topic(&other, &alerts), "other tenants are kept");
     }

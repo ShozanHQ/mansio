@@ -862,7 +862,7 @@ async fn a_restarted_server_knows_who_has_a_credential() -> anyhow::Result<()> {
         .await?;
     target.revoke(&dropped.id).await?;
 
-    target.crash_server().await?;
+    target.stop_server().await?;
     target.start_server().await?;
 
     assert_eq!(kept.publish("facts.build").await?.0, StatusCode::CREATED);

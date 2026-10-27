@@ -7,9 +7,8 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
-use mansio_core::{
-    ConsumerName, Envelope, EventId, ItemId, LeaseId, Next, Principal, Segment, Topic,
-};
+use mansio_core::{ConsumerName, Envelope, EventId, ItemId, LeaseId, Next, Principal, Segment};
+use subtle::ConstantTimeEq;
 
 use crate::error::ApiError;
 
@@ -67,10 +66,42 @@ impl Item {
     }
 }
 
-/// The open items of one queue. Acknowledged and dead items are not kept.
+/// The ids of items that are done. An item is named by the id of its first
+/// message, which is a UUID, so an id is kept as the 16 bytes of one; an id
+/// that is not a UUID (it can only have come from outside) is kept as text.
+#[derive(Debug, Default)]
+struct Finished {
+    uuids: HashSet<u128>,
+    other: HashSet<ItemId>,
+}
+
+impl Finished {
+    fn uuid(id: &ItemId) -> Option<u128> {
+        id.as_str().parse::<EventId>().ok().map(|id| id.as_u128())
+    }
+
+    fn insert(&mut self, id: &ItemId) {
+        match Self::uuid(id) {
+            Some(uuid) => self.uuids.insert(uuid),
+            None => self.other.insert(id.clone()),
+        };
+    }
+
+    fn contains(&self, id: &ItemId) -> bool {
+        match Self::uuid(id) {
+            Some(uuid) => self.uuids.contains(&uuid),
+            None => self.other.contains(id),
+        }
+    }
+}
+
+/// The items of one queue. Open items are kept whole; an item that is done
+/// (acknowledged, or dead) leaves only its id, so that the id is not used
+/// again.
 #[derive(Debug, Default)]
 pub(crate) struct Queue {
     items: HashMap<ItemId, Item>,
+    finished: Finished,
     /// `(order, id)` of every item in [`Phase::Ready`], so that the oldest
     /// is the first.
     ready: BTreeSet<(u64, ItemId)>,
@@ -83,8 +114,9 @@ impl Queue {
         self.items.get(id)
     }
 
-    pub(crate) fn contains(&self, id: &ItemId) -> bool {
-        self.items.contains_key(id)
+    /// Whether the id belongs to an item, open or done.
+    pub(crate) fn knows(&self, id: &ItemId) -> bool {
+        self.items.contains_key(id) || self.finished.contains(id)
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&ItemId, &Item)> {
@@ -123,10 +155,16 @@ impl Queue {
         );
     }
 
-    pub(crate) fn remove(&mut self, id: &ItemId) {
+    fn remove(&mut self, id: &ItemId) {
         if let Some(old) = self.items.remove(id) {
             self.ready.remove(&(old.order, id.clone()));
         }
+    }
+
+    /// The item is done: drop it and remember its id.
+    pub(crate) fn finish(&mut self, id: &ItemId) {
+        self.remove(id);
+        self.finished.insert(id);
     }
 
     pub(crate) fn set_phase(&mut self, id: &ItemId, phase: Phase) {
@@ -152,27 +190,21 @@ impl Queue {
     }
 }
 
-/// An alert and whether it still needs surfacing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AlertState {
-    /// When it was published or last surfaced, in milliseconds since the
-    /// Unix epoch. The next surfacing is one interval later.
-    pub(crate) surfaced_at: i64,
-    /// Who acknowledged it, once someone has.
-    pub(crate) acknowledged_by: Option<Principal>,
-}
-
 /// Everything the engine holds for one tenant.
 #[derive(Debug, Default)]
 pub(crate) struct TenantState {
-    /// Whether the state has been rebuilt from the logs.
+    /// Whether the state matches the logs. It stops doing so when a publish
+    /// fails, because the broker may have stored the message all the same;
+    /// the next use rebuilds it.
     pub(crate) loaded: bool,
-    /// Whether the broker is known to have the tenant.
-    pub(crate) tenant_ready: bool,
-    /// Topics the broker is known to have.
-    pub(crate) topics_ready: HashSet<Topic>,
     pub(crate) queues: HashMap<Segment, Queue>,
-    pub(crate) alerts: HashMap<EventId, AlertState>,
+    /// Alerts nobody has acknowledged, with when each was published or last
+    /// surfaced, in milliseconds since the Unix epoch. The next surfacing is
+    /// one interval later.
+    pub(crate) alerts: HashMap<EventId, i64>,
+    /// The ids of alerts that were acknowledged, which are all that is kept
+    /// of them.
+    pub(crate) acknowledged_alerts: HashSet<EventId>,
 }
 
 impl TenantState {
@@ -206,7 +238,10 @@ pub(crate) fn held_lease<'a>(
             "the item is not claimed: its lease has ended or it was never claimed".to_owned(),
         ));
     };
-    if lease.id != *presented || lease.holder != *principal {
+    // The lease id is a secret the holder was given: compare it so that the
+    // time taken does not say how much of a guess was right.
+    let same_lease = bool::from(lease.id.as_u128().ct_eq(&presented.as_u128()));
+    if !same_lease || lease.holder != *principal {
         return Err(ApiError::Forbidden(
             "the item is claimed under a lease that is not yours".to_owned(),
         ));
@@ -295,6 +330,42 @@ mod tests {
         queue.remove(&c);
         assert_eq!(queue.oldest_ready(), None);
         assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn a_finished_item_leaves_its_id_and_nothing_else() {
+        let mut queue = Queue::default();
+        let (a, message_a) = message(1);
+        let (b, _) = message(2);
+        queue.insert(a.clone(), message_a, Phase::Ready);
+        assert!(queue.knows(&a) && !queue.knows(&b));
+        queue.finish(&a);
+        assert!(queue.knows(&a), "an id is not used again");
+        assert!(queue.get(&a).is_none());
+        assert_eq!(queue.oldest_ready(), None);
+        assert_eq!(queue.len(), 0);
+        // Finishing what is not there still reserves the id.
+        queue.finish(&b);
+        assert!(queue.knows(&b));
+    }
+
+    #[test]
+    fn the_ids_of_finished_items_are_kept_as_sixteen_bytes() {
+        let mut queue = Queue::default();
+        let uuid = EventId::generate();
+        let id: ItemId = uuid.to_string().parse().unwrap();
+        queue.finish(&id);
+        assert!(queue.knows(&id));
+        assert!(queue.finished.uuids.contains(&uuid.as_u128()));
+        assert!(queue.finished.other.is_empty());
+        assert!(!queue.knows(&EventId::generate().to_string().parse().unwrap()));
+
+        // An id from outside that is not a UUID is still remembered.
+        let odd: ItemId = "build-7".parse().unwrap();
+        assert!(!queue.knows(&odd));
+        queue.finish(&odd);
+        assert!(queue.knows(&odd));
+        assert_eq!(queue.finished.other.len(), 1);
     }
 
     #[test]

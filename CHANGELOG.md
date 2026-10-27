@@ -26,6 +26,10 @@ All notable changes to mansio are listed here. The format follows
 - `compose.yaml` and a `Dockerfile` that start Iggy 0.9.0 and mansio-server.
 - CI: format, clippy, test, `cargo-deny`, licence and naming checks, and an
   end-to-end run through Iggy.
+- `MANSIO_IGGY_DURABILITY` and `MANSIO_IGGY_PRESENCE_DURABILITY`, choosing
+  `persisted` or `replicated` for the durable topics and for `presence`.
+- The publish answer's `offset` is optional: left out when Iggy does not say
+  where the message landed and it is not among the recent ones.
 - Work items over the HTTP API (`work_publish`, `work_pull`, `work_ack`,
   `work_fail`): a claim is a lease, a fail or an expired lease republishes the
   item one attempt on after a doubling backoff, and past the attempt cap it goes
@@ -64,6 +68,11 @@ All notable changes to mansio are listed here. The format follows
   hold them.
 - The generic messages route refuses `work.<queue>`, `facts.work` and
   `facts.alert`.
+- An item id and an alert id are used once: resending one the queue or tenant
+  has had is a 409.
+- After a publish fails, which may still have stored the message, the engine
+  rebuilds the tenant's state from its topics.
+- `Server::with_work_settings` checks the settings and returns an error.
 - `compose.yaml` passes the work settings through, and keeps the sink file in
   `MANSIO_SINK_DIR` when it is set.- Every request is authenticated by its bearer credential and acts through the
   broker as that credential; the bootstrap `MANSIO_TOKEN` is the admin's.

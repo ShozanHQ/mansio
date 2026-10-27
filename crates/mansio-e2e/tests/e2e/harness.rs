@@ -36,6 +36,7 @@ use reqwest::{Method, StatusCode};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 /// The token the in-process server accepts.
@@ -44,6 +45,8 @@ const LOCAL_TOKEN: &str = "e2e-local-token";
 pub const PRINCIPAL: &str = "service:mansio";
 /// How often a test looks again while it waits for something.
 const LOOK_AGAIN: Duration = Duration::from_millis(50);
+/// How long a server may take to shut down before it is aborted.
+const STOP_TIME: Duration = Duration::from_secs(5);
 /// What a wait may take beyond what the settings call for, for a slow runner.
 pub const SLACK: Duration = Duration::from_secs(15);
 
@@ -73,6 +76,8 @@ fn local_credential_settings() -> CredentialSettings {
 /// A server running in this process. It stops when dropped.
 struct LocalServer {
     base: String,
+    /// Tells the server to shut down; it also does when this is dropped.
+    stop: Option<oneshot::Sender<()>>,
     task: JoinHandle<io::Result<()>>,
 }
 
@@ -86,16 +91,36 @@ impl LocalServer {
         );
         let server = Server::new(broker.clone(), auth)
             .with_sink(Arc::new(FileSink::open(sink).await?))
-            .with_work_settings(local_work_settings())
+            .with_work_settings(local_work_settings())?
             .with_credential_settings(local_credential_settings());
-        let task = tokio::spawn(server.serve(listener, std::future::pending()));
-        Ok(Self { base, task })
+        let (stop, stopped) = oneshot::channel::<()>();
+        let task = tokio::spawn(server.serve(listener, async move {
+            let _ = stopped.await;
+        }));
+        Ok(Self {
+            base,
+            stop: Some(stop),
+            task,
+        })
+    }
+
+    /// Shut the server down and wait until it has gone, its timer too, so
+    /// that nothing of it is still running when a new one starts. A server
+    /// that does not stop in time is aborted.
+    async fn stop(mut self) -> anyhow::Result<()> {
+        drop(self.stop.take());
+        if tokio::time::timeout(STOP_TIME, &mut self.task)
+            .await
+            .is_err()
+        {
+            self.task.abort();
+            let _ = (&mut self.task).await;
+        }
+        Ok(())
     }
 }
 
 impl Drop for LocalServer {
-    /// Stopping is not graceful: the listener and the timer go at once, as
-    /// they would if the process died.
     fn drop(&mut self) {
         self.task.abort();
     }
@@ -167,16 +192,15 @@ impl Target {
         self.local.is_some()
     }
 
-    /// Stop the in-process server as a crash would. The broker and the sink
-    /// file stay.
-    pub async fn crash_server(&mut self) -> anyhow::Result<()> {
+    /// Stop the in-process server, and wait until it and its timer are gone.
+    /// The broker and the sink file stay.
+    pub async fn stop_server(&mut self) -> anyhow::Result<()> {
         let (_, server) = self.local.as_mut().context("the server is not local")?;
-        let mut stopped = server.take().context("the server is already stopped")?;
-        stopped.task.abort();
-        // Wait until it is gone, timer included, so that nothing of the old
-        // server is still running when a new one starts.
-        let _ = (&mut stopped.task).await;
-        Ok(())
+        server
+            .take()
+            .context("the server is already stopped")?
+            .stop()
+            .await
     }
 
     /// Start a new in-process server on the broker and the sink file that
@@ -402,8 +426,10 @@ impl Target {
         };
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading the sink {}", path.display()))?;
+        // The server may be part way through a line; the rest comes later.
+        let complete = text.rfind('\n').map_or("", |end| &text[..=end]);
         let mut records = Vec::new();
-        for line in text.lines() {
+        for line in complete.lines() {
             let envelope = Envelope::from_json_slice(line.as_bytes())?;
             if envelope.tenant.as_str() == self.tenant {
                 records.push(envelope);
