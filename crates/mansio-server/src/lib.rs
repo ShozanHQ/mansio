@@ -36,6 +36,8 @@ mod settings;
 mod sink;
 mod state;
 mod tail;
+#[cfg(test)]
+mod testing;
 mod webhooks;
 mod webhooks_api;
 mod work_api;

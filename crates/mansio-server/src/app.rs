@@ -9,6 +9,7 @@ use std::sync::Arc;
 use axum::extract::rejection::{BytesRejection, PathRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
@@ -387,12 +388,9 @@ impl Server {
                 "the tenants could not be listed; the timer will try again"
             );
         }
-        if let Err(error) = credentials.load().await {
-            warn!(
-                ?error,
-                "the registry of principals could not be loaded; the next request will try again"
-            );
-        }
+        // If this fails it has logged why at error. Credentials are refused and
+        // `/healthz` says so until a later attempt succeeds.
+        credentials.load().await.ok();
         if let Err(error) = webhooks.load().await {
             warn!(
                 ?error,
@@ -433,8 +431,23 @@ impl Server {
     }
 }
 
-async fn healthz() -> Json<Value> {
-    Json(json!({ "status": "ok" }))
+/// `200 {"status":"ok"}`, or `503 {"status":"degraded","credentials":"unavailable",..}`
+/// while the registry of principals is not loaded: the server is up, and no
+/// credential is accepted. Asking for it tries the load again when its time
+/// is up, which is what a health check that keeps asking wants.
+async fn healthz(State(state): State<Arc<AppState>>) -> Response {
+    match state.credentials.load().await {
+        Ok(()) => Json(json!({ "status": "ok" })).into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "degraded",
+                "credentials": "unavailable",
+                "message": "the registry of principals is not loaded, so no credential is accepted; see the server log",
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn settings(
@@ -655,12 +668,13 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request, header};
     use http_body_util::BodyExt;
-    use mansio_core::MemoryBroker;
     use mansio_core::api::ErrorBody;
+    use mansio_core::{MemoryBroker, SystemLog};
     use secrecy::SecretString;
     use tower::ServiceExt;
 
     use super::*;
+    use crate::testing::serial;
 
     const TOKEN: &str = "test-token";
 
@@ -1321,17 +1335,6 @@ mod tests {
         }
     }
 
-    /// Every test in this module holds this lock for its life, and
-    /// `Logs::capture` takes it too. Tracing keeps subscribers and callsite
-    /// interest in process-wide state. A callsite first reached on a thread
-    /// with no subscriber, while another thread's capture is live, is cached
-    /// as never interesting, and its events vanish from that capture.
-    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
-        SERIAL.lock().await
-    }
-
     /// Ends the capture when dropped, then releases the lock. Fields drop in
     /// declaration order, so the subscriber is gone before the next test runs.
     struct CaptureGuard {
@@ -1448,6 +1451,74 @@ mod tests {
             assert!(logged.contains(expected), "{expected} is not in {logged}");
         }
         assert!(!logged.contains("private-payload"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn a_registry_that_cannot_be_loaded_is_logged_with_its_cause_and_healthz_says_so() {
+        let (logs, _guard) = Logs::capture().await;
+        let broker = Arc::new(MemoryBroker::new());
+        broker
+            .system_append(SystemLog::Principals, b"not a record")
+            .await
+            .unwrap();
+        let clock = Arc::new(crate::clock::manual::ManualClock::new(1_792_000_000_000));
+        let router = Server::new(
+            broker,
+            Auth::new(
+                SecretString::from(TOKEN.to_owned()),
+                "service:mansio".parse().unwrap(),
+            ),
+        )
+        .with_clock(clock.clone())
+        .with_credential_settings(CredentialSettings {
+            agent_ttl: std::time::Duration::from_secs(60),
+            recheck: std::time::Duration::from_secs(30),
+            sweep: std::time::Duration::from_secs(10),
+        })
+        .router();
+
+        // The server is up and says it is not well, in a status a health
+        // check fails on. It does not say why: it answers anyone.
+        let (status, body) = send(&router, Method::GET, "/healthz", None, "").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(body["credentials"], "unavailable");
+        assert!(!body.to_string().contains("offset"), "{body}");
+
+        // A credential is refused with a 503, not a 401, however many times it
+        // is shown. The bootstrap token is not a credential and still works.
+        for _ in 0..3 {
+            let (status, body) = send(&router, Method::GET, URI, Some("a-credential"), "").await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(error_code(&body), "unavailable");
+        }
+        let (status, _) = send(&router, Method::POST, URI, Some(TOKEN), MINIMAL).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // One line at error, with the cause, for all of that.
+        let logged = logs.text();
+        let lines = |text: &str| text.matches("could not be loaded").count();
+        assert_eq!(lines(&logged), 1, "{logged}");
+        for expected in ["ERROR", "offset 0", "retry_seconds=30"] {
+            assert!(logged.contains(expected), "{expected} is not in {logged}");
+        }
+
+        // Once the interval has passed the next request tries, and says so.
+        clock.advance(std::time::Duration::from_secs(30));
+        let (status, _) = send(&router, Method::GET, "/healthz", None, "").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(lines(&logs.text()), 2, "{}", logs.text());
+    }
+
+    #[tokio::test]
+    async fn a_registry_that_loaded_leaves_healthz_ok() {
+        let _serial = serial().await;
+        let router = router();
+        let (status, _) = send(&router, Method::GET, URI, Some("a-credential"), "").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, body) = send(&router, Method::GET, "/healthz", None, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"status": "ok"}));
     }
 
     #[tokio::test]
