@@ -49,20 +49,32 @@ Segments match `[a-z0-9][a-z0-9_-]{0,62}`; so does a tenant id. Each topic has o
 
 ## Work items
 
-Iggy is offset-based. mansio-server runs one dispatcher per `work.<queue>`, reading in order under a named consumer whose offset Iggy stores.
+Iggy is offset-based: it has no per-message claim, acknowledgement, redelivery or dead letters. The engine in mansio-server builds them and records every transition. An item is named by the `id` of its first message, which `work_publish` sets as `itemid` with `attempt` 1; a caller cannot set either, and the generic messages route refuses `work.<queue>`, `facts.work` and `facts.alert`.
 
-- **Claim** hands the oldest unclaimed item to the caller with a lease: holder, item id, expiry (now plus `MANSIO_LEASE_SECONDS`). Another caller cannot see it while the lease holds.
-- **Ack** by the holder completes it.
-- **Fail** by the holder, or an expired lease, republishes the item to the same queue as a new message with the same `itemid` and `attempt` plus one, after a backoff of `MANSIO_BACKOFF_BASE_SECONDS * 2^(attempt-1)` capped at `MANSIO_BACKOFF_CAP_SECONDS`. Past `MANSIO_MAX_ATTEMPTS` it goes to `dead` and nowhere else.
-- Every transition (`claimed`, `acked`, `failed`, `expired`, `retried`, `dead`) is an envelope on `facts.work`, recorded in the sink first and then published. The lease table is a projection of `facts.work`: a restarted server rebuilds it by replay, so a restart neither drops nor duplicates an item.
+- **Claim** (`work_pull`) hands the oldest claimable item to the caller with a lease: a random lease id, the holder (the principal behind the credential and the consumer name from the request), the item and an expiry (now plus `MANSIO_LEASE_SECONDS`). Another caller cannot see it while the lease holds, and the claim is atomic.
+- **Ack** (`work_ack`) by the holder, presenting the lease id, completes it. Another lease id or principal is refused with 403, an item with no live lease (never claimed, expired, waiting for its retry) with 409, an item that is not open with 404. Nothing changes then.
+- **Fail** (`work_fail`) by the holder, or an expired lease, republishes the item to the same queue as a new message with the same `itemid`, `attempt` plus one and the message before as `causationid`, after a backoff of `MANSIO_BACKOFF_BASE_SECONDS * 2^(attempt-1)` capped at `MANSIO_BACKOFF_CAP_SECONDS`. When `attempt` plus one would pass `MANSIO_MAX_ATTEMPTS`, the item is published to `dead` at once instead, and nowhere else. Republished and dead messages are published by `service:mansio-engine`.
+- Every transition (`claimed`, `acked`, `failed`, `expired`, `retried`, `dead`) is an envelope on `facts.work` with the item id as `subject` and the item id and attempt as attributes; `data` names the queue, message id, attempt, and as they apply the lease id, holder, consumer, expiry, reason and what happens next (`next`, `retry_at`). It is recorded in the sink first and then published.
+
+A timer (`MANSIO_TICK_MILLIS`) drives expiries, republishes and the surfacing of alerts. It reads the clock through a trait, so tests move time by hand.
+
+### State
+
+The engine keeps, per tenant, the open items of each queue, their leases and the alerts. None of it is authoritative: it is a projection of `work.<queue>`, `facts.work`, `dead`, `alerts` and `facts.alert`. On start the server lists the tenants and topics the broker holds (`Broker::tenants`, `Broker::topics`), reads those topics from offset 0, and rebuilds the state; a tenant it first meets later is rebuilt on its first request. An item's newest message says what it is, and the transitions recorded for that attempt say where it stands: a lease still holds until its recorded expiry, a failure waits until its recorded `retry_at`. So a restart neither drops nor duplicates an item, and a lease that ended while the server was down is expired on start. Order is by position in the queue, not by offset, because Iggy does not always report one.
+
+A transition is written before the state changes, so a write that fails changes nothing. Republishing an item and sending it to `dead` each publish a message and then record a fact, which cannot be one write. Between the two the item is not claimable and owes its fact; the timer finishes it, and so does a restart, which finds the message published and the fact missing and records the fact once. A message that was never published is published once.
+
+Retention must keep `facts.work` at least as long as `work.<queue>`: an item whose facts expired while its message did not is claimable again.
 
 ## Alerts
 
-Published to `alerts`. `ack` by a principal records who and when as `facts.alert` `acknowledged`; a second ack is refused. An alert unacknowledged after `MANSIO_ALERT_RESURFACE_SECONDS` is surfaced again as `facts.alert` `resurfaced`.
+Published to `alerts` (`alerts_publish`, or the generic route to `alerts`). The alert is the message and its id is the message's `id`. `alerts_ack` by a principal records who and when as `facts.alert` `acknowledged`; a second ack is refused with 409. An alert unacknowledged `MANSIO_ALERT_RESURFACE_SECONDS` after it was published is surfaced again as `facts.alert` `resurfaced`, once per interval until it is acknowledged.
 
 ## Sink
 
 `Sink::record(&Envelope) -> Result<Option<Record>>` is called before every durable publish mansio makes, in order. A host returns the record it appended (id and hashes), which is set on the envelope before it is published, so subscribers can verify it against the host's log. The standalone binary uses a JSON Lines file sink (`MANSIO_SINK_PATH`) and returns no record. A record a producer put on the envelope is kept when the sink returns none and replaced when it returns one.
+
+Record and publish happen under one async lock per tenant, so the sink sees a tenant's messages in the order its topics hold them, whichever route they took. A failed publish after a record leaves the record in the sink with nothing on the topic.
 
 ## Credentials
 
@@ -77,8 +89,13 @@ One HTTP API under `/v1`:
 - `GET /healthz`, open: `{"status":"ok"}`.
 - `POST /v1/tenants/{tenant}/topics/{topic}/messages`: the body is an envelope without the four attributes above; the answer is 201 with `{"offset", "envelope"}`, the envelope as stored. `offset` is absent when Iggy stored the message without saying where and it is not among the last `MANSIO_IGGY_LOCATE_WINDOW` messages: the message is stored, so the client must not send it again.
 - `GET /v1/tenants/{tenant}/topics/{topic}/messages?offset=N&count=M`: 200 with `{"messages": [{"offset", "envelope"}]}` from that offset, in publish order.
+- `GET /v1/settings`: the effective non-secret settings (the work settings and the API limits).
+- `work_publish`: `POST /v1/tenants/{tenant}/work/{queue}/items`, an envelope without the server-set attributes and without `itemid` and `attempt`; 201 as for a publish.
+- `work_pull`: `POST /v1/tenants/{tenant}/work/{queue}/pull` with `{"consumer"}`; 200 with `{"lease_id", "expires_at", "item"}`, or 204 when nothing is claimable.
+- `work_ack`: `POST /v1/tenants/{tenant}/work/{queue}/items/{itemid}/ack` with `{"lease_id"}`, and `work_fail`: `.../fail` with `{"lease_id", "reason"}`; 200 with the transition's envelope.
+- `alerts_publish`: `POST /v1/tenants/{tenant}/alerts`, as a publish to `alerts`. `alerts_ack`: `POST /v1/tenants/{tenant}/alerts/{id}/ack`; 200 with the `acknowledged` envelope.
 
-Every refusal is `{"error": {"code", "message"}}` with 400 (malformed), 401 (no valid token), 404, 413 (body too large), 502 (the broker refused) or 503 (the broker or the sink is unavailable). A 502 or 503 is logged at `warn` with the tenant, topic and cause. Everything but `/healthz` needs `Authorization: Bearer <token>`.
+Every refusal is `{"error": {"code", "message"}}` with 400 (malformed), 401 (no valid token), 403 (a lease that is not the caller's), 404, 409 (the state does not allow it: no live lease, an alert already acknowledged, an item id already open), 413 (body too large), 502 (the broker refused) or 503 (the broker or the sink is unavailable). A 502 or 503 is logged at `warn` with the tenant, topic and cause. Everything but `/healthz` needs `Authorization: Bearer <token>`.
 
 The CLI, the MCP server, server-sent events (`GET /v1/events`, resuming from `Last-Event-ID`) and signed webhooks (CloudEvents JSON, HMAC-SHA256 signature header, retry with backoff) all use it, with the same operation names.
 

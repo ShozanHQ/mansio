@@ -83,6 +83,18 @@ impl Topic {
         }
     }
 
+    /// `facts.work`: where mansio records every work item transition.
+    #[must_use]
+    pub fn facts_work() -> Self {
+        Topic::Facts(Segment::known("work"))
+    }
+
+    /// `facts.alert`: where mansio records every alert transition.
+    #[must_use]
+    pub fn facts_alert() -> Self {
+        Topic::Facts(Segment::known("alert"))
+    }
+
     /// Whether what is published here is durable, and so goes through the
     /// sink first. Everything is, except `presence`.
     #[must_use]
@@ -209,6 +221,17 @@ mod tests {
         for kind in TopicKind::ALL {
             assert_eq!(kind.to_string(), kind.as_str());
         }
+    }
+
+    #[test]
+    fn the_transition_topics_are_facts_work_and_facts_alert() {
+        assert_eq!(Topic::facts_work().to_string(), "facts.work");
+        assert_eq!(Topic::facts_alert().to_string(), "facts.alert");
+        assert_eq!("facts.work".parse::<Topic>().unwrap(), Topic::facts_work());
+        assert_eq!(
+            "facts.alert".parse::<Topic>().unwrap(),
+            Topic::facts_alert()
+        );
     }
 
     #[test]

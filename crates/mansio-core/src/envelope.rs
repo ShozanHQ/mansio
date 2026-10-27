@@ -48,6 +48,28 @@ impl Timestamp {
             .map(Self)
     }
 
+    /// The UTC time `millis` milliseconds after the Unix epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the time is outside the years RFC 3339 can write.
+    pub fn from_unix_millis(millis: i64) -> Result<Self, ParseError> {
+        let out_of_range = || invalid("time", &millis.to_string(), "is outside RFC 3339 range");
+        OffsetDateTime::from_unix_timestamp_nanos(i128::from(millis) * 1_000_000)
+            .map_err(|_| out_of_range())?
+            .format(&Rfc3339)
+            .map_err(|_| out_of_range())
+            .map(Self)
+    }
+
+    /// Milliseconds since the Unix epoch, rounded down, or `None` if the
+    /// timestamp is outside the range of an `i64` of milliseconds.
+    #[must_use]
+    pub fn unix_millis(&self) -> Option<i64> {
+        let parsed = OffsetDateTime::parse(&self.0, &Rfc3339).ok()?;
+        i64::try_from(parsed.unix_timestamp_nanos().div_euclid(1_000_000)).ok()
+    }
+
     /// The timestamp as written.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -819,6 +841,20 @@ mod tests {
                 .parse::<Timestamp>()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn times_convert_to_and_from_unix_milliseconds() {
+        let at = Timestamp::from_unix_millis(1_792_000_000_123).unwrap();
+        assert_eq!(at.as_str(), "2026-10-14T17:46:40.123Z");
+        assert_eq!(at.unix_millis(), Some(1_792_000_000_123));
+        assert_eq!(
+            Timestamp::from_unix_millis(0).unwrap().as_str(),
+            "1970-01-01T00:00:00Z"
+        );
+        let offset: Timestamp = "2026-10-26T12:00:00.500+02:00".parse().unwrap();
+        assert_eq!(offset.unix_millis(), Some(1_793_008_800_500));
+        assert!(Timestamp::from_unix_millis(i64::MAX).is_err());
     }
 
     #[test]

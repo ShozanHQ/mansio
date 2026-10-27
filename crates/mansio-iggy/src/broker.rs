@@ -323,6 +323,26 @@ fn map_iggy(error: IggyError) -> BrokerError {
 
 #[async_trait]
 impl Broker for IggyBroker {
+    async fn tenants(&self) -> Result<Vec<TenantId>, BrokerError> {
+        let streams = self.client.get_streams().await.map_err(map_iggy)?;
+        Ok(streams
+            .iter()
+            .filter_map(|stream| stream.name.parse().ok())
+            .collect())
+    }
+
+    async fn topics(&self, tenant: &TenantId) -> Result<Vec<Topic>, BrokerError> {
+        let topics = self
+            .client
+            .get_topics(&stream_id(tenant)?)
+            .await
+            .map_err(map_iggy)?;
+        Ok(topics
+            .iter()
+            .filter_map(|topic| topic.name.parse().ok())
+            .collect())
+    }
+
     async fn ensure_tenant(&self, tenant: &TenantId) -> Result<(), BrokerError> {
         if self.ensured.has_stream(tenant) {
             return Ok(());

@@ -25,6 +25,24 @@ pub struct Stored {
 /// [`MemoryBroker`](crate::MemoryBroker).
 #[async_trait]
 pub trait Broker: Send + Sync {
+    /// Every tenant the broker holds. A server uses this on start to find
+    /// the work and alerts it has to take up again. Names that are not valid
+    /// tenant ids are left out.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the broker cannot be reached or refuses.
+    async fn tenants(&self) -> Result<Vec<TenantId>, BrokerError>;
+
+    /// Every topic the tenant holds, in no particular order. Names that are
+    /// not valid topics are left out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::NotFound`] if the tenant does not exist, or an
+    /// error if the broker cannot be reached or refuses.
+    async fn topics(&self, tenant: &TenantId) -> Result<Vec<Topic>, BrokerError>;
+
     /// Make sure the tenant exists. Does nothing if it already does.
     ///
     /// # Errors

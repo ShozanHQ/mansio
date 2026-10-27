@@ -83,14 +83,28 @@ jobs:
       # Development values for a throwaway stack on the runner.
       MANSIO_TOKEN: ci-e2e-token
       MANSIO_E2E_URL: http://127.0.0.1:7070
+      # Seconds-scale work settings, so that a lease, a backoff and an alert
+      # interval take seconds. The tests read them from GET /v1/settings.
+      MANSIO_LEASE_SECONDS: "2"
+      MANSIO_MAX_ATTEMPTS: "3"
+      MANSIO_BACKOFF_BASE_SECONDS: "1"
+      MANSIO_BACKOFF_CAP_SECONDS: "4"
+      MANSIO_ALERT_RESURFACE_SECONDS: "2"
+      MANSIO_TICK_MILLIS: "200"
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Install the toolchain pinned in rust-toolchain.toml
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2.9.3
+      - name: A directory for the sink that the container can write and the tests can read
+        run: |
+          mkdir -p "$RUNNER_TEMP/mansio-sink"
+          chmod 777 "$RUNNER_TEMP/mansio-sink"
+          echo "MANSIO_SINK_DIR=$RUNNER_TEMP/mansio-sink" >> "$GITHUB_ENV"
+          echo "MANSIO_E2E_SINK_PATH=$RUNNER_TEMP/mansio-sink/sink.jsonl" >> "$GITHUB_ENV"
       - name: Start Iggy and mansio-server
         run: docker compose up --build --wait
-      - name: Publish and poll through Iggy
+      - name: Publish, poll, claim, retry and acknowledge through Iggy
         run: cargo test -p mansio-e2e --locked
       - name: Compose logs
         if: failure()

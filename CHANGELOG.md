@@ -26,3 +26,26 @@ All notable changes to mansio are listed here. The format follows
 - `compose.yaml` and a `Dockerfile` that start Iggy 0.9.0 and mansio-server.
 - CI: format, clippy, test, `cargo-deny`, licence and naming checks, and an
   end-to-end run through Iggy.
+- Work items over the HTTP API (`work_publish`, `work_pull`, `work_ack`,
+  `work_fail`): a claim is a lease, a fail or an expired lease republishes the
+  item one attempt on after a doubling backoff, and past the attempt cap it goes
+  to `dead` and nowhere else. Alerts (`alerts_publish`, `alerts_ack`) are
+  acknowledged once and surfaced again each interval until they are. Every
+  transition is an envelope on `facts.work` or `facts.alert`, recorded in the
+  sink first. A restarted server rebuilds its state from the topics.
+- `GET /v1/settings`, and the settings `MANSIO_LEASE_SECONDS`,
+  `MANSIO_MAX_ATTEMPTS`, `MANSIO_BACKOFF_BASE_SECONDS`,
+  `MANSIO_BACKOFF_CAP_SECONDS`, `MANSIO_ALERT_RESURFACE_SECONDS` and
+  `MANSIO_TICK_MILLIS`.
+- `Broker::tenants` and `Broker::topics`, so a server can find what to take up
+  again on start.
+
+### Changed
+
+- Every durable publish holds a per-tenant lock across the sink record and the
+  broker publish, so the sink sees a tenant's messages in the order its topics
+  hold them.
+- The generic messages route refuses `work.<queue>`, `facts.work` and
+  `facts.alert`.
+- `compose.yaml` passes the work settings through, and keeps the sink file in
+  `MANSIO_SINK_DIR` when it is set.

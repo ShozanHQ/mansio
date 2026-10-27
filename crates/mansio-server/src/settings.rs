@@ -48,6 +48,80 @@ impl Default for Limits {
     }
 }
 
+/// How the work and alert engine behaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkSettings {
+    /// How long a claim holds (`MANSIO_LEASE_SECONDS`).
+    pub lease: Duration,
+    /// Attempts an item gets before it goes to `dead`
+    /// (`MANSIO_MAX_ATTEMPTS`).
+    pub max_attempts: u32,
+    /// The wait after a first failure; it doubles with each attempt
+    /// (`MANSIO_BACKOFF_BASE_SECONDS`).
+    pub backoff_base: Duration,
+    /// The longest wait (`MANSIO_BACKOFF_CAP_SECONDS`).
+    pub backoff_cap: Duration,
+    /// How long an alert may go unacknowledged before it is surfaced again,
+    /// and again after each further interval
+    /// (`MANSIO_ALERT_RESURFACE_SECONDS`).
+    pub alert_resurface: Duration,
+    /// How often the timer looks for expiries, republishes and alerts to
+    /// surface (`MANSIO_TICK_MILLIS`).
+    pub tick: Duration,
+}
+
+impl Default for WorkSettings {
+    fn default() -> Self {
+        Self {
+            lease: Duration::from_secs(300),
+            max_attempts: 5,
+            backoff_base: Duration::from_secs(5),
+            backoff_cap: Duration::from_secs(300),
+            alert_resurface: Duration::from_secs(3600),
+            tick: Duration::from_millis(500),
+        }
+    }
+}
+
+impl WorkSettings {
+    /// Check the settings fit together.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the variable that is out of range.
+    pub fn validate(&self) -> Result<(), SettingsError> {
+        let invalid = |name: &'static str, reason: &str| SettingsError::Invalid {
+            name,
+            reason: reason.to_owned(),
+        };
+        if self.lease < Duration::from_secs(1) {
+            return Err(invalid("MANSIO_LEASE_SECONDS", "must be at least 1"));
+        }
+        if self.max_attempts == 0 {
+            return Err(invalid("MANSIO_MAX_ATTEMPTS", "must be at least 1"));
+        }
+        if self.backoff_base < Duration::from_secs(1) {
+            return Err(invalid("MANSIO_BACKOFF_BASE_SECONDS", "must be at least 1"));
+        }
+        if self.backoff_cap < self.backoff_base {
+            return Err(invalid(
+                "MANSIO_BACKOFF_CAP_SECONDS",
+                "must be at least MANSIO_BACKOFF_BASE_SECONDS",
+            ));
+        }
+        if self.alert_resurface < Duration::from_secs(1) {
+            return Err(invalid(
+                "MANSIO_ALERT_RESURFACE_SECONDS",
+                "must be at least 1",
+            ));
+        }
+        if self.tick.is_zero() {
+            return Err(invalid("MANSIO_TICK_MILLIS", "must be at least 1"));
+        }
+        Ok(())
+    }
+}
+
 /// Which broker to run on (`MANSIO_BROKER`), with what it needs.
 #[derive(Debug)]
 pub enum Backend {
@@ -103,6 +177,8 @@ pub struct Settings {
     pub sink_path: Option<PathBuf>,
     /// API limits.
     pub limits: Limits,
+    /// The work and alert engine.
+    pub work: WorkSettings,
 }
 
 impl Settings {
@@ -138,6 +214,23 @@ impl Settings {
             });
         }
 
+        let work_defaults = WorkSettings::default();
+        let work = WorkSettings {
+            lease: env.seconds("MANSIO_LEASE_SECONDS", work_defaults.lease)?,
+            max_attempts: env.parse("MANSIO_MAX_ATTEMPTS", work_defaults.max_attempts)?,
+            backoff_base: env.seconds("MANSIO_BACKOFF_BASE_SECONDS", work_defaults.backoff_base)?,
+            backoff_cap: env.seconds("MANSIO_BACKOFF_CAP_SECONDS", work_defaults.backoff_cap)?,
+            alert_resurface: env.seconds(
+                "MANSIO_ALERT_RESURFACE_SECONDS",
+                work_defaults.alert_resurface,
+            )?,
+            tick: Duration::from_millis(env.parse(
+                "MANSIO_TICK_MILLIS",
+                u64::try_from(work_defaults.tick.as_millis()).unwrap_or(u64::MAX),
+            )?),
+        };
+        work.validate()?;
+
         let broker = match env.string("MANSIO_BROKER", "iggy").as_str() {
             "iggy" => Backend::Iggy(Self::iggy_config(&env)?),
             "memory" => Backend::Memory,
@@ -160,6 +253,7 @@ impl Settings {
                 Some(path) => Some(PathBuf::from(path)),
             },
             limits,
+            work,
         })
     }
 
@@ -222,6 +316,11 @@ impl<F: Fn(&str) -> Option<String>> Env<F> {
             .ok_or(SettingsError::Missing { name })
     }
 
+    /// A whole number of seconds, or `default` if it is not set.
+    fn seconds(&self, name: &'static str, default: Duration) -> Result<Duration, SettingsError> {
+        self.parse(name, default.as_secs()).map(Duration::from_secs)
+    }
+
     /// The parsed value of `name`, or of `default` if it is not set.
     fn parse<T>(&self, name: &'static str, default: impl ToString) -> Result<T, SettingsError>
     where
@@ -260,6 +359,7 @@ mod tests {
         assert_eq!(settings.token_principal.to_string(), "service:mansio");
         assert_eq!(settings.sink_path, Some(PathBuf::from("mansio-sink.jsonl")));
         assert_eq!(settings.limits, Limits::default());
+        assert_eq!(settings.work, WorkSettings::default());
         let Backend::Iggy(iggy) = settings.broker else {
             panic!("expected the Iggy broker");
         };
@@ -328,6 +428,83 @@ mod tests {
                 poll_max_count: 50
             }
         );
+    }
+
+    #[test]
+    fn the_defaults_for_work_are_the_documented_ones() {
+        let work = WorkSettings::default();
+        assert_eq!(work.lease, Duration::from_secs(300));
+        assert_eq!(work.max_attempts, 5);
+        assert_eq!(work.backoff_base, Duration::from_secs(5));
+        assert_eq!(work.backoff_cap, Duration::from_secs(300));
+        assert_eq!(work.alert_resurface, Duration::from_secs(3600));
+        assert_eq!(work.tick, Duration::from_millis(500));
+        assert_eq!(work.validate(), Ok(()));
+    }
+
+    #[test]
+    fn work_settings_are_read_from_the_environment() {
+        let settings = settings(&[
+            ("MANSIO_TOKEN", "t"),
+            ("MANSIO_BROKER", "memory"),
+            ("MANSIO_LEASE_SECONDS", "2"),
+            ("MANSIO_MAX_ATTEMPTS", "3"),
+            ("MANSIO_BACKOFF_BASE_SECONDS", "1"),
+            ("MANSIO_BACKOFF_CAP_SECONDS", "4"),
+            ("MANSIO_ALERT_RESURFACE_SECONDS", "7"),
+            ("MANSIO_TICK_MILLIS", "100"),
+        ])
+        .unwrap();
+        assert_eq!(
+            settings.work,
+            WorkSettings {
+                lease: Duration::from_secs(2),
+                max_attempts: 3,
+                backoff_base: Duration::from_secs(1),
+                backoff_cap: Duration::from_secs(4),
+                alert_resurface: Duration::from_secs(7),
+                tick: Duration::from_millis(100),
+            }
+        );
+    }
+
+    #[test]
+    fn work_settings_that_do_not_fit_are_refused_by_name() {
+        for (name, value) in [
+            ("MANSIO_LEASE_SECONDS", "0"),
+            ("MANSIO_MAX_ATTEMPTS", "0"),
+            ("MANSIO_BACKOFF_BASE_SECONDS", "0"),
+            ("MANSIO_ALERT_RESURFACE_SECONDS", "0"),
+            ("MANSIO_TICK_MILLIS", "0"),
+            ("MANSIO_LEASE_SECONDS", "soon"),
+            ("MANSIO_TICK_MILLIS", "-5"),
+        ] {
+            let error = settings(&[
+                ("MANSIO_TOKEN", "t"),
+                ("MANSIO_BROKER", "memory"),
+                (name, value),
+            ])
+            .unwrap_err();
+            assert!(
+                matches!(&error, SettingsError::Invalid { name: reported, .. } if *reported == name),
+                "{name}={value}: {error:?}"
+            );
+        }
+        // The cap may not be below the base.
+        let error = settings(&[
+            ("MANSIO_TOKEN", "t"),
+            ("MANSIO_BROKER", "memory"),
+            ("MANSIO_BACKOFF_BASE_SECONDS", "10"),
+            ("MANSIO_BACKOFF_CAP_SECONDS", "5"),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SettingsError::Invalid {
+                name: "MANSIO_BACKOFF_CAP_SECONDS",
+                ..
+            }
+        ));
     }
 
     #[test]

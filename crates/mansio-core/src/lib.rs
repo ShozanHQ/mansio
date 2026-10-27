@@ -11,6 +11,7 @@ mod id;
 mod memory;
 mod sink;
 mod topic;
+mod work;
 
 pub use broker::{Broker, Stored};
 pub use envelope::{
@@ -18,9 +19,10 @@ pub use envelope::{
 };
 pub use error::{BrokerError, EnvelopeError, ParseError, SinkError};
 pub use id::{
-    CausationId, CorrelationId, EventId, EventType, IdempotencyKey, ItemId, Principal,
-    PrincipalKind, PrincipalName, RecordId, Segment, Source, Subject, TenantId,
+    CausationId, ConsumerName, CorrelationId, EventId, EventType, IdempotencyKey, ItemId, LeaseId,
+    Principal, PrincipalKind, PrincipalName, RecordId, Segment, Source, Subject, TenantId,
 };
 pub use memory::MemoryBroker;
 pub use sink::{NoSink, Sink};
 pub use topic::{Topic, TopicKind};
+pub use work::{AlertEvent, AlertFact, Next, WorkEvent, WorkFact};
