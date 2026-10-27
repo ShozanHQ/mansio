@@ -12,14 +12,25 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use mansio_core::{
-    BrokerUser, CredentialDigest, Principal, PrincipalId, PrincipalInfo, TenantId, Timestamp,
+    BrokerUser, CredentialDigest, Grant, Principal, PrincipalId, PrincipalInfo, PrincipalKind,
+    PrincipalName, TenantId, Timestamp, TopicPattern, Verb,
 };
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::ApiError;
 
+/// The version of the record format written now. A record says which it is in
+/// `v`; one without is version 1, which was written before the field was.
+///
+/// A later version that changes what a record means adds a number here and
+/// keeps reading the earlier ones: a record that was valid when it was written
+/// is a principal for as long as the log is kept.
+const VERSION: u64 = 1;
+
 /// One record of the log.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub(crate) enum Entry {
     /// A credential was issued for the principal, as the broker's user.
@@ -32,16 +43,107 @@ pub(crate) enum Entry {
     Revoked { id: PrincipalId, at: Timestamp },
 }
 
+/// A record as it is read: the shape of the version it was written in, with
+/// fields it does not know ignored, and a scope not checked again.
+#[derive(Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum StoredEntry {
+    Created {
+        principal: StoredPrincipal,
+        user: BrokerUser,
+        digest: CredentialDigest,
+    },
+    Revoked {
+        id: PrincipalId,
+        at: Timestamp,
+    },
+}
+
+#[derive(Deserialize)]
+struct StoredPrincipal {
+    id: PrincipalId,
+    kind: PrincipalKind,
+    name: PrincipalName,
+    tenant: TenantId,
+    scopes: Vec<StoredGrant>,
+    created_at: Timestamp,
+    #[serde(default)]
+    expires_at: Option<Timestamp>,
+}
+
+#[derive(Deserialize)]
+struct StoredGrant {
+    topic: TopicPattern,
+    verbs: Vec<Verb>,
+}
+
+impl From<StoredEntry> for Entry {
+    fn from(stored: StoredEntry) -> Self {
+        match stored {
+            StoredEntry::Created {
+                principal,
+                user,
+                digest,
+            } => Entry::Created {
+                principal: PrincipalInfo {
+                    id: principal.id,
+                    kind: principal.kind,
+                    name: principal.name,
+                    tenant: principal.tenant,
+                    scopes: principal
+                        .scopes
+                        .into_iter()
+                        .map(|grant| Grant::from_stored(grant.topic, grant.verbs))
+                        .collect(),
+                    created_at: principal.created_at,
+                    expires_at: principal.expires_at,
+                },
+                user,
+                digest,
+            },
+            StoredEntry::Revoked { id, at } => Entry::Revoked { id, at },
+        }
+    }
+}
+
 impl Entry {
     pub(crate) fn encode(&self) -> Result<Vec<u8>, ApiError> {
-        serde_json::to_vec(self).map_err(|reason| {
+        let mut value = serde_json::to_value(self).map_err(|reason| {
+            tracing::error!(%reason, "a registry record did not serialize");
+            ApiError::Internal
+        })?;
+        let Some(fields) = value.as_object_mut() else {
+            tracing::error!("a registry record did not serialize to an object");
+            return Err(ApiError::Internal);
+        };
+        fields.insert("v".to_owned(), VERSION.into());
+        serde_json::to_vec(&value).map_err(|reason| {
             tracing::error!(%reason, "a registry record did not serialize");
             ApiError::Internal
         })
     }
 
+    /// Read a record of any version up to this one. A scope in it is taken as
+    /// it was stored, whatever the rules for a new one are now.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a record that is not one, or was written by a
+    /// version newer than this one.
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(bytes)
+        let value: Value = serde_json::from_slice(bytes)?;
+        let version = match value.get("v") {
+            None => 1,
+            Some(v) => v
+                .as_u64()
+                .ok_or_else(|| serde_json::Error::custom("the version `v` is not a number"))?,
+        };
+        if version == 0 || version > VERSION {
+            return Err(serde_json::Error::custom(format!(
+                "version {version} of the record format; this server reads up to {VERSION}"
+            )));
+        }
+        Ok(serde_json::from_value::<StoredEntry>(value)?.into())
     }
 }
 
@@ -203,6 +305,7 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use mansio_core::{Credential, Grant, Verb};
+    use serde_json::json;
 
     use super::*;
 
@@ -257,6 +360,103 @@ mod tests {
         assert!(!text.contains("token-7"), "{text}");
         assert!(Entry::decode(b"not json").is_err());
         assert!(Entry::decode(br#"{"op":"other"}"#).is_err());
+    }
+
+    #[test]
+    fn a_record_says_which_version_of_the_format_it_is() {
+        let principal = info("a", "acme", "2026-10-26T12:00:00Z", None);
+        let text = String::from_utf8(created(&principal, 7).encode().unwrap()).unwrap();
+        let written: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(written["v"], 1, "{text}");
+        let revoked = Entry::Revoked {
+            id: principal.id,
+            at: "2026-10-26T13:00:00Z".parse().unwrap(),
+        };
+        let written: serde_json::Value =
+            serde_json::from_slice(&revoked.encode().unwrap()).unwrap();
+        assert_eq!(written["v"], 1);
+    }
+
+    /// A `created` record as an earlier version wrote it, with the fields and
+    /// the scopes the test gives.
+    fn old_record(version: Option<serde_json::Value>, scopes: serde_json::Value) -> Vec<u8> {
+        let mut record = json!({
+            "op": "created",
+            "principal": {
+                "id": PrincipalId::generate().to_string(),
+                "kind": "agent",
+                "name": "builder",
+                "tenant": "acme",
+                "scopes": scopes,
+                "created_at": "2026-10-26T12:00:00Z",
+                "a_field_a_later_version_added": true,
+            },
+            "user": 4,
+            "digest": digest("token-4").to_string(),
+            "another_field": [1, 2],
+        });
+        if let Some(version) = version {
+            record["v"] = version;
+        }
+        serde_json::to_vec(&record).unwrap()
+    }
+
+    #[test]
+    fn a_record_of_an_earlier_version_is_read_whatever_has_been_added_to_the_format() {
+        let scopes = json!([{"topic": "alerts", "verbs": ["subscribe"], "note": "ignored"}]);
+        // No `v` is version 1; fields it does not know are ignored.
+        for version in [None, Some(json!(1))] {
+            let entry = Entry::decode(&old_record(version, scopes.clone())).unwrap();
+            let Entry::Created {
+                principal, user, ..
+            } = entry
+            else {
+                panic!("a created record");
+            };
+            assert_eq!(user, BrokerUser(4));
+            assert_eq!(principal.name.to_string(), "builder");
+            assert_eq!(principal.scopes.len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_scope_that_todays_rules_would_refuse_is_still_the_principals_scope() {
+        // Neither would be made now: only mansio publishes to `facts.work`,
+        // and `claim` applies to work topics. Both were valid once.
+        let scopes = json!([
+            {"topic": "facts.work", "verbs": ["publish", "subscribe"]},
+            {"topic": "alerts", "verbs": ["claim"]},
+        ]);
+        let Entry::Created { principal, .. } = Entry::decode(&old_record(None, scopes)).unwrap()
+        else {
+            panic!("a created record");
+        };
+        assert_eq!(principal.scopes.len(), 2);
+        let facts_work: mansio_core::Topic = "facts.work".parse().unwrap();
+        assert!(!mansio_core::allows(
+            &principal.scopes,
+            mansio_core::Action::Send,
+            &facts_work
+        ));
+        assert!(mansio_core::allows(
+            &principal.scopes,
+            mansio_core::Action::Poll,
+            &facts_work
+        ));
+    }
+
+    #[test]
+    fn a_record_of_a_later_version_or_without_a_meaning_is_not_read() {
+        let scopes = json!([{"topic": "alerts", "verbs": ["subscribe"]}]);
+        for version in [json!(2), json!(0), json!("1"), json!(null)] {
+            let error = Entry::decode(&old_record(Some(version.clone()), scopes.clone()))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("version"), "{version}: {error}");
+        }
+        // And what is not a record of any version.
+        assert!(Entry::decode(br#"{"op":"created","principal":"x"}"#).is_err());
+        assert!(Entry::decode(b"").is_err());
     }
 
     #[test]

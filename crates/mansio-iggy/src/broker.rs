@@ -51,6 +51,10 @@ const PARTITION: u32 = 0;
 struct Ensured {
     /// A tenant is a known stream; its topics are the known topics in it.
     known: Mutex<HashMap<TenantId, HashSet<Topic>>>,
+    /// Topics this process made whose users have not been told yet, because
+    /// telling them failed. The next request tries again, and finds the topic
+    /// already there.
+    unopened: Mutex<HashSet<(TenantId, Topic)>>,
 }
 
 impl Ensured {
@@ -66,6 +70,23 @@ impl Ensured {
         self.lock()
             .get(tenant)
             .is_some_and(|topics| topics.contains(topic))
+    }
+
+    fn unopened(&self) -> MutexGuard<'_, HashSet<(TenantId, Topic)>> {
+        self.unopened.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A topic was made and its users are yet to be told.
+    fn mark_unopened(&self, tenant: &TenantId, topic: &Topic) {
+        self.unopened().insert((tenant.clone(), topic.clone()));
+    }
+
+    fn is_unopened(&self, tenant: &TenantId, topic: &Topic) -> bool {
+        self.unopened().contains(&(tenant.clone(), topic.clone()))
+    }
+
+    fn mark_opened(&self, tenant: &TenantId, topic: &Topic) {
+        self.unopened().remove(&(tenant.clone(), topic.clone()));
     }
 
     fn add_stream(&self, tenant: &TenantId) {
@@ -206,9 +227,9 @@ impl IggyBroker {
 
     // ---- sessions ---------------------------------------------------------
 
-    /// A client signed in with the credential. Iggy refusing the sign-in, for
-    /// whatever reason it gives, means the credential is not valid: unknown,
-    /// expired, or its user is gone.
+    /// A client signed in with the credential. Iggy refusing the sign-in with
+    /// a reason that is about the token (see [`login_failure`]) means the
+    /// credential is not valid: unknown, expired, or its user is gone.
     async fn sign_in(&self, credential: &Credential) -> Result<Session, BrokerError> {
         let timed_out = || {
             BrokerError::Unavailable(format!(
@@ -443,12 +464,20 @@ impl IggyBroker {
             self.segment_size_bytes,
             topic,
         );
-        self.make_topic(tenant.as_str(), &topic.to_string(), &options)
+        let made = self
+            .make_topic(tenant.as_str(), &topic.to_string(), &options)
             .await?;
-        // Whether the topic was made now or found, the users whose scopes
-        // cover it may not have it yet: it may have been made just before a
-        // restart, or by a request that did not get as far as this.
-        self.open_to_users(tenant).await?;
+        // Users get a topic their scopes cover when it is made. One that was
+        // found is already open to them: `load` applied every principal over
+        // every topic there was, and a topic made since was opened by the
+        // request that made it, unless that failed and left it marked.
+        if made {
+            self.ensured.mark_unopened(tenant, topic);
+        }
+        if self.ensured.is_unopened(tenant, topic) {
+            self.open_to_users(tenant).await?;
+            self.ensured.mark_opened(tenant, topic);
+        }
         self.ensured.add_topic(tenant, topic);
         Ok(())
     }
@@ -746,23 +775,25 @@ fn map_iggy(error: IggyError) -> BrokerError {
     }
 }
 
-/// Why Iggy would not sign in with a token. Whatever the reason it gives, the
-/// token is not valid (unknown, expired, or its user is gone), unless the
-/// answer is about reaching Iggy, which says nothing about the token. Nothing
-/// is written by a sign-in, so unlike `map_iggy` there is no outcome to be
-/// unsure of.
+/// Why Iggy would not sign in with a token. Only the refusals that say the
+/// token is not valid (unknown, malformed, expired, or its user gone or
+/// inactive) are `Unauthenticated`, which ends a kept session and answers a
+/// caller 401 for good. Anything else, an answer about reaching Iggy or one
+/// that is not known to be about the token, is `Unavailable`: a valid
+/// credential must not be refused for good because of a fault that is not its
+/// own. Nothing is written by a sign-in, so unlike `map_iggy` there is no
+/// outcome to be unsure of.
 fn login_failure(error: IggyError) -> BrokerError {
     let text = error.to_string();
     match error {
-        IggyError::Disconnected
-        | IggyError::CannotEstablishConnection
-        | IggyError::ClientShutdown
-        | IggyError::StaleClient
-        | IggyError::TcpError
-        | IggyError::TransientNotCommitted
-        | IggyError::TransientNotAccepted
-        | IggyError::TaskTimeout => BrokerError::Unavailable(text),
-        _ => BrokerError::Unauthenticated(text),
+        IggyError::InvalidPersonalAccessToken
+        | IggyError::PersonalAccessTokenExpired(..)
+        | IggyError::InvalidCredentials
+        | IggyError::Unauthenticated
+        | IggyError::UserInactive
+        | IggyError::ResourceNotFound(_)
+        | IggyError::InvalidFormat => BrokerError::Unauthenticated(text),
+        _ => BrokerError::Unavailable(text),
     }
 }
 
@@ -1170,14 +1201,15 @@ mod tests {
     }
 
     #[test]
-    fn a_sign_in_iggy_refuses_is_an_invalid_token_unless_iggy_was_not_reached() {
+    fn only_a_refusal_that_says_the_token_is_bad_is_an_invalid_token() {
         for refused in [
             IggyError::InvalidPersonalAccessToken,
             IggyError::PersonalAccessTokenExpired("mansio".to_owned(), 7),
             IggyError::Unauthenticated,
             IggyError::InvalidCredentials,
+            IggyError::UserInactive,
             IggyError::ResourceNotFound("user".to_owned()),
-            IggyError::Error,
+            IggyError::InvalidFormat,
         ] {
             let text = refused.to_string();
             assert!(
@@ -1185,16 +1217,26 @@ mod tests {
                 "{text}"
             );
         }
-        for unreached in [
+    }
+
+    #[test]
+    fn any_other_sign_in_failure_leaves_the_token_standing() {
+        for other in [
             IggyError::Disconnected,
             IggyError::CannotEstablishConnection,
             IggyError::TcpError,
             IggyError::TaskTimeout,
+            IggyError::Error,
+            IggyError::InvalidCommand,
+            IggyError::RequestAlreadyApplied,
+            IggyError::ClientNotFound(3),
+            IggyError::Unauthorized,
         ] {
-            assert!(matches!(
-                login_failure(unreached),
-                BrokerError::Unavailable(_)
-            ));
+            let text = other.to_string();
+            assert!(
+                matches!(login_failure(other), BrokerError::Unavailable(why) if why == text),
+                "{text}"
+            );
         }
     }
 
@@ -1370,6 +1412,28 @@ mod tests {
         ensured.forget(&acme);
         assert!(!ensured.has_stream(&acme) && !ensured.has_topic(&acme, &alerts));
         assert!(ensured.has_topic(&other, &alerts), "other tenants are kept");
+    }
+
+    #[test]
+    fn a_topic_made_stays_unopened_until_its_users_have_been_told() {
+        let ensured = Ensured::default();
+        let acme: TenantId = "acme".parse().unwrap();
+        let alerts = Topic::Alerts;
+        assert!(
+            !ensured.is_unopened(&acme, &alerts),
+            "a topic found is open"
+        );
+
+        ensured.mark_unopened(&acme, &alerts);
+        assert!(ensured.is_unopened(&acme, &alerts));
+        assert!(!ensured.is_unopened(&acme, &Topic::Dead));
+        // Telling them failed, the topic was not remembered as ensured, and
+        // the next request still has it to do.
+        assert!(!ensured.has_topic(&acme, &alerts));
+        assert!(ensured.is_unopened(&acme, &alerts));
+
+        ensured.mark_opened(&acme, &alerts);
+        assert!(!ensured.is_unopened(&acme, &alerts));
     }
 
     #[test]

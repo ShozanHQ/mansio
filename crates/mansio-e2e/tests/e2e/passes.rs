@@ -15,7 +15,12 @@
 //! - `restart_first_pass` and `restart_second_pass`: a queue longer than
 //!   `MANSIO_POLL_MAX_COUNT`, one item claimed before the restart. After it
 //!   the lease still holds, the item is retried exactly once, and every other
-//!   item can be claimed once.
+//!   item can be claimed once. Two credentials are issued before it and one
+//!   revoked; after it the registry of principals the new server rebuilt from
+//!   its log in Iggy knows the one that was kept (it publishes and polls as
+//!   its principal), refuses the revoked one with 401, and lists just the
+//!   kept principal. A server whose registry did not load would answer every
+//!   credential with 503, and the second pass fails.
 //! - `retention_first_pass` and `retention_second_pass`: an `alerts` topic on a
 //!   short retention loses its head to Iggy's cleaner, and an alert is
 //!   published after that. After the restart the server's rebuild, which
@@ -29,6 +34,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail, ensure};
+use mansio_core::api::Polled;
 use mansio_core::{Envelope, LeaseId};
 use mansio_server::Limits;
 use reqwest::StatusCode;
@@ -64,9 +70,19 @@ fn state_path(pass: &str) -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(dir).join(format!("{pass}.json")))
 }
 
+/// Keep the state of a pass for the next. It holds the credentials the first
+/// pass issued, so it is readable by its owner alone, and the directory is the
+/// job's, outside the checkout.
 fn save(pass: &str, state: &Value) -> anyhow::Result<()> {
+    use std::io::Write;
     let path = state_path(pass)?;
-    std::fs::write(&path, serde_json::to_vec_pretty(state)?)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options
+        .open(&path)
+        .and_then(|mut file| file.write_all(&serde_json::to_vec_pretty(state)?))
         .with_context(|| format!("writing {}", path.display()))
 }
 
@@ -131,7 +147,93 @@ async fn restart_before(target: &Target) -> anyhow::Result<Value> {
         "held": held,
         "lease_id": claim.lease_id.to_string(),
         "expires_at": millis(&claim.expires_at)?,
+        "credentials": credentials_before(target).await?,
     }))
+}
+
+/// The topic the two credentials of the restart passes publish to and poll.
+const CREDENTIAL_TOPIC: &str = "facts.restart";
+const KEPT: &str = "restart-kept";
+const REVOKED: &str = "restart-revoked";
+
+/// Issue two credentials, each of which publishes once, and revoke one. The
+/// answer is what the second pass needs to use them, and they are the secrets
+/// of a stack that is thrown away: it goes to the state directory, never to
+/// the repository.
+async fn credentials_before(target: &Target) -> anyhow::Result<Value> {
+    let scopes = json!([{ "topic": CREDENTIAL_TOPIC, "verbs": ["publish", "subscribe"] }]);
+    let kept = target.issue("service", KEPT, &scopes, None).await?;
+    let revoked = target.issue("service", REVOKED, &scopes, None).await?;
+    for credential in [&kept, &revoked] {
+        let (status, body) = credential.publish(CREDENTIAL_TOPIC).await?;
+        ensure!(
+            status == StatusCode::CREATED,
+            "a new credential's publish answered {status}: {body}"
+        );
+    }
+    let (status, body) = target.revoke(&revoked.id).await?;
+    ensure!(
+        status == StatusCode::OK,
+        "principals_revoke answered {status}: {body}"
+    );
+    let (status, body) = revoked.publish(CREDENTIAL_TOPIC).await?;
+    ensure!(
+        status == StatusCode::UNAUTHORIZED,
+        "the revoked credential's publish answered {status}: {body}"
+    );
+    Ok(json!({
+        "kept": { "id": kept.id, "token": kept.token },
+        "revoked": { "id": revoked.id, "token": revoked.token },
+    }))
+}
+
+/// The server has been restarted, and rebuilt the registry of principals from
+/// its log: the credential that was kept is its principal's, the revoked one
+/// is refused, and the list holds the one.
+async fn credentials_after(target: &Target, state: &Value) -> anyhow::Result<()> {
+    let credential = |which: &str| -> anyhow::Result<crate::harness::Issued> {
+        Ok(target.adopt(text(&state[which], "id")?, text(&state[which], "token")?))
+    };
+    let (kept, revoked) = (credential("kept")?, credential("revoked")?);
+
+    // Not a 503, which is what a registry that did not load answers.
+    let (status, body) = kept.publish(CREDENTIAL_TOPIC).await?;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "the kept credential publishes: {body}"
+    );
+    let (status, body) = kept.poll(CREDENTIAL_TOPIC).await?;
+    assert_eq!(status, StatusCode::OK, "the kept credential polls: {body}");
+    let polled: Polled = serde_json::from_value(body)?;
+    let wrote: Vec<String> = polled
+        .messages
+        .iter()
+        .map(|stored| stored.envelope.principal.to_string())
+        .collect();
+    assert_eq!(
+        wrote,
+        [
+            format!("service:{KEPT}"),
+            format!("service:{REVOKED}"),
+            format!("service:{KEPT}")
+        ],
+        "each message carries the principal of the credential that sent it, before and after the restart"
+    );
+
+    let (status, body) = revoked.publish(CREDENTIAL_TOPIC).await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    let (status, body) = revoked.poll(CREDENTIAL_TOPIC).await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    let listed = target.principals().await?;
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0]["id"], kept.id.as_str());
+    assert_eq!(listed[0]["name"], KEPT);
+    // The revocation is in the registry too, not only in Iggy.
+    let (status, _) = target.revoke(&revoked.id).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
 }
 
 fn item_of_published(published: &mansio_core::api::Published) -> anyhow::Result<String> {
@@ -236,7 +338,8 @@ async fn restart_after(target: &Target, state: &Value) -> anyhow::Result<()> {
         retries[0].item_id.as_ref().map(ToString::to_string),
         Some(held)
     );
-    Ok(())
+
+    credentials_after(target, &state["credentials"]).await
 }
 
 #[tokio::test]

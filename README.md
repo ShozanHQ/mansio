@@ -215,6 +215,13 @@ Everything except `/healthz` needs `Authorization: Bearer <token>`. The token
 is the admin token (`MANSIO_TOKEN`) or a credential issued to a principal, see
 [Credentials](#credentials). The examples use the admin token.
 
+`GET /healthz` answers 200 `{"status":"ok"}`. While the registry of principals
+cannot be loaded (the broker could not be read, or a record of it cannot be)
+it answers 503 `{"status":"degraded","credentials":"unavailable","message":...}`:
+the server is up, every credential gets 503, and only the admin token works.
+The server log says why, at `error`. `compose.yaml`'s health check fails on it,
+so the stack is not healthy until the registry loads.
+
 ```sh
 curl -H "Authorization: Bearer $MANSIO_TOKEN" -H 'Content-Type: application/json' \
   -d '{"source":"ci","type":"build.finished","data":{"ok":true}}' \
@@ -554,7 +561,17 @@ its tenant and no other.
   `requested`, `expired` or `failed`), recorded in the sink first. The
   generic messages route refuses the topic, and a credential with `facts.*`
   can read it. The principals themselves are kept in a log in the broker that
-  no credential can read, and read again on start.
+  no credential can read, and read again on start. Each record in it carries
+  the version of its format, and an earlier version is read as it was written,
+  its scopes included, whatever the rules for a new scope are by then. If a
+  record cannot be read the registry does not load: nothing is deleted or
+  revoked for it, every credential is refused with 503, and `/healthz` is
+  degraded, until the record is dealt with and the server restarted.
+- A `principals_create` that answers 5xx may have made the principal anyway
+  (it fails after the broker has made the user, or the record fails to be
+  written, and mansio undoes what it can). Its credential was not returned. List
+  the tenant's principals, revoke the one of that kind and name, and issue it
+  again: until then the name is taken and a retry is a 409.
 
 #### What enforces what
 
@@ -591,8 +608,9 @@ that keeps what it is allowed to read until the user is deleted: at a
 revocation, immediately; at an expiry, by the next sweep, so within
 `MANSIO_CREDENTIAL_SWEEP_SECONDS`, and only while mansio-server runs. A user
 that is signed in can make tokens for itself, including ones that never
-expire; they stop working with the user. When the server starts it deletes the
-Iggy users it made for principals it holds no record of.
+expire; they stop working with the user. When the server starts, and has read the whole
+registry, it deletes the Iggy users it made for principals it holds no record
+of. While a record cannot be read it deletes none.
 
 ### Order
 
@@ -613,7 +631,7 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_TOKEN` | none, required | The admin's bearer token, which may do everything in every tenant, and call the admin API. |
 | `MANSIO_TOKEN_PRINCIPAL` | `service:mansio` | The `kind:name` the admin token stands for. |
 | `MANSIO_AGENT_CREDENTIAL_TTL_SECONDS` | `3600` | How long an agent credential lasts when the request does not say. |
-| `MANSIO_CREDENTIAL_RECHECK_SECONDS` | `30` | The longest a credential is trusted without asking the broker again, so the longest a revocation the server did not see itself takes to apply. |
+| `MANSIO_CREDENTIAL_RECHECK_SECONDS` | `30` | The longest a credential is trusted without asking the broker again, so the longest a revocation the server did not see itself takes to apply. Also how long the server waits after a registry that could not be loaded before it tries again. |
 | `MANSIO_CREDENTIAL_SWEEP_SECONDS` | `60` | How often expired credentials are revoked. |
 | `MANSIO_SINK_PATH` | `mansio-sink.jsonl` (`/data/sink.jsonl` in the image) | JSON Lines file that every durable publish is appended to before it is published. Empty turns the sink off. |
 | `MANSIO_MAX_BODY_BYTES` | `1048576` | Largest request body. |
