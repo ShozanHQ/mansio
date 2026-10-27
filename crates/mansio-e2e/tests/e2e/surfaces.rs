@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, anyhow, ensure};
 use serde_json::{Value, json};
 
-use crate::harness::{SLACK, Target, job};
+use crate::harness::{SLACK, Target, job, millis};
 use crate::receiver::{Receiver, Reply};
 
 /// A command line for the binary against this target, with the token given
@@ -1068,17 +1068,21 @@ async fn the_mcp_server_lists_the_tools_and_pulls_and_acks_work_over_stdio() -> 
             "item": claim["item"]["itemid"], "consumer": claim["consumer"],
             "lease_id": claim["lease_id"]
         });
+        // Work that takes longer than the lease extends it first.
+        let mut extend_args = ack_args.clone();
+        extend_args["seconds"] = json!(60);
+        let extended = mcp.call(9, "work_extend", extend_args)?;
         let acked = mcp.call(5, "work_ack", ack_args.clone())?;
         let empty = mcp.call(6, "work_pull", args)?;
         let twice = mcp.call(7, "work_ack", ack_args)?;
         let bad = mcp.call(8, "work_pull", json!({"tenant": t}))?;
         let status = mcp.finish()?;
         Ok((
-            init, listed, pulled, again, acked, empty, twice, bad, status,
+            init, listed, pulled, again, extended, acked, empty, twice, bad, status,
         ))
     })
     .await??;
-    let (init, listed, pulled, again, acked, empty, twice, bad, status) = talked;
+    let (init, listed, pulled, again, extended, acked, empty, twice, bad, status) = talked;
 
     assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
     assert_eq!(init["result"]["serverInfo"]["name"], "mansio");
@@ -1103,6 +1107,7 @@ async fn the_mcp_server_lists_the_tools_and_pulls_and_acks_work_over_stdio() -> 
         "webhooks_delete",
         "webhooks_list",
         "work_ack",
+        "work_extend",
         "work_fail",
         "work_publish",
         "work_pull",
@@ -1117,6 +1122,16 @@ async fn the_mcp_server_lists_the_tools_and_pulls_and_acks_work_over_stdio() -> 
     let claim: Value = serde_json::from_str(&pulled.1)?;
     assert_eq!(claim["item"]["id"], json!(item.id.to_string()));
     assert_eq!(again, pulled, "the same lease again");
+    assert!(!extended.0, "{}", extended.1);
+    let extended: Value = serde_json::from_str(&extended.1)?;
+    assert_eq!(extended["type"], "mansio.work.extended");
+    assert_eq!(extended["itemid"], claim["item"]["itemid"]);
+    let ends = extended["data"]["expires_at"].clone();
+    let ends = millis(&serde_json::from_value(ends)?)?;
+    assert!(
+        ends > millis(&serde_json::from_value(claim["expires_at"].clone())?)?,
+        "the lease now ends later than the claim said"
+    );
     assert!(!acked.0, "{}", acked.1);
     let acked: Value = serde_json::from_str(&acked.1)?;
     assert_eq!(acked["type"], "mansio.work.acked");
@@ -1127,7 +1142,10 @@ async fn the_mcp_server_lists_the_tools_and_pulls_and_acks_work_over_stdio() -> 
     assert!(bad.0 && bad.1.contains("queue is required"), "{}", bad.1);
     assert!(status.success(), "exit {status}");
 
-    assert_eq!(target.work_transitions().await?, ["claimed", "acked"]);
+    assert_eq!(
+        target.work_transitions().await?,
+        ["claimed", "extended", "acked"]
+    );
     Ok(())
 }
 
