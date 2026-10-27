@@ -12,6 +12,8 @@ mansio is a message bus for agents, people and programs that are not connected a
 | `mansio` | bin | The CLI and the MCP server (`mansio mcp`, stdio). Both are clients of the HTTP API and use the same operation names. |
 | `mansio-e2e` | test | End-to-end tests. With `MANSIO_E2E_URL` unset they start an in-process server on `MemoryBroker`; with it set they run against a live server and Iggy (CI, through compose). |
 
+`tests/offline/` is the test of the guarantee that work is never dropped and never done twice for consumers that are not always connected: a shell consumer killed while idle, holding a lease, and restarted under its name, run against compose in CI (README, "The guarantee").
+
 ## The envelope
 
 CloudEvents 1.0 in its JSON format. Required: `specversion` (`1.0`), `id` (a lowercase hyphenated UUID, never nil; also the Iggy message id), `source`, `type`. Optional CloudEvents attributes: `subject`, `time` (RFC 3339, kept as written), `datacontenttype` (only `application/json`), `data` (JSON). On publish the server fills in `specversion`, `id` and `time` when the producer left them out. Iggy does not deduplicate on the message id, so a resend is stored again: consumers deduplicate on `id` and `idempotencykey`.
