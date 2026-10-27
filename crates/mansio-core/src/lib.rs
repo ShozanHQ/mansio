@@ -17,17 +17,19 @@ mod topic;
 pub mod webhook;
 mod work;
 
-pub use access::{Action, Grant, TopicAccess, TopicPattern, Verb, allows, topic_access};
-pub use broker::{Broker, BrokerUser, Caller, Minted, Stored, SystemLog, SystemRecord};
+pub use access::{Action, Grant, TopicPattern, Verb, allows};
+pub use broker::{
+    Broker, BrokerUser, BrokerUserInfo, Caller, Minted, Stored, SystemLog, SystemRecord,
+};
 pub use credential::{Credential, CredentialDigest};
 pub use envelope::{
     ApprovalState, Budget, DataContentType, Envelope, Hash, Record, Scope, Timestamp,
 };
 pub use error::{BrokerError, EnvelopeError, ParseError, SinkError};
 pub use id::{
-    CausationId, ConsumerName, CorrelationId, EventId, EventType, IdempotencyKey, ItemId, LeaseId,
-    Principal, PrincipalId, PrincipalKind, PrincipalName, RecordId, Segment, Source, Subject,
-    TenantId, WebhookId,
+    CausationId, ConsumerName, CorrelationId, EventId, EventType, IdempotencyKey, ItemId,
+    LeaseFingerprint, LeaseId, Principal, PrincipalId, PrincipalKind, PrincipalName, RecordId,
+    Segment, Source, Subject, TenantId, WebhookId,
 };
 pub use memory::MemoryBroker;
 pub use principal::{PrincipalEvent, PrincipalFact, PrincipalInfo, RevokeReason};

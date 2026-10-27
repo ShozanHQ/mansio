@@ -60,8 +60,12 @@ pub struct PullRequest {
 /// its id.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Claimed {
-    /// The id to present to acknowledge or fail the item.
+    /// The id to present to acknowledge or fail the item. It is the holder's
+    /// proof; the facts record a fingerprint of it, never the id.
     pub lease_id: LeaseId,
+    /// The consumer name the lease was taken under, which `work_ack` and
+    /// `work_fail` name too.
+    pub consumer: ConsumerName,
     /// When the lease ends, as RFC 3339.
     pub expires_at: Timestamp,
     /// The work message, with its `itemid` and `attempt`.
@@ -74,6 +78,9 @@ pub struct Claimed {
 pub struct AckRequest {
     /// The lease the item was claimed under.
     pub lease_id: LeaseId,
+    /// The consumer it was claimed as: the holder is the principal, the
+    /// consumer and the lease together.
+    pub consumer: ConsumerName,
 }
 
 /// The body of `work_fail`.
@@ -82,6 +89,8 @@ pub struct AckRequest {
 pub struct FailRequest {
     /// The lease the item was claimed under.
     pub lease_id: LeaseId,
+    /// The consumer it was claimed as.
+    pub consumer: ConsumerName,
     /// Why it failed. Recorded on the `failed` fact.
     pub reason: String,
 }

@@ -49,10 +49,14 @@ pub enum BrokerError {
     /// The tenant or topic does not exist.
     #[error("not found: {0}")]
     NotFound(String),
-    /// The broker could not be reached, or did not answer in time.
+    /// The broker could not be reached, did not answer in time, or answered in
+    /// a way that does not say whether it applied the request. A write that
+    /// fails like this may still have been stored.
     #[error("broker unavailable: {0}")]
     Unavailable(String),
-    /// The broker refused the request.
+    /// The broker named a refusal that it makes before it stores or applies
+    /// anything, so a write that fails like this was not stored. An answer that
+    /// is not one of those is [`BrokerError::Unavailable`].
     #[error("broker refused the request: {0}")]
     Rejected(String),
     /// The credential is valid, and the broker's permissions do not let it do

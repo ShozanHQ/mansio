@@ -154,7 +154,7 @@ impl Delivery {
         let start = loop {
             match self
                 .broker
-                .consumer_offset(&Caller::Admin, &webhook.tenant, &webhook.topic, &consumer)
+                .consumer_offset(&webhook.tenant, &webhook.topic, &consumer)
                 .await
             {
                 Ok(Some(committed)) => {
@@ -213,13 +213,7 @@ impl Delivery {
         }
         let committed = self
             .broker
-            .commit_offset(
-                &Caller::Admin,
-                &webhook.tenant,
-                &webhook.topic,
-                consumer,
-                stored.offset,
-            )
+            .commit_offset(&webhook.tenant, &webhook.topic, consumer, stored.offset)
             .await;
         if let Err(error) = committed {
             // The next commit covers this one; a stop before it sends this

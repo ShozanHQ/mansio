@@ -24,9 +24,12 @@ pub enum ApiError {
     /// 409: the request is well formed but the state it acts on does not
     /// allow it, for example an alert already acknowledged.
     Conflict(String),
-    /// 502: the broker refused.
+    /// 502: the broker named a refusal that it makes before it stores
+    /// anything. Nothing was stored.
     BadGateway(String),
-    /// 503: the broker or the sink is not available.
+    /// 503: the broker or the sink is not available, or the broker's answer
+    /// does not say whether it stored the request. A client sends it again
+    /// with the same id.
     Unavailable(String),
     /// 500: a fault in the server. The message is generic; the detail is
     /// logged.

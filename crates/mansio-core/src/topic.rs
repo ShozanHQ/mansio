@@ -114,6 +114,22 @@ impl Topic {
         Topic::Work(Segment::known("approvals"))
     }
 
+    /// Whether only mansio writes the topic: the transitions it records
+    /// (`facts.work`, `facts.alert`), the credentials it issues and revokes
+    /// (`facts.principal`), the deliveries a webhook gives up on
+    /// (`facts.webhook`), and the items it gives up on (`dead`). Nobody
+    /// publishes to these, whatever their scopes, and so no scope grants
+    /// `publish` on one. Work items are written through `work_publish`, which
+    /// sets what a caller may not, and so are not among them.
+    #[must_use]
+    pub fn is_written_by_mansio(&self) -> bool {
+        *self == Topic::Dead
+            || *self == Topic::facts_work()
+            || *self == Topic::facts_alert()
+            || *self == Topic::facts_principal()
+            || *self == Topic::facts_webhook()
+    }
+
     /// Whether what is published here is durable, and so goes through the
     /// sink first. Everything is, except `presence`.
     #[must_use]
@@ -274,6 +290,35 @@ mod tests {
             "work.approvals".parse::<Topic>().unwrap(),
             Topic::work_approvals()
         );
+    }
+
+    #[test]
+    fn the_topics_only_mansio_writes_are_its_facts_and_dead() {
+        for name in [
+            "facts.work",
+            "facts.alert",
+            "facts.principal",
+            "facts.webhook",
+            "dead",
+        ] {
+            assert!(
+                name.parse::<Topic>().unwrap().is_written_by_mansio(),
+                "{name}"
+            );
+        }
+        for name in [
+            "facts.build",
+            "facts.signal",
+            "work.builds",
+            "work.approvals",
+            "alerts",
+            "presence",
+        ] {
+            assert!(
+                !name.parse::<Topic>().unwrap().is_written_by_mansio(),
+                "{name}"
+            );
+        }
     }
 
     #[test]

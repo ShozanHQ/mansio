@@ -3,7 +3,7 @@
 //! It holds users, scopes and expiring credentials the way the Iggy backend
 //! does, so that what a credential may do is enforced by the broker in every
 //! test and not only against Iggy: a credential belongs to one tenant, reads
-//! and writes only the topics its scopes cover, and stops working when it
+//! only the topics its scopes cover, writes nothing, and stops working when it
 //! expires or its user is deleted.
 
 use std::collections::HashMap;
@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 
 use crate::access::{Action, Grant, allows};
-use crate::broker::{Broker, BrokerUser, Caller, Minted, Stored, SystemLog, SystemRecord};
+use crate::broker::{
+    Broker, BrokerUser, BrokerUserInfo, Caller, Minted, Stored, SystemLog, SystemRecord,
+};
 use crate::credential::{Credential, CredentialDigest};
 use crate::envelope::Envelope;
 use crate::error::BrokerError;
@@ -32,6 +34,7 @@ type Topics = HashMap<Topic, Log>;
 /// A user the broker made, and what it may reach.
 #[derive(Debug, Clone)]
 struct User {
+    name: String,
     tenant: TenantId,
     grants: Vec<Grant>,
 }
@@ -110,26 +113,28 @@ fn missing_topic(tenant: &TenantId, topic: &Topic) -> BrokerError {
     BrokerError::NotFound(format!("topic {topic} in tenant {tenant}"))
 }
 
-/// Whether the caller may do this to the topic. The broker looks the topic
-/// up first, as Iggy does, so that is checked before this.
-fn permit(
-    granted: &Granted,
-    action: Action,
-    tenant: &TenantId,
-    topic: &Topic,
-) -> Result<(), BrokerError> {
+/// Whether the caller may read the topic. The broker looks the topic up
+/// first, as Iggy does, so that is checked before this.
+fn permit_read(granted: &Granted, tenant: &TenantId, topic: &Topic) -> Result<(), BrokerError> {
     let Some(user) = granted else { return Ok(()) };
-    if user.tenant == *tenant && allows(&user.grants, action, topic) {
+    if user.tenant == *tenant && allows(&user.grants, Action::Poll, topic) {
         Ok(())
     } else {
-        let verb = match action {
-            Action::Send => "send to",
-            _ => "read",
-        };
         Err(BrokerError::Forbidden(format!(
-            "the credential may not {verb} {topic} in {tenant}"
+            "the credential may not read {topic} in {tenant}"
         )))
     }
+}
+
+/// A credential writes nothing at the broker, as its Iggy user has no send
+/// permission: writes go through the server, which writes as the admin.
+fn permit_write(granted: &Granted, topic: &Topic, tenant: &TenantId) -> Result<(), BrokerError> {
+    if granted.is_some() {
+        return Err(BrokerError::Forbidden(format!(
+            "a credential may not write {topic} in {tenant}: it reads, and the server writes"
+        )));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -171,7 +176,7 @@ impl Broker for MemoryBroker {
             .get_mut(&envelope.tenant)
             .and_then(|topics| topics.get_mut(&envelope.topic))
             .ok_or_else(|| missing_topic(&envelope.tenant, &envelope.topic))?;
-        permit(&granted, Action::Send, &envelope.tenant, &envelope.topic)?;
+        permit_write(&granted, &envelope.topic, &envelope.tenant)?;
         log.messages.push(envelope.clone());
         Ok(Some(u64::try_from(log.messages.len() - 1).unwrap_or(u64::MAX)))
     }
@@ -190,7 +195,7 @@ impl Broker for MemoryBroker {
             .get(tenant)
             .and_then(|topics| topics.get(topic))
             .ok_or_else(|| missing_topic(tenant, topic))?;
-        permit(&granted, Action::Poll, tenant, topic)?;
+        permit_read(&granted, tenant, topic)?;
         let start = usize::try_from(offset).unwrap_or(usize::MAX);
         let stored = log
             .messages
@@ -208,36 +213,30 @@ impl Broker for MemoryBroker {
 
     async fn consumer_offset(
         &self,
-        caller: &Caller<'_>,
         tenant: &TenantId,
         topic: &Topic,
         consumer: &ConsumerName,
     ) -> Result<Option<u64>, BrokerError> {
-        let granted = self.granted(caller)?;
         let tenants = self.lock();
         let log = tenants
             .get(tenant)
             .and_then(|topics| topics.get(topic))
             .ok_or_else(|| missing_topic(tenant, topic))?;
-        permit(&granted, Action::Poll, tenant, topic)?;
         Ok(log.consumers.get(consumer).copied())
     }
 
     async fn commit_offset(
         &self,
-        caller: &Caller<'_>,
         tenant: &TenantId,
         topic: &Topic,
         consumer: &ConsumerName,
         offset: u64,
     ) -> Result<(), BrokerError> {
-        let granted = self.granted(caller)?;
         let mut tenants = self.lock();
         let log = tenants
             .get_mut(tenant)
             .and_then(|topics| topics.get_mut(topic))
             .ok_or_else(|| missing_topic(tenant, topic))?;
-        permit(&granted, Action::Poll, tenant, topic)?;
         log.consumers.insert(consumer.clone(), offset);
         Ok(())
     }
@@ -276,7 +275,7 @@ impl Broker for MemoryBroker {
     async fn create_user(
         &self,
         tenant: &TenantId,
-        _name: &str,
+        name: &str,
         grants: &[Grant],
         ttl: Option<Duration>,
     ) -> Result<Minted, BrokerError> {
@@ -297,6 +296,7 @@ impl Broker for MemoryBroker {
         users.by_id.insert(
             user,
             User {
+                name: name.to_owned(),
                 tenant: tenant.clone(),
                 grants: grants.to_vec(),
             },
@@ -331,6 +331,18 @@ impl Broker for MemoryBroker {
         users.by_id.remove(&user);
         users.tokens.retain(|_, token| token.user != user);
         Ok(())
+    }
+
+    async fn list_users(&self) -> Result<Vec<BrokerUserInfo>, BrokerError> {
+        Ok(self
+            .users()
+            .by_id
+            .iter()
+            .map(|(user, known)| BrokerUserInfo {
+                user: *user,
+                name: known.name.clone(),
+            })
+            .collect())
     }
 
     async fn identify(&self, credential: &Credential) -> Result<BrokerUser, BrokerError> {
@@ -583,14 +595,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_credential_reads_and_writes_only_what_its_scopes_cover_in_its_tenant() {
+    async fn a_credential_reads_only_what_its_scopes_cover_in_its_tenant_and_writes_nothing() {
         use crate::Verb;
         let broker = two_tenants().await;
         let minted = user(
             &broker,
             "acme",
             &[
-                grant("facts.build", &[Verb::Publish]),
+                grant("facts.build", &[Verb::Publish, Verb::Subscribe]),
                 grant("work.builds", &[Verb::Claim]),
             ],
             None,
@@ -599,16 +611,17 @@ mod tests {
         let caller = Caller::Credential(&minted.credential);
         let acme: TenantId = "acme".parse().unwrap();
 
-        // What it was given.
-        let sent = envelope("acme", "facts.build", "t");
-        assert_eq!(broker.publish(&caller, &sent).await.unwrap(), Some(0));
-        broker
-            .poll(&caller, &acme, &"work.builds".parse().unwrap(), 0, 1)
-            .await
-            .unwrap();
+        // What it was given: to read.
+        for name in ["facts.build", "work.builds"] {
+            broker
+                .poll(&caller, &acme, &name.parse().unwrap(), 0, 1)
+                .await
+                .unwrap();
+        }
 
-        // Nothing else: another verb on a topic it has, a topic it lacks, and
-        // another tenant's topic of the same name.
+        // Nothing else: a topic it lacks, another tenant's topics, and every
+        // write, to a topic it may read and to one it may publish through the
+        // server.
         let refused = |result: Result<_, BrokerError>| {
             assert!(
                 matches!(result, Err(BrokerError::Forbidden(_))),
@@ -617,25 +630,7 @@ mod tests {
         };
         refused(
             broker
-                .poll(&caller, &acme, &"facts.build".parse().unwrap(), 0, 1)
-                .await
-                .map(|_| ()),
-        );
-        refused(
-            broker
-                .publish(&caller, &envelope("acme", "work.builds", "t"))
-                .await
-                .map(|_| ()),
-        );
-        refused(
-            broker
-                .publish(&caller, &envelope("acme", "alerts", "t"))
-                .await
-                .map(|_| ()),
-        );
-        refused(
-            broker
-                .publish(&caller, &envelope("other", "facts.build", "t"))
+                .poll(&caller, &acme, &Topic::Alerts, 0, 1)
                 .await
                 .map(|_| ()),
         );
@@ -645,20 +640,47 @@ mod tests {
                 .await
                 .map(|_| ()),
         );
-        // Nothing was written by the refusals.
-        assert!(
+        refused(
             broker
                 .poll(
-                    &Caller::Admin,
+                    &caller,
                     &"other".parse().unwrap(),
                     &"facts.build".parse().unwrap(),
                     0,
-                    10
+                    1,
                 )
                 .await
-                .unwrap()
-                .is_empty()
+                .map(|_| ()),
         );
+        for (tenant, name) in [
+            ("acme", "facts.build"),
+            ("acme", "work.builds"),
+            ("acme", "alerts"),
+            ("other", "facts.build"),
+        ] {
+            refused(
+                broker
+                    .publish(&caller, &envelope(tenant, name, "t"))
+                    .await
+                    .map(|_| ()),
+            );
+        }
+        // Nothing was written by the refusals.
+        for tenant in ["acme", "other"] {
+            assert!(
+                broker
+                    .poll(
+                        &Caller::Admin,
+                        &tenant.parse().unwrap(),
+                        &"facts.build".parse().unwrap(),
+                        0,
+                        10
+                    )
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     #[tokio::test]
@@ -715,13 +737,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pattern_reaches_topics_created_after_the_user() {
+    async fn a_pattern_reaches_topics_made_after_the_user_for_reading() {
         use crate::Verb;
         let broker = two_tenants().await;
         let minted = user(
             &broker,
             "acme",
-            &[grant("facts.*", &[Verb::Publish, Verb::Subscribe])],
+            &[grant("facts.*", &[Verb::Subscribe])],
             None,
         )
         .await;
@@ -732,7 +754,7 @@ mod tests {
             .await
             .unwrap();
         broker
-            .publish(&caller, &envelope("acme", later, "t"))
+            .publish(&Caller::Admin, &envelope("acme", later, "t"))
             .await
             .unwrap();
         let read = broker
@@ -919,23 +941,18 @@ mod tests {
             let (topic, name) = (topic.clone(), consumer(name));
             let acme = acme.clone();
             let broker = &broker;
-            async move {
-                broker
-                    .consumer_offset(&Caller::Admin, &acme, &topic, &name)
-                    .await
-                    .unwrap()
-            }
+            async move { broker.consumer_offset(&acme, &topic, &name).await.unwrap() }
         };
 
         assert_eq!(get(&alerts, "a").await, None);
         broker
-            .commit_offset(&Caller::Admin, &acme, &alerts, &consumer("a"), 4)
+            .commit_offset(&acme, &alerts, &consumer("a"), 4)
             .await
             .unwrap();
         assert_eq!(get(&alerts, "a").await, Some(4));
         // Zero is an offset like any other, and is not "none".
         broker
-            .commit_offset(&Caller::Admin, &acme, &alerts, &consumer("b"), 0)
+            .commit_offset(&acme, &alerts, &consumer("b"), 0)
             .await
             .unwrap();
         assert_eq!(get(&alerts, "b").await, Some(0));
@@ -943,68 +960,67 @@ mod tests {
         assert_eq!(get(&builds, "a").await, None);
         // A commit replaces what was there, even with a smaller offset.
         broker
-            .commit_offset(&Caller::Admin, &acme, &alerts, &consumer("a"), 2)
+            .commit_offset(&acme, &alerts, &consumer("a"), 2)
             .await
             .unwrap();
         assert_eq!(get(&alerts, "a").await, Some(2));
     }
 
     #[tokio::test]
-    async fn a_consumer_needs_a_topic_and_the_right_to_read_it() {
-        use crate::Verb;
+    async fn a_consumer_needs_a_topic() {
         let broker = two_tenants().await;
         let acme: TenantId = "acme".parse().unwrap();
         let name = consumer("watcher");
         let missing = broker
-            .consumer_offset(&Caller::Admin, &acme, &Topic::Dead, &name)
+            .consumer_offset(&acme, &Topic::Dead, &name)
             .await
             .unwrap_err();
         assert!(matches!(missing, BrokerError::NotFound(_)), "{missing:?}");
         let missing = broker
-            .commit_offset(&Caller::Admin, &acme, &Topic::Dead, &name, 1)
+            .commit_offset(&acme, &Topic::Dead, &name, 1)
             .await
             .unwrap_err();
         assert!(matches!(missing, BrokerError::NotFound(_)), "{missing:?}");
+        let nobody: TenantId = "nobody".parse().unwrap();
+        assert!(matches!(
+            broker.consumer_offset(&nobody, &Topic::Alerts, &name).await,
+            Err(BrokerError::NotFound(_))
+        ));
+    }
 
-        let reader = user(&broker, "acme", &[grant("alerts", &[Verb::Subscribe])], None).await;
-        let writer = user(&broker, "acme", &[grant("alerts", &[Verb::Publish])], None).await;
-        let (read, write) = (
-            Caller::Credential(&reader.credential),
-            Caller::Credential(&writer.credential),
-        );
-        broker
-            .commit_offset(&read, &acme, &Topic::Alerts, &name, 3)
-            .await
-            .unwrap();
-        assert_eq!(
+    #[tokio::test]
+    async fn a_credential_writes_nothing_at_the_broker_whatever_its_scopes() {
+        use crate::Verb;
+        let broker = two_tenants().await;
+        let minted = user(
+            &broker,
+            "acme",
+            &[grant("facts.*", &[Verb::Publish, Verb::Subscribe])],
+            None,
+        )
+        .await;
+        let caller = Caller::Credential(&minted.credential);
+        let acme: TenantId = "acme".parse().unwrap();
+        for name in [
+            "facts.work",
+            "facts.alert",
+            "facts.principal",
+            "facts.build",
+        ] {
             broker
-                .consumer_offset(&read, &acme, &Topic::Alerts, &name)
+                .ensure_topic(&acme, &name.parse().unwrap())
                 .await
-                .unwrap(),
-            Some(3)
-        );
-        // A credential that may not read the topic may not move a consumer on
-        // it or see where one is, and another tenant's credential neither.
-        assert!(matches!(
-            broker.commit_offset(&write, &acme, &Topic::Alerts, &name, 9).await,
-            Err(BrokerError::Forbidden(_))
-        ));
-        assert!(matches!(
-            broker.consumer_offset(&write, &acme, &Topic::Alerts, &name).await,
-            Err(BrokerError::Forbidden(_))
-        ));
-        let other: TenantId = "other".parse().unwrap();
-        assert!(matches!(
-            broker.consumer_offset(&read, &other, &Topic::Alerts, &name).await,
-            Err(BrokerError::Forbidden(_))
-        ));
-        assert_eq!(
+                .unwrap();
+            let result = broker.publish(&caller, &envelope("acme", name, "t")).await;
+            assert!(
+                matches!(result, Err(BrokerError::Forbidden(_))),
+                "{name}: {result:?}"
+            );
+            // And it reads them.
             broker
-                .consumer_offset(&Caller::Admin, &acme, &Topic::Alerts, &name)
+                .poll(&caller, &acme, &name.parse().unwrap(), 0, 1)
                 .await
-                .unwrap(),
-            Some(3),
-            "the refused commit changed nothing"
-        );
+                .unwrap();
+        }
     }
 }

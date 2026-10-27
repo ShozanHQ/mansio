@@ -2,45 +2,54 @@
 //!
 //! Iggy names streams and topics by number in a permission, so scopes are
 //! expanded to the topics a tenant has now. The broker remembers each user's
-//! scopes and expands them again when a matching topic is created.
+//! scopes and expands them again whenever a topic or a stream is created,
+//! because Iggy may give a new one the number of a deleted one. A user is given
+//! the right to poll and never the right to send: a credential that could send
+//! could write any principal, item id or fact, so every write goes through the
+//! server, which writes as the admin.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use iggy::prelude::{GlobalPermissions, Permissions, StreamPermissions, TopicPermissions};
-use mansio_core::{BrokerUser, Grant, TenantId, Topic, topic_access};
+use mansio_core::{Action, BrokerUser, Grant, TenantId, Topic, allows};
 
-/// What a user may do on the topics a stream has, and nothing else.
+/// What a user may do on the topics a stream has: poll the ones its scopes
+/// cover, and nothing else.
 ///
-/// No flag is set on the stream or globally: the permission of a user who is
-/// not the admin never covers a stream as a whole, so a topic made later is
-/// closed until the broker opens it for a user whose scopes match.
+/// No flag is set on the stream or globally, and no topic is given a send
+/// permission: the permission of a user who is not the admin never covers a
+/// stream as a whole, so a topic made later is closed until the broker opens it
+/// for a user whose scopes cover it.
 pub(crate) fn permissions(stream: u32, topics: &[(u32, Topic)], grants: &[Grant]) -> Permissions {
-    let mut allowed = BTreeMap::new();
-    for (id, topic) in topics {
-        let access = topic_access(grants, topic);
-        if access.is_none() {
-            continue;
-        }
-        allowed.insert(
-            to_usize(*id),
-            TopicPermissions {
-                poll_messages: access.poll,
-                send_messages: access.send,
-                ..TopicPermissions::default()
-            },
-        );
-    }
+    let polled = topics
+        .iter()
+        .filter(|(_, topic)| allows(grants, Action::Poll, topic))
+        .map(|(id, _)| {
+            (
+                to_usize(*id),
+                TopicPermissions {
+                    poll_messages: true,
+                    ..TopicPermissions::default()
+                },
+            )
+        })
+        .collect();
     Permissions {
         global: GlobalPermissions::default(),
         streams: Some(BTreeMap::from([(
             to_usize(stream),
             StreamPermissions {
-                topics: Some(allowed),
+                topics: Some(polled),
                 ..StreamPermissions::default()
             },
         )])),
     }
+}
+
+/// No permissions at all: what a user has whose stream is gone.
+pub(crate) fn no_permissions() -> Permissions {
+    Permissions::default()
 }
 
 fn to_usize(id: u32) -> usize {
@@ -88,6 +97,14 @@ impl Users {
         self.lock().remove(&user);
     }
 
+    /// Every user and its tenant and scopes.
+    pub(crate) fn all(&self) -> Vec<(BrokerUser, TenantId, Vec<Grant>)> {
+        self.lock()
+            .iter()
+            .map(|(user, (tenant, grants))| (*user, tenant.clone(), grants.clone()))
+            .collect()
+    }
+
     /// The users of the tenant and their scopes.
     pub(crate) fn of_tenant(&self, tenant: &TenantId) -> Vec<(BrokerUser, Vec<Grant>)> {
         self.lock()
@@ -108,6 +125,17 @@ mod tests {
         Grant::new(pattern.parse().unwrap(), verbs.iter().copied()).unwrap()
     }
 
+    /// What `permissions` names for these scopes over the test topics.
+    fn permissions_all(grants: &[Grant]) -> std::collections::BTreeMap<usize, TopicPermissions> {
+        permissions(1, &topics(), grants)
+            .streams
+            .unwrap()
+            .remove(&1)
+            .unwrap()
+            .topics
+            .unwrap()
+    }
+
     fn topics() -> Vec<(u32, Topic)> {
         [
             "alerts",
@@ -123,9 +151,10 @@ mod tests {
     }
 
     #[test]
-    fn only_topics_the_scopes_cover_are_named_and_nothing_is_stream_wide() {
+    fn only_topics_the_scopes_let_it_read_are_named_and_none_can_be_sent_to() {
         let grants = [
             grant("facts.build", &[Verb::Publish]),
+            grant("facts.signal", &[Verb::Publish, Verb::Subscribe]),
             grant("work.builds", &[Verb::Claim]),
             grant("alerts", &[Verb::Ack]),
         ];
@@ -138,16 +167,29 @@ mod tests {
         assert!(!stream.manage_stream && !stream.read_stream && !stream.manage_topics);
         assert!(!stream.read_topics && !stream.poll_messages && !stream.send_messages);
 
+        // facts.build (11) is only published through the server, and an ack on
+        // alerts (10) is enforced by mansio: neither is the broker's to allow.
+        // facts.signal (12) and work.builds (13) are read.
         let named = stream.topics.as_ref().unwrap();
-        // facts.build (11) is send only, work.builds (13) poll only. Ack on
-        // alerts (10) is enforced by mansio and gives the broker nothing.
-        assert_eq!(named.keys().copied().collect::<Vec<_>>(), [11, 13]);
-        let build = &named[&11];
-        assert!(build.send_messages && !build.poll_messages);
-        assert!(!build.read_topic && !build.manage_topic);
-        let queue = &named[&13];
-        assert!(queue.poll_messages && !queue.send_messages);
-        assert!(!queue.read_topic && !queue.manage_topic);
+        assert_eq!(named.keys().copied().collect::<Vec<_>>(), [12, 13]);
+        for topic in named.values() {
+            assert!(topic.poll_messages);
+            assert!(!topic.send_messages && !topic.read_topic && !topic.manage_topic);
+        }
+    }
+
+    #[test]
+    fn a_publish_scope_never_gives_the_user_the_right_to_send() {
+        let grants = [
+            grant("facts.*", &[Verb::Publish]),
+            grant("work.*", &[Verb::Publish]),
+        ];
+        let permissions = permissions(1, &topics(), &grants);
+        let named = permissions.streams.unwrap()[&1].topics.clone().unwrap();
+        assert!(named.is_empty(), "nothing to read, and nothing to send to");
+        let all = [grant("facts.*", &[Verb::Publish, Verb::Subscribe])];
+        let permissions = permissions_all(&all);
+        assert!(permissions.values().all(|t| !t.send_messages));
     }
 
     #[test]
@@ -165,6 +207,13 @@ mod tests {
         let streams = permissions.streams.unwrap();
         assert!(streams[&1].topics.as_ref().unwrap().is_empty());
         assert_eq!(permissions.global, GlobalPermissions::default());
+    }
+
+    #[test]
+    fn a_user_whose_stream_is_gone_has_no_permissions() {
+        let none = no_permissions();
+        assert_eq!(none.global, GlobalPermissions::default());
+        assert!(none.streams.is_none());
     }
 
     #[test]
@@ -191,6 +240,7 @@ mod tests {
         let mut acme_users: Vec<u32> = users.of_tenant(&acme).iter().map(|(u, _)| u.0).collect();
         acme_users.sort_unstable();
         assert_eq!(acme_users, [1, 3]);
+        assert_eq!(users.all().len(), 3);
         users.remove(BrokerUser(1));
         assert_eq!(users.of_tenant(&acme).len(), 1);
         assert_eq!(users.of_tenant(&"nobody".parse().unwrap()).len(), 0);
