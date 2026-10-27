@@ -369,7 +369,10 @@ mod tests {
             .unwrap();
         assert_eq!(fact.topic.to_string(), "facts.webhook");
         assert_eq!(fact.event_type.as_str(), "mansio.webhook.failed");
-        assert_eq!(fact.subject.as_ref().unwrap().as_str(), data.webhook_id.to_string());
+        assert_eq!(
+            fact.subject.as_ref().unwrap().as_str(),
+            data.webhook_id.to_string()
+        );
         assert_eq!(fact.principal.to_string(), ENGINE_PRINCIPAL);
         let back: WebhookFact = serde_json::from_value(fact.data.unwrap()).unwrap();
         assert_eq!(back, data);

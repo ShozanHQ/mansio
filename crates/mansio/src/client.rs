@@ -262,7 +262,9 @@ mod tests {
             Client::from_lookup(Connection::default(), lookup(&[("MANSIO_TOKEN", "t")])).unwrap();
         assert_eq!(client.base.as_str(), "http://127.0.0.1:7070/");
         let url = client
-            .url(&["v1", "tenants", "acme", "work", "builds", "items", "a/b c?", "ack"])
+            .url(&[
+                "v1", "tenants", "acme", "work", "builds", "items", "a/b c?", "ack",
+            ])
             .unwrap();
         assert_eq!(
             url.as_str(),
@@ -271,7 +273,10 @@ mod tests {
         // A server behind a path keeps it.
         let client = Client::from_lookup(
             Connection::default(),
-            lookup(&[("MANSIO_TOKEN", "t"), ("MANSIO_URL", "https://h.example/mansio/")]),
+            lookup(&[
+                ("MANSIO_TOKEN", "t"),
+                ("MANSIO_URL", "https://h.example/mansio/"),
+            ]),
         )
         .unwrap();
         assert_eq!(
@@ -374,7 +379,13 @@ mod tests {
         let (base, seen) = flaky_server(1).await;
         let client = client_for(&base, "3");
         let error = client
-            .call(Method::POST, &["v1", "x"], &[], Some(&json!({})), Replay::Unsafe)
+            .call(
+                Method::POST,
+                &["v1", "x"],
+                &[],
+                Some(&json!({})),
+                Replay::Unsafe,
+            )
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("sending to"), "{error:#}");
@@ -405,7 +416,13 @@ mod tests {
         let client = client_for(&base, "1");
         let started = std::time::Instant::now();
         let error = client
-            .call(Method::POST, &["v1", "x"], &[], Some(&json!({})), Replay::Unsafe)
+            .call(
+                Method::POST,
+                &["v1", "x"],
+                &[],
+                Some(&json!({})),
+                Replay::Unsafe,
+            )
             .await
             .unwrap_err();
         let text = format!("{error:#}");
@@ -426,7 +443,13 @@ mod tests {
             let _ = socket.write_all(reply.as_bytes()).await;
         });
         let answered = client
-            .call(Method::POST, &["v1", "x"], &[], Some(&json!({})), Replay::Unsafe)
+            .call(
+                Method::POST,
+                &["v1", "x"],
+                &[],
+                Some(&json!({})),
+                Replay::Unsafe,
+            )
             .await
             .unwrap();
         assert_eq!(answered, Some(json!({})));

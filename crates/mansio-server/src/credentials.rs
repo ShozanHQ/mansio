@@ -147,7 +147,10 @@ impl Credentials {
         self.registry.clear();
         let mut offset = 0;
         loop {
-            let batch = self.broker.system_read(SystemLog::Principals, offset, self.page).await?;
+            let batch = self
+                .broker
+                .system_read(SystemLog::Principals, offset, self.page)
+                .await?;
             let Some(last) = batch.last() else { break };
             let next = last.offset.saturating_add(1);
             for record in &batch {
@@ -391,7 +394,11 @@ impl Credentials {
             user: minted.user,
             digest,
         };
-        if let Err(error) = self.broker.system_append(SystemLog::Principals, &entry.encode()?).await {
+        if let Err(error) = self
+            .broker
+            .system_append(SystemLog::Principals, &entry.encode()?)
+            .await
+        {
             if let Err(cleanup) = self.broker.delete_user(minted.user).await {
                 warn!(principal = %info.id, error = %cleanup, "a user without a record could not be deleted");
             }

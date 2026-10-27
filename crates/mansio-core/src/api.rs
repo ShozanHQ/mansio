@@ -266,13 +266,21 @@ mod tests {
         let name: ConsumerName = "watcher".parse().unwrap();
         let fresh = ConsumerState::new(name.clone(), None);
         assert_eq!((fresh.offset, fresh.next), (None, 0));
-        assert!(serde_json::to_value(&fresh).unwrap().get("offset").is_none());
+        assert!(
+            serde_json::to_value(&fresh)
+                .unwrap()
+                .get("offset")
+                .is_none()
+        );
         let first = ConsumerState::new(name.clone(), Some(0));
         assert_eq!((first.offset, first.next), (Some(0), 1));
         let json = serde_json::to_value(&first).unwrap();
         assert_eq!(json["offset"], 0);
         assert_eq!(json["next"], 1);
-        assert_eq!(serde_json::from_value::<ConsumerState>(json).unwrap(), first);
+        assert_eq!(
+            serde_json::from_value::<ConsumerState>(json).unwrap(),
+            first
+        );
         // The last offset there can be does not wrap round to 0.
         assert_eq!(ConsumerState::new(name, Some(u64::MAX)).next, u64::MAX);
     }

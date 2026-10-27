@@ -21,11 +21,23 @@ pub enum Chosen {
 
 /// The groups of commands, in the order they are listed.
 const GROUPS: [(&str, &str); 5] = [
-    ("work", "Work items: publish, claim, complete and fail them."),
+    (
+        "work",
+        "Work items: publish, claim, complete and fail them.",
+    ),
     ("alerts", "Alerts: publish and acknowledge them."),
-    ("principals", "Credentials: issue, list and withdraw them. Admin only."),
-    ("webhooks", "Webhooks: deliver a topic, signed, to a URL. Admin only."),
-    ("consumers", "Named consumers: where each one stands on a topic."),
+    (
+        "principals",
+        "Credentials: issue, list and withdraw them. Admin only.",
+    ),
+    (
+        "webhooks",
+        "Webhooks: deliver a topic, signed, to a URL. Admin only.",
+    ),
+    (
+        "consumers",
+        "Named consumers: where each one stands on a topic.",
+    ),
 ];
 
 fn parse_json(text: &str) -> Result<Value, String> {
@@ -100,10 +112,9 @@ pub fn command() -> Command {
     for group in groups {
         root = root.subcommand(group);
     }
-    root.subcommand(
-        Command::new(MCP)
-            .about("Serve the operations as MCP tools on stdin and stdout, for an agent's harness to run."),
-    )
+    root.subcommand(Command::new(MCP).about(
+        "Serve the operations as MCP tools on stdin and stdout, for an agent's harness to run.",
+    ))
 }
 
 /// The connection flags.
@@ -201,7 +212,15 @@ mod tests {
     #[test]
     fn nested_commands_and_numbers_are_found() {
         let matches = parse(&[
-            "work", "pull", "--tenant", "acme", "--queue", "builds", "--consumer", "w1", "--wait",
+            "work",
+            "pull",
+            "--tenant",
+            "acme",
+            "--queue",
+            "builds",
+            "--consumer",
+            "w1",
+            "--wait",
             "5",
         ])
         .unwrap();
@@ -216,8 +235,28 @@ mod tests {
     #[test]
     fn the_connection_flags_work_before_and_after_the_command() {
         for args in [
-            &["--url", "http://h:1", "--token", "t", "poll", "--tenant", "a", "--topic", "alerts"][..],
-            &["poll", "--tenant", "a", "--topic", "alerts", "--url", "http://h:1", "--token", "t"][..],
+            &[
+                "--url",
+                "http://h:1",
+                "--token",
+                "t",
+                "poll",
+                "--tenant",
+                "a",
+                "--topic",
+                "alerts",
+            ][..],
+            &[
+                "poll",
+                "--tenant",
+                "a",
+                "--topic",
+                "alerts",
+                "--url",
+                "http://h:1",
+                "--token",
+                "t",
+            ][..],
         ] {
             let matches = parse(args).unwrap();
             let connection = connection(&matches);
@@ -228,16 +267,26 @@ mod tests {
 
     #[test]
     fn mcp_is_a_command() {
-        assert!(matches!(chosen(&parse(&["mcp"]).unwrap()).unwrap(), Chosen::Mcp));
+        assert!(matches!(
+            chosen(&parse(&["mcp"]).unwrap()).unwrap(),
+            Chosen::Mcp
+        ));
     }
 
     #[test]
     fn bad_arguments_are_refused_by_the_parser() {
         for args in [
-            &["publish", "--tenant", "acme", "--topic", "alerts", "--source", "s"][..],
+            &[
+                "publish", "--tenant", "acme", "--topic", "alerts", "--source", "s",
+            ][..],
             &["poll", "--tenant", "acme"][..],
-            &["poll", "--tenant", "acme", "--topic", "alerts", "--offset", "-1"][..],
-            &["publish", "--tenant", "acme", "--topic", "alerts", "--type", "t", "--source", "s", "--data", "{"][..],
+            &[
+                "poll", "--tenant", "acme", "--topic", "alerts", "--offset", "-1",
+            ][..],
+            &[
+                "publish", "--tenant", "acme", "--topic", "alerts", "--type", "t", "--source", "s",
+                "--data", "{",
+            ][..],
             &["work"][..],
             &["work", "nope"][..],
             &["nope"][..],
@@ -252,7 +301,17 @@ mod tests {
         let error = parse(&["--help"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
         let help = error.to_string();
-        for word in ["publish", "poll", "watch", "work", "alerts", "principals", "webhooks", "consumers", "mcp"] {
+        for word in [
+            "publish",
+            "poll",
+            "watch",
+            "work",
+            "alerts",
+            "principals",
+            "webhooks",
+            "consumers",
+            "mcp",
+        ] {
             assert!(help.contains(word), "{word} is not in the help");
         }
     }

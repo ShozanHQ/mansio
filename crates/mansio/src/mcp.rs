@@ -261,7 +261,10 @@ mod tests {
             "params": {"protocolVersion": "1999-01-01"}
         }))
         .await;
-        assert_eq!(answer["result"]["protocolVersion"], VERSIONS[VERSIONS.len() - 1]);
+        assert_eq!(
+            answer["result"]["protocolVersion"],
+            VERSIONS[VERSIONS.len() - 1]
+        );
         assert_eq!(answer["id"], "a");
     }
 
@@ -305,8 +308,14 @@ mod tests {
         assert_eq!(schema["properties"]["tenant"]["type"], "string");
         assert!(pull["description"].as_str().unwrap().contains("lease"));
 
-        let create = listed.iter().find(|t| t["name"] == "principals_create").unwrap();
-        assert_eq!(create["inputSchema"]["properties"]["scopes"]["type"], "array");
+        let create = listed
+            .iter()
+            .find(|t| t["name"] == "principals_create")
+            .unwrap();
+        assert_eq!(
+            create["inputSchema"]["properties"]["scopes"]["type"],
+            "array"
+        );
     }
 
     #[tokio::test]
@@ -323,7 +332,10 @@ mod tests {
             "params": {"name": "watch", "arguments": {}}
         }))
         .await;
-        assert_eq!(answer["error"]["code"], INVALID_PARAMS, "watch is not a tool");
+        assert_eq!(
+            answer["error"]["code"], INVALID_PARAMS,
+            "watch is not a tool"
+        );
 
         // A tool the model called badly answers it, so that it can try again.
         let answer = ask(json!({

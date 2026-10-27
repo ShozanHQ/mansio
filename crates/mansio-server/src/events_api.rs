@@ -77,7 +77,10 @@ fn events(following: Following) -> impl Stream<Item = Result<Event, Infallible>>
         loop {
             if let Some(stored) = following.waiting.pop_front() {
                 let Some(event) = event(&stored) else {
-                    warn!(offset = stored.offset, "an envelope could not be written as an event");
+                    warn!(
+                        offset = stored.offset,
+                        "an envelope could not be written as an event"
+                    );
                     return None;
                 };
                 return Some((Ok(event), following));

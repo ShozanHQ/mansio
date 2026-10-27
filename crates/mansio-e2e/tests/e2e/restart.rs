@@ -3,6 +3,7 @@
 
 use std::time::Instant;
 
+use anyhow::Context;
 use reqwest::StatusCode;
 
 use crate::harness::{SLACK, Target, item_of, job};
@@ -26,15 +27,8 @@ async fn a_restarted_server_keeps_the_lease_and_claims_the_item_again_exactly_on
     target.stop_server().await?;
     target.start_server().await?;
 
-    // The new server knows the lease: nobody else can claim the item, and the
-    // consumer that holds it is given it again.
+    // The new server knows the lease: nobody else can claim the item.
     assert!(target.pull(QUEUE, "other").await?.is_none());
-    let held = target.pull(QUEUE, "worker").await?;
-    assert_eq!(
-        held.map(|claim| claim.lease_id),
-        Some(first.lease_id),
-        "the lease survives the restart"
-    );
 
     // After the lease and the backoff it is claimed, as attempt 2.
     let wait = target.lease() + target.backoff(1) + SLACK;
@@ -64,6 +58,55 @@ async fn a_restarted_server_keeps_the_lease_and_claims_the_item_again_exactly_on
         .await?;
     assert_eq!(status, StatusCode::FORBIDDEN);
     target.ack_claim(QUEUE, &second).await?;
+    Ok(())
+}
+
+/// The facts keep a fingerprint of a lease id and not the id, so a restarted
+/// server cannot say it again. A consumer that asks for the lease it holds is
+/// given a new id for the same item, with the same expiry, and the old id stops
+/// working.
+#[tokio::test]
+async fn a_consumer_that_asks_again_after_a_restart_is_given_a_new_id_for_its_lease()
+-> anyhow::Result<()> {
+    let mut target = Target::start().await?;
+    if !target.is_local() {
+        return Ok(());
+    }
+    target.work_publish(QUEUE, &job(1)).await?;
+    let first = target.claim(QUEUE, "worker", SLACK).await?;
+
+    target.stop_server().await?;
+    target.start_server().await?;
+
+    let again = target
+        .pull(QUEUE, "worker")
+        .await?
+        .context("the lease it holds")?;
+    assert_eq!(again.item, first.item);
+    assert_eq!(again.expires_at, first.expires_at);
+    assert_ne!(again.lease_id, first.lease_id);
+    // Nobody else is given the item, and the holder is told the same lease.
+    assert!(target.pull(QUEUE, "other").await?.is_none());
+    assert_eq!(target.pull(QUEUE, "worker").await?, Some(again.clone()));
+
+    // The old id is refused, the new one is the lease, and the fingerprint of
+    // it is what a second restart finds.
+    let (status, _) = target
+        .ack(
+            QUEUE,
+            &item_of(&first)?,
+            first.consumer.as_str(),
+            &first.lease_id.to_string(),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    target.stop_server().await?;
+    target.start_server().await?;
+    target.ack_claim(QUEUE, &again).await?;
+    assert_eq!(
+        target.work_transitions().await?,
+        ["claimed", "claimed", "acked"]
+    );
     Ok(())
 }
 
@@ -122,7 +165,10 @@ async fn a_failure_whose_retry_was_not_published_is_retried_once_after_a_restart
     assert!(target.pull(QUEUE, "other").await?.is_none());
     tokio::time::sleep(target.settle()).await;
     assert_eq!(
-        target.pull(QUEUE, "worker").await?.map(|claim| claim.lease_id),
+        target
+            .pull(QUEUE, "worker")
+            .await?
+            .map(|claim| claim.lease_id),
         Some(second.lease_id),
         "the holder is given its lease again, and nobody is given a second item"
     );

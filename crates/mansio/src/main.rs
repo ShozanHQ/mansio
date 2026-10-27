@@ -13,8 +13,8 @@ mod watch;
 use std::process::ExitCode;
 
 use anyhow::Context;
-use client::Client;
 use cli::Chosen;
+use client::Client;
 
 #[expect(clippy::print_stdout, reason = "the CLI prints its results to stdout")]
 fn print(lines: &[serde_json::Value]) {
@@ -80,7 +80,11 @@ mod parity {
     }
 
     /// The commands of the CLI by operation name, found by walking the tree.
-    fn commands(command: &clap::Command, path: &mut Vec<String>, found: &mut BTreeMap<String, Offer>) {
+    fn commands(
+        command: &clap::Command,
+        path: &mut Vec<String>,
+        found: &mut BTreeMap<String, Offer>,
+    ) {
         let mut any = false;
         for sub in command.get_subcommands() {
             any = true;
@@ -92,7 +96,10 @@ mod parity {
             return;
         }
         let own = |arg: &&clap::Arg| {
-            !arg.is_global_set() && arg.get_long().is_some() && arg.get_id() != "help" && arg.get_id() != "version"
+            !arg.is_global_set()
+                && arg.get_long().is_some()
+                && arg.get_id() != "help"
+                && arg.get_id() != "version"
         };
         let flags: Vec<&clap::Arg> = command.get_arguments().filter(own).collect();
         found.insert(
@@ -159,10 +166,20 @@ mod parity {
             BTreeSet::from(COMMAND_ONLY),
             "the commands that are not tools"
         );
-        let only_tools: Vec<&String> = tools.keys().filter(|name| !cli.contains_key(*name)).collect();
-        assert!(only_tools.is_empty(), "tools with no command: {only_tools:?}");
+        let only_tools: Vec<&String> = tools
+            .keys()
+            .filter(|name| !cli.contains_key(*name))
+            .collect();
+        assert!(
+            only_tools.is_empty(),
+            "tools with no command: {only_tools:?}"
+        );
         for (name, tool) in &tools {
-            assert_eq!(Some(tool), cli.get(name), "{name}: the flags and the properties differ");
+            assert_eq!(
+                Some(tool),
+                cli.get(name),
+                "{name}: the flags and the properties differ"
+            );
         }
         assert!(tools.len() >= 15, "{} tools", tools.len());
     }

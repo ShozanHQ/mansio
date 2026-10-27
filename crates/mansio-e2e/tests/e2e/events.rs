@@ -179,7 +179,12 @@ fn parse(block: &str) -> anyhow::Result<Frame> {
     }
 }
 
-async fn publish_n(target: &Target, topic: &str, from: u32, to: u32) -> anyhow::Result<Vec<Envelope>> {
+async fn publish_n(
+    target: &Target,
+    topic: &str,
+    from: u32,
+    to: u32,
+) -> anyhow::Result<Vec<Envelope>> {
     let mut published = Vec::new();
     for n in from..to {
         let body = json!({"source": "e2e", "type": format!("e2e.n{n}"), "data": {"n": n}});
@@ -227,8 +232,7 @@ async fn a_stream_resumes_after_last_event_id_with_nothing_missed_and_nothing_tw
     drop(stream);
 
     sent.extend(publish_n(&target, "facts.build", 5, 8).await?);
-    let mut stream =
-        Stream::open(&target, "facts.build", "", Some(&last.to_string())).await?;
+    let mut stream = Stream::open(&target, "facts.build", "", Some(&last.to_string())).await?;
     let rest = stream.events(6).await?;
     assert_eq!(
         rest.iter().map(|event| event.id).collect::<Vec<_>>(),
@@ -319,8 +323,14 @@ async fn a_stream_needs_the_right_to_read_the_topic() -> anyhow::Result<()> {
         }
     };
 
-    assert_eq!(status(&reader.token, "facts.build", "", None).await?, StatusCode::OK);
-    assert_eq!(status(&target.token, "facts.build", "", None).await?, StatusCode::OK);
+    assert_eq!(
+        status(&reader.token, "facts.build", "", None).await?,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status(&target.token, "facts.build", "", None).await?,
+        StatusCode::OK
+    );
     assert_eq!(
         status(&writer.token, "facts.build", "", None).await?,
         StatusCode::FORBIDDEN,
@@ -364,7 +374,10 @@ async fn a_stream_needs_the_right_to_read_the_topic() -> anyhow::Result<()> {
     let (without_token, _) = target
         .call(
             reqwest::Method::GET,
-            &format!("{}/v1/events?tenant={}&topic=facts.build", target.base, target.tenant),
+            &format!(
+                "{}/v1/events?tenant={}&topic=facts.build",
+                target.base, target.tenant
+            ),
             None,
             None,
         )

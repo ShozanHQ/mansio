@@ -429,11 +429,9 @@ impl Settings {
                 "MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS",
                 webhook_defaults.backoff_cap,
             )?,
-            max_attempts: env.parse("MANSIO_WEBHOOK_MAX_ATTEMPTS", webhook_defaults.max_attempts)?,
-            timeout: env.seconds(
-                "MANSIO_WEBHOOK_TIMEOUT_SECONDS",
-                webhook_defaults.timeout,
-            )?,
+            max_attempts: env
+                .parse("MANSIO_WEBHOOK_MAX_ATTEMPTS", webhook_defaults.max_attempts)?,
+            timeout: env.seconds("MANSIO_WEBHOOK_TIMEOUT_SECONDS", webhook_defaults.timeout)?,
         };
         webhooks.validate()?;
 

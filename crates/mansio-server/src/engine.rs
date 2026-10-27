@@ -370,7 +370,7 @@ impl Engine {
             .map(|(id, item, lease)| (id.clone(), item.message.clone(), lease.clone()));
         if let Some((id, message, lease)) = existing {
             return self
-                .give_again(&mut held, tenant, queue, id, message, lease, now)
+                .give_again(&mut held, tenant, queue, id, message, lease)
                 .await
                 .map(Some);
         }
@@ -391,7 +391,7 @@ impl Engine {
             consumer: consumer.clone(),
             expires_at: now.saturating_add(millis(self.settings.lease)),
         };
-        self.record_claim(&mut held, tenant, queue, &id, &message, &lease, now)
+        self.record_claim(&mut held, tenant, queue, &id, &message, &lease)
             .await?;
         held.queue_mut(queue)
             .set_phase(&id, Phase::Leased(lease.clone()));
@@ -412,21 +412,16 @@ impl Engine {
         item: &ItemId,
         message: &Envelope,
         lease: &Lease,
-        now: i64,
     ) -> Result<(), ApiError> {
+        let now = self.clock.now_millis();
         let mut data = WorkFact::new(queue.clone(), message.id, message.attempt.unwrap_or(1));
         data.lease = Some(lease.fingerprint);
         data.holder = Some(lease.holder.clone());
         data.consumer = Some(lease.consumer.clone());
         data.expires_at = Some(timestamp(lease.expires_at)?);
-        let fact = self.facts.work(
-            tenant,
-            WorkEvent::Claimed,
-            &lease.holder,
-            now,
-            item,
-            &data,
-        )?;
+        let fact = self
+            .facts
+            .work(tenant, WorkEvent::Claimed, &lease.holder, now, item, &data)?;
         self.append(held, fact).await?;
         Ok(())
     }
@@ -440,7 +435,6 @@ impl Engine {
         item: ItemId,
         message: Envelope,
         lease: Lease,
-        now: i64,
     ) -> Result<Claimed, ApiError> {
         let expires_at = timestamp(lease.expires_at)?;
         if let Some(Remembered(lease_id)) = lease.id {
@@ -459,7 +453,7 @@ impl Engine {
             id: Some(Remembered(lease_id)),
             ..lease
         };
-        self.record_claim(held, tenant, queue, &item, &message, &renewed, now)
+        self.record_claim(held, tenant, queue, &item, &message, &renewed)
             .await?;
         held.queue_mut(queue)
             .set_phase(&item, Phase::Leased(renewed.clone()));

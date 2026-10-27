@@ -119,7 +119,11 @@ const TOPIC: Param = required(
     Kind::Text,
     "The topic: facts.<kind>, work.<queue>, alerts, presence or dead.",
 );
-const QUEUE: Param = required("queue", Kind::Text, "The work queue: the <queue> of work.<queue>.");
+const QUEUE: Param = required(
+    "queue",
+    Kind::Text,
+    "The work queue: the <queue> of work.<queue>.",
+);
 const CONSUMER_PULL: Param = required(
     "consumer",
     Kind::Text,
@@ -137,11 +141,23 @@ const CONSUMER_NAMED: Param = required(
 );
 const ENVELOPE: [Param; 8] = [
     required("type", Kind::Text, "What happened (CloudEvents type)."),
-    required("source", Kind::Text, "Where it happened (CloudEvents source)."),
+    required(
+        "source",
+        Kind::Text,
+        "Where it happened (CloudEvents source).",
+    ),
     optional("subject", Kind::Text, "The subject within the source."),
     optional("data", Kind::Json, "The payload, as JSON."),
-    optional("correlation_id", Kind::Text, "The chain of work this belongs to."),
-    optional("causation_id", Kind::Text, "The event that caused this one."),
+    optional(
+        "correlation_id",
+        Kind::Text,
+        "The chain of work this belongs to.",
+    ),
+    optional(
+        "causation_id",
+        Kind::Text,
+        "The event that caused this one.",
+    ),
     optional(
         "idempotency_key",
         Kind::Text,
@@ -220,42 +236,81 @@ impl Op {
         match self {
             Op::Publish => "Publish an envelope to a topic and print it as stored.",
             Op::Poll => "Print the envelopes in a topic from an offset, one JSON object per line.",
-            Op::Watch => "Stream the envelopes of a topic as they arrive, one JSON object per line. With --consumer the position is kept by the broker, so a restart resumes at the next envelope; stop with SIGINT or SIGTERM.",
-            Op::WorkPublish => "Publish a work item to a queue and print it as stored. The item is named by its id.",
-            Op::WorkPull => "Claim the oldest claimable item of a queue under a lease and print the lease id, the consumer, the expiry and the item. Prints nothing if there is none. A consumer that holds a live lease is given it again, so asking again after a lost answer is safe.",
-            Op::WorkAck => "Complete an item you claimed, naming the consumer and presenting the lease.",
-            Op::WorkFail => "Give an item you claimed back as failed. It is tried again after a backoff, or goes to the dead topic when its attempts are used.",
-            Op::AlertsPublish => "Publish an alert and print it as stored. Its id is the alert's id.",
+            Op::Watch => {
+                "Stream the envelopes of a topic as they arrive, one JSON object per line. With --consumer the position is kept by the broker, so a restart resumes at the next envelope; stop with SIGINT or SIGTERM."
+            }
+            Op::WorkPublish => {
+                "Publish a work item to a queue and print it as stored. The item is named by its id."
+            }
+            Op::WorkPull => {
+                "Claim the oldest claimable item of a queue under a lease and print the lease id, the consumer, the expiry and the item. Prints nothing if there is none. A consumer that holds a live lease is given it again, so asking again after a lost answer is safe."
+            }
+            Op::WorkAck => {
+                "Complete an item you claimed, naming the consumer and presenting the lease."
+            }
+            Op::WorkFail => {
+                "Give an item you claimed back as failed. It is tried again after a backoff, or goes to the dead topic when its attempts are used."
+            }
+            Op::AlertsPublish => {
+                "Publish an alert and print it as stored. Its id is the alert's id."
+            }
             Op::AlertsAck => "Acknowledge an alert, once.",
-            Op::PrincipalsCreate => "Issue a credential to a principal. The credential is printed this once. Admin only.",
-            Op::PrincipalsList => "List the principals that have a credential, one JSON object per line. Admin only.",
+            Op::PrincipalsCreate => {
+                "Issue a credential to a principal. The credential is printed this once. Admin only."
+            }
+            Op::PrincipalsList => {
+                "List the principals that have a credential, one JSON object per line. Admin only."
+            }
             Op::PrincipalsRevoke => "Withdraw a principal's credential. Admin only.",
-            Op::WebhooksCreate => "Deliver every envelope of a topic, signed, to a URL. The signing secret is printed this once. Admin only.",
-            Op::WebhooksList => "List the webhooks with their last delivered offset and last error, one JSON object per line. Admin only.",
+            Op::WebhooksCreate => {
+                "Deliver every envelope of a topic, signed, to a URL. The signing secret is printed this once. Admin only."
+            }
+            Op::WebhooksList => {
+                "List the webhooks with their last delivered offset and last error, one JSON object per line. Admin only."
+            }
             Op::WebhooksDelete => "Delete a webhook. Admin only.",
-            Op::ConsumersGet => "Show the offset a named consumer last committed on a topic, and the one it reads next.",
-            Op::ConsumersCommit => "Set the offset of the last message a named consumer has handled. Its next read starts one after it.",
+            Op::ConsumersGet => {
+                "Show the offset a named consumer last committed on a topic, and the one it reads next."
+            }
+            Op::ConsumersCommit => {
+                "Set the offset of the last message a named consumer has handled. Its next read starts one after it."
+            }
         }
     }
 
     /// The parameters.
     pub fn params(self) -> Vec<Param> {
-        let envelope = |first: &[Param]| -> Vec<Param> {
-            first.iter().copied().chain(ENVELOPE).collect()
-        };
+        let envelope =
+            |first: &[Param]| -> Vec<Param> { first.iter().copied().chain(ENVELOPE).collect() };
         match self {
             Op::Publish => envelope(&[TENANT, TOPIC]),
             Op::Poll => vec![
                 TENANT,
                 TOPIC,
-                optional("offset", Kind::Int, "Where to start; the first message is offset 0."),
-                optional("count", Kind::Int, "How many to read at most. The server decides if not given."),
+                optional(
+                    "offset",
+                    Kind::Int,
+                    "Where to start; the first message is offset 0.",
+                ),
+                optional(
+                    "count",
+                    Kind::Int,
+                    "How many to read at most. The server decides if not given.",
+                ),
             ],
             Op::Watch => vec![
                 TENANT,
                 TOPIC,
-                optional("consumer", Kind::Text, "Resume from this named consumer, and commit each offset after its line is written. Not with --from."),
-                optional("from", Kind::Int, "Start at this offset, without keeping a position. Not with --consumer. Default 0."),
+                optional(
+                    "consumer",
+                    Kind::Text,
+                    "Resume from this named consumer, and commit each offset after its line is written. Not with --from.",
+                ),
+                optional(
+                    "from",
+                    Kind::Int,
+                    "Start at this offset, without keeping a position. Not with --consumer. Default 0.",
+                ),
                 optional("limit", Kind::Int, "Stop after this many envelopes."),
             ],
             Op::WorkPublish => envelope(&[TENANT, QUEUE]),
@@ -263,50 +318,91 @@ impl Op {
                 TENANT,
                 QUEUE,
                 CONSUMER_PULL,
-                optional("wait", Kind::Int, "Keep looking for this many seconds until an item can be claimed."),
+                optional(
+                    "wait",
+                    Kind::Int,
+                    "Keep looking for this many seconds until an item can be claimed.",
+                ),
             ],
             Op::WorkAck => vec![
                 TENANT,
                 QUEUE,
                 required("item", Kind::Text, "The item id."),
                 CONSUMER_HELD,
-                required("lease_id", Kind::Text, "The lease the item was claimed under."),
+                required(
+                    "lease_id",
+                    Kind::Text,
+                    "The lease the item was claimed under.",
+                ),
             ],
             Op::WorkFail => vec![
                 TENANT,
                 QUEUE,
                 required("item", Kind::Text, "The item id."),
                 CONSUMER_HELD,
-                required("lease_id", Kind::Text, "The lease the item was claimed under."),
+                required(
+                    "lease_id",
+                    Kind::Text,
+                    "The lease the item was claimed under.",
+                ),
                 required("reason", Kind::Text, "Why it failed."),
             ],
             Op::AlertsPublish => envelope(&[TENANT]),
-            Op::AlertsAck => vec![
-                TENANT,
-                required("alert", Kind::Text, "The alert's id."),
-            ],
+            Op::AlertsAck => vec![TENANT, required("alert", Kind::Text, "The alert's id.")],
             Op::PrincipalsCreate => vec![
-                required("kind", Kind::Text, "The kind: person, agent, connector, service or another lowercase token. An agent credential always expires."),
-                required("name", Kind::Text, "The name, unique within its kind and tenant."),
+                required(
+                    "kind",
+                    Kind::Text,
+                    "The kind: person, agent, connector, service or another lowercase token. An agent credential always expires.",
+                ),
+                required(
+                    "name",
+                    Kind::Text,
+                    "The name, unique within its kind and tenant.",
+                ),
                 TENANT,
-                required("scopes", Kind::Scopes, "What the credential may do: a list of {\"topic\": ..., \"verbs\": [...]}. Verbs are publish, subscribe, claim, ack and approve."),
-                optional("ttl_seconds", Kind::Int, "Seconds until the credential stops working."),
+                required(
+                    "scopes",
+                    Kind::Scopes,
+                    "What the credential may do: a list of {\"topic\": ..., \"verbs\": [...]}. Verbs are publish, subscribe, claim, ack and approve.",
+                ),
+                optional(
+                    "ttl_seconds",
+                    Kind::Int,
+                    "Seconds until the credential stops working.",
+                ),
             ],
-            Op::PrincipalsList => vec![optional("tenant", Kind::Text, "Only this tenant's principals.")],
+            Op::PrincipalsList => vec![optional(
+                "tenant",
+                Kind::Text,
+                "Only this tenant's principals.",
+            )],
             Op::PrincipalsRevoke => vec![required("id", Kind::Text, "The principal's id.")],
             Op::WebhooksCreate => vec![
                 TENANT,
                 TOPIC,
-                required("endpoint", Kind::Text, "The http or https address each envelope is POSTed to."),
+                required(
+                    "endpoint",
+                    Kind::Text,
+                    "The http or https address each envelope is POSTed to.",
+                ),
             ],
-            Op::WebhooksList => vec![optional("tenant", Kind::Text, "Only this tenant's webhooks.")],
+            Op::WebhooksList => vec![optional(
+                "tenant",
+                Kind::Text,
+                "Only this tenant's webhooks.",
+            )],
             Op::WebhooksDelete => vec![required("id", Kind::Text, "The webhook's id.")],
             Op::ConsumersGet => vec![TENANT, TOPIC, CONSUMER_NAMED],
             Op::ConsumersCommit => vec![
                 TENANT,
                 TOPIC,
                 CONSUMER_NAMED,
-                required("offset", Kind::Int, "The offset of the last message handled."),
+                required(
+                    "offset",
+                    Kind::Int,
+                    "The offset of the last message handled.",
+                ),
             ],
         }
     }
@@ -396,7 +492,9 @@ impl<'a> Args<'a> {
         let consumer = self.parse_opt::<ConsumerName>("consumer")?;
         let from = self.int("from");
         if consumer.is_some() && from.is_some() {
-            bail!("--consumer and --from cannot be used together: a consumer resumes where it stopped");
+            bail!(
+                "--consumer and --from cannot be used together: a consumer resumes where it stopped"
+            );
         }
         Ok(WatchArgs {
             tenant: self.parse("tenant")?,
@@ -515,7 +613,14 @@ pub async fn read_messages(
     let reply = client
         .call(
             Method::GET,
-            &["v1", "tenants", tenant.as_str(), "topics", &topic.to_string(), "messages"],
+            &[
+                "v1",
+                "tenants",
+                tenant.as_str(),
+                "topics",
+                &topic.to_string(),
+                "messages",
+            ],
             &query,
             None,
             Replay::Safe,
@@ -619,7 +724,14 @@ pub async fn run(
             let reply = client
                 .call(
                     Method::POST,
-                    &["v1", "tenants", tenant.as_str(), "topics", &topic.to_string(), "messages"],
+                    &[
+                        "v1",
+                        "tenants",
+                        tenant.as_str(),
+                        "topics",
+                        &topic.to_string(),
+                        "messages",
+                    ],
                     &[],
                     Some(&envelope_body(&args)?),
                     Replay::Unsafe,
@@ -630,9 +742,14 @@ pub async fn run(
         Op::Poll => {
             let tenant: TenantId = args.parse("tenant")?;
             let topic: Topic = args.parse("topic")?;
-            let read =
-                read_messages(client, &tenant, &topic, args.int("offset").unwrap_or(0), args.int("count"))
-                    .await?;
+            let read = read_messages(
+                client,
+                &tenant,
+                &topic,
+                args.int("offset").unwrap_or(0),
+                args.int("count"),
+            )
+            .await?;
             Ok(read.into_iter().map(|(_, envelope)| envelope).collect())
         }
         Op::WorkPublish => {
@@ -641,7 +758,14 @@ pub async fn run(
             let reply = client
                 .call(
                     Method::POST,
-                    &["v1", "tenants", tenant.as_str(), "work", queue.as_str(), "items"],
+                    &[
+                        "v1",
+                        "tenants",
+                        tenant.as_str(),
+                        "work",
+                        queue.as_str(),
+                        "items",
+                    ],
                     &[],
                     Some(&envelope_body(&args)?),
                     Replay::Unsafe,
@@ -668,7 +792,16 @@ pub async fn run(
             let reply = client
                 .call(
                     Method::POST,
-                    &["v1", "tenants", tenant.as_str(), "work", queue.as_str(), "items", item, verb],
+                    &[
+                        "v1",
+                        "tenants",
+                        tenant.as_str(),
+                        "work",
+                        queue.as_str(),
+                        "items",
+                        item,
+                        verb,
+                    ],
                     &[],
                     Some(&body),
                     Replay::Unsafe,
@@ -687,7 +820,10 @@ pub async fn run(
                     Replay::Unsafe,
                 )
                 .await?;
-            Ok(vec![member(answered(reply, "alerts_publish")?, "envelope")?])
+            Ok(vec![member(
+                answered(reply, "alerts_publish")?,
+                "envelope",
+            )?])
         }
         Op::AlertsAck => {
             let tenant: TenantId = args.parse("tenant")?;
@@ -695,7 +831,14 @@ pub async fn run(
             let reply = client
                 .call(
                     Method::POST,
-                    &["v1", "tenants", tenant.as_str(), "alerts", &alert.to_string(), "ack"],
+                    &[
+                        "v1",
+                        "tenants",
+                        tenant.as_str(),
+                        "alerts",
+                        &alert.to_string(),
+                        "ack",
+                    ],
                     &[],
                     None,
                     Replay::Unsafe,
@@ -732,7 +875,13 @@ pub async fn run(
                 .map(|tenant| ("tenant", tenant.to_string()))
                 .collect();
             let reply = client
-                .call(Method::GET, &["v1", "principals"], &query, None, Replay::Safe)
+                .call(
+                    Method::GET,
+                    &["v1", "principals"],
+                    &query,
+                    None,
+                    Replay::Safe,
+                )
                 .await?;
             items(answered(reply, "principals_list")?, "principals")
         }
@@ -829,7 +978,14 @@ async fn work_pull(client: &Client, args: &Args<'_>) -> anyhow::Result<Vec<Value
         let reply = client
             .call(
                 Method::POST,
-                &["v1", "tenants", tenant.as_str(), "work", queue.as_str(), "pull"],
+                &[
+                    "v1",
+                    "tenants",
+                    tenant.as_str(),
+                    "work",
+                    queue.as_str(),
+                    "pull",
+                ],
                 &[],
                 Some(&json!({ "consumer": consumer })),
                 Replay::Safe,
@@ -914,7 +1070,11 @@ mod tests {
         assert!(Args::check(Op::WorkPull, &ok).is_ok());
 
         for (op, bad, why) in [
-            (Op::WorkPull, json!({"tenant": "acme", "queue": "builds"}), "consumer is required"),
+            (
+                Op::WorkPull,
+                json!({"tenant": "acme", "queue": "builds"}),
+                "consumer is required",
+            ),
             (
                 Op::WorkPull,
                 json!({"tenant": "acme", "queue": "builds", "consumer": "w", "extra": 1}),
@@ -993,9 +1153,18 @@ mod tests {
     #[test]
     fn what_the_server_would_refuse_is_refused_here() {
         for (op, values) in [
-            (Op::Publish, json!({"tenant": "Acme", "topic": "alerts", "type": "t", "source": "s"})),
-            (Op::Publish, json!({"tenant": "acme", "topic": "nope", "type": "t", "source": "s"})),
-            (Op::Publish, json!({"tenant": "acme", "topic": "alerts", "type": "t", "source": "s", "id": "x"})),
+            (
+                Op::Publish,
+                json!({"tenant": "Acme", "topic": "alerts", "type": "t", "source": "s"}),
+            ),
+            (
+                Op::Publish,
+                json!({"tenant": "acme", "topic": "nope", "type": "t", "source": "s"}),
+            ),
+            (
+                Op::Publish,
+                json!({"tenant": "acme", "topic": "alerts", "type": "t", "source": "s", "id": "x"}),
+            ),
         ] {
             let values = object(values);
             let args = Args::check(op, &values).unwrap();

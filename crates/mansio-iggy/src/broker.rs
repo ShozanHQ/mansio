@@ -13,9 +13,8 @@ use bytes::Bytes;
 use iggy::prelude::{
     AutoLogin, Client, Consumer, ConsumerOffsetClient, Credentials, Durability as IggyDurability,
     Identifier, IggyByteSize, IggyClient, IggyClientBuilder, IggyDuration, IggyError, IggyExpiry,
-    IggyMessage,
-    MaxTopicSize, MessageClient, Partitioning, PersonalAccessTokenClient, PollingStrategy,
-    StreamClient, TopicClient, TopicCreateOptions, UserClient, UserStatus,
+    IggyMessage, MaxTopicSize, MessageClient, Partitioning, PersonalAccessTokenClient,
+    PollingStrategy, StreamClient, TopicClient, TopicCreateOptions, UserClient, UserStatus,
 };
 use mansio_core::{
     Broker, BrokerError, BrokerUser, BrokerUserInfo, Caller, ConsumerName, Credential, Envelope,
