@@ -49,7 +49,7 @@ pub const PRINCIPAL: &str = "service:mansio";
 /// How often a test looks again while it waits for something.
 const LOOK_AGAIN: Duration = Duration::from_millis(50);
 /// How long a server may take to shut down before it is aborted.
-const STOP_TIME: Duration = Duration::from_secs(5);
+pub const STOP_TIME: Duration = Duration::from_secs(5);
 /// What a wait may take beyond what the settings call for, for a slow runner.
 pub const SLACK: Duration = Duration::from_secs(15);
 
@@ -78,11 +78,13 @@ fn local_credential_settings() -> CredentialSettings {
 }
 
 /// The stream settings of the in-process server: a quick look for new
-/// messages, and a comment every second on a quiet event stream.
+/// messages, a comment every second on a quiet event stream, and two seconds
+/// of grace for a shutdown.
 fn local_stream_settings() -> StreamSettings {
     StreamSettings {
         poll: Duration::from_millis(50),
         sse_keepalive: Duration::from_secs(1),
+        shutdown_grace: Duration::from_secs(2),
     }
 }
 
@@ -780,6 +782,19 @@ impl Target {
             base: self.base.clone(),
             tenant: self.tenant.clone(),
         })
+    }
+
+    /// A credential issued earlier, by an earlier process, in this target's
+    /// tenant: the means to use it, from what the issuing pass kept.
+    pub fn adopt(&self, id: &str, token: &str) -> Issued {
+        Issued {
+            id: id.to_owned(),
+            principal: Value::Null,
+            token: token.to_owned(),
+            http: self.http.clone(),
+            base: self.base.clone(),
+            tenant: self.tenant.clone(),
+        }
     }
 
     /// `principals_revoke`, answering whatever the server says.

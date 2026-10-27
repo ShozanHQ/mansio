@@ -57,7 +57,7 @@ pub struct Connection {
     /// `--url`.
     pub url: Option<String>,
     /// `--token`.
-    pub token: Option<String>,
+    pub token: Option<SecretString>,
 }
 
 impl Client {
@@ -77,8 +77,8 @@ impl Client {
         let set = |name: &str| lookup(name).filter(|value| !value.is_empty());
         let token = connection
             .token
-            .filter(|token| !token.is_empty())
-            .or_else(|| set("MANSIO_TOKEN"))
+            .filter(|token| !token.expose_secret().is_empty())
+            .or_else(|| set("MANSIO_TOKEN").map(SecretString::from))
             .context("there is no token: set MANSIO_TOKEN or pass --token")?;
         let base = connection
             .url
@@ -108,7 +108,7 @@ impl Client {
         Ok(Self {
             http,
             base,
-            token: SecretString::from(token),
+            token,
             retries: u32::try_from(retries).unwrap_or(u32::MAX),
             retry_backoff: Duration::from_millis(retry_backoff),
             poll_interval: Duration::from_millis(poll_interval.max(1)),
@@ -231,7 +231,7 @@ mod tests {
         assert!(error.to_string().contains("MANSIO_TOKEN"), "{error}");
         let empty = Connection {
             url: None,
-            token: Some(String::new()),
+            token: Some(SecretString::from(String::new())),
         };
         assert!(Client::from_lookup(empty, lookup(&[("MANSIO_TOKEN", "")])).is_err());
     }
@@ -240,7 +240,7 @@ mod tests {
     fn the_command_line_wins_over_the_environment() {
         let connection = Connection {
             url: Some("http://flag:1".to_owned()),
-            token: Some("from-flag".to_owned()),
+            token: Some(SecretString::from("from-flag".to_owned())),
         };
         let client = Client::from_lookup(
             connection,

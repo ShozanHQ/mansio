@@ -31,7 +31,8 @@
 #   MANSIO_IGGY_SEGMENT_SIZE_BYTES, MANSIO_RETENTION_ALERTS_SECONDS,
 #   MANSIO_AGENT_CREDENTIAL_TTL_SECONDS, MANSIO_CREDENTIAL_RECHECK_SECONDS,
 #   MANSIO_CREDENTIAL_SWEEP_SECONDS, MANSIO_STREAM_POLL_MILLIS,
-#   MANSIO_SSE_KEEPALIVE_SECONDS, MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS,
+#   MANSIO_SSE_KEEPALIVE_SECONDS, MANSIO_SHUTDOWN_GRACE_SECONDS,
+#   MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS,
 #   MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS, MANSIO_WEBHOOK_MAX_ATTEMPTS,
 #   MANSIO_WEBHOOK_TIMEOUT_SECONDS
 #
@@ -40,6 +41,9 @@
 #
 # On start mansio-server replays the topics of every tenant before it answers
 # anything, /healthz included, so a big log keeps /healthz dark for a while.
+# If the registry of principals cannot be loaded (the broker could not be read,
+# or a record of it cannot) /healthz answers 503 "degraded", so the health
+# check fails and the stack is not healthy: the cause is in the server's log.
 # Docker ignores failed health checks during the start period of the check
 # (60s here), and the first one that passes ends it. For a log that takes
 # longer to replay than that, set MANSIO_HEALTH_START_PERIOD, for example 5m.
@@ -141,6 +145,7 @@ services:
       MANSIO_CREDENTIAL_SWEEP_SECONDS: ${MANSIO_CREDENTIAL_SWEEP_SECONDS:-}
       MANSIO_STREAM_POLL_MILLIS: ${MANSIO_STREAM_POLL_MILLIS:-}
       MANSIO_SSE_KEEPALIVE_SECONDS: ${MANSIO_SSE_KEEPALIVE_SECONDS:-}
+      MANSIO_SHUTDOWN_GRACE_SECONDS: ${MANSIO_SHUTDOWN_GRACE_SECONDS:-}
       MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS: ${MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS:-}
       MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS: ${MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS:-}
       MANSIO_WEBHOOK_MAX_ATTEMPTS: ${MANSIO_WEBHOOK_MAX_ATTEMPTS:-}

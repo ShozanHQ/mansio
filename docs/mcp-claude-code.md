@@ -34,7 +34,7 @@ Then `.mcp.json`, at the root of the project:
       "args": ["mcp"],
       "env": {
         "MANSIO_URL": "${MANSIO_URL:-http://127.0.0.1:7070}",
-        "MANSIO_TOKEN": "${MANSIO_TOKEN}"
+        "MANSIO_TOKEN": "${MANSIO_TOKEN:-}"
       }
     }
   }
@@ -43,9 +43,12 @@ Then `.mcp.json`, at the root of the project:
 
 `mansio` has to be on the `PATH` (`cargo install --path crates/mansio`), or
 `command` has to be its full path. The token is read from the environment each
-time Claude Code starts the server, and is never written into the file. Run
-`/mcp` in Claude Code to see that `mansio` is connected; without a token the
-server does not start, and says so.
+time Claude Code starts the server, and is never written into the file. It is
+`${MANSIO_TOKEN:-}` and not `${MANSIO_TOKEN}` on purpose: Claude Code keeps the
+literal text of a variable that is unset and has no default, and `mansio mcp`
+would start with that as its token and answer every call with a 401. With an
+empty default `mansio mcp` sees no token, refuses to start, and says so. Run
+`/mcp` in Claude Code to see that `mansio` is connected.
 
 The tools are the commands of `mansio`, with the same names and parameters:
 `publish`, `poll`, `work_publish`, `work_pull`, `work_extend`, `work_ack`,

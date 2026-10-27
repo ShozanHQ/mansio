@@ -1,8 +1,8 @@
 //! The handlers for named durable consumers: `consumers_get` and
-//! `consumers_commit`. The broker keeps the offset, so it survives a restart
-//! of the server. A credential reads the topic first, which the broker holds
-//! it to, and the server then asks about the consumer, or moves it, as its own
-//! admin identity: a credential writes nothing at the broker.
+//! `consumers_commit`. mansio keeps the positions itself ([`crate::cursors`]),
+//! and a consumer belongs to the principal behind the credential, so two
+//! principals that use one name have two positions. A credential reads the
+//! topic first, which the broker holds it to.
 
 use std::sync::Arc;
 
@@ -11,10 +11,11 @@ use axum::extract::rejection::{BytesRejection, PathRejection};
 use axum::extract::{Path, State};
 use bytes::Bytes;
 use mansio_core::api::{CommitRequest, ConsumerState};
-use mansio_core::{Action, ConsumerName, TenantId, Topic};
+use mansio_core::{Action, Caller, ConsumerName, TenantId, Topic};
 
 use crate::app::{AppState, parse_body, parse_part, read_body};
 use crate::auth::{Actor, Authenticated};
+use crate::cursors::Cursor;
 use crate::error::ApiError;
 
 type Target = (TenantId, Topic, ConsumerName);
@@ -44,8 +45,19 @@ async fn may_read(
         .map_err(|error| ApiError::from(error).logged(tenant, topic))
 }
 
+/// The caller's own consumer of that name.
+fn cursor(actor: &Actor, tenant: TenantId, topic: Topic, consumer: ConsumerName) -> Cursor {
+    Cursor::Named {
+        tenant,
+        topic,
+        principal: actor.principal().clone(),
+        consumer,
+    }
+}
+
 /// `GET /v1/tenants/{tenant}/topics/{topic}/consumers/{consumer}`: where the
-/// consumer stands. A consumer that has committed nothing reads from 0.
+/// caller's consumer of that name stands. One that has committed nothing reads
+/// from 0.
 pub(crate) async fn consumers_get(
     State(state): State<Arc<AppState>>,
     Authenticated(actor): Authenticated,
@@ -55,17 +67,24 @@ pub(crate) async fn consumers_get(
     actor.authorize(Action::Poll, &tenant, &topic)?;
     may_read(&state, &actor, &tenant, &topic).await?;
     let committed = state
-        .broker
-        .consumer_offset(&tenant, &topic, &consumer)
+        .cursors
+        .get(&cursor(
+            &actor,
+            tenant.clone(),
+            topic.clone(),
+            consumer.clone(),
+        ))
         .await
-        .map_err(|error| ApiError::from(error).logged(&tenant, &topic))?;
+        .map_err(|error| error.logged(&tenant, &topic))?;
     Ok(Json(ConsumerState::new(consumer, committed)))
 }
 
 /// `POST /v1/tenants/{tenant}/topics/{topic}/consumers/{consumer}/commit`:
-/// store the offset of the last message the consumer has handled. Its next
-/// read starts one after it. Any offset may be stored, so a consumer can be
-/// set back.
+/// store the offset of the last message the caller's consumer has handled. Its
+/// next read starts one after it. The message must exist, or be one that
+/// retention has since deleted: an offset past the last message of the topic
+/// is a 409, so a typo cannot make a consumer skip what is published next. An
+/// earlier offset sets the consumer back.
 pub(crate) async fn consumers_commit(
     State(state): State<Arc<AppState>>,
     Authenticated(actor): Authenticated,
@@ -76,10 +95,24 @@ pub(crate) async fn consumers_commit(
     actor.authorize(Action::Poll, &tenant, &topic)?;
     let request: CommitRequest = parse_body(&read_body(&state, body)?)?;
     may_read(&state, &actor, &tenant, &topic).await?;
-    state
+    let found = state
         .broker
-        .commit_offset(&tenant, &topic, &consumer, request.offset)
+        .poll(&Caller::Admin, &tenant, &topic, request.offset, 1)
         .await
         .map_err(|error| ApiError::from(error).logged(&tenant, &topic))?;
+    if found.is_empty() {
+        return Err(ApiError::Conflict(format!(
+            "offset {} is past the last message of {topic}: commit the offset of a message that exists",
+            request.offset
+        )));
+    }
+    state
+        .cursors
+        .set(
+            cursor(&actor, tenant.clone(), topic.clone(), consumer.clone()),
+            request.offset,
+        )
+        .await
+        .map_err(|error| error.logged(&tenant, &topic))?;
     Ok(Json(ConsumerState::new(consumer, Some(request.offset))))
 }
