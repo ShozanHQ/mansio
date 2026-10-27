@@ -462,6 +462,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_needs_no_token() {
+        let _serial = serial().await;
         let (status, body) = send(&router(), Method::GET, "/healthz", None, "").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, json!({"status": "ok"}));
@@ -469,6 +470,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_api_needs_the_token() {
+        let _serial = serial().await;
         let router = router();
         for token in [None, Some("wrong"), Some("")] {
             let (status, body) = send(&router, Method::POST, URI, token, MINIMAL).await;
@@ -481,6 +483,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_fills_in_and_poll_returns_it() {
+        let _serial = serial().await;
         let router = router();
         let (status, body) = send(&router, Method::POST, URI, Some(TOKEN), MINIMAL).await;
         assert_eq!(status, StatusCode::CREATED);
@@ -500,6 +503,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_body_with_server_set_attributes_is_refused() {
+        let _serial = serial().await;
         let router = router();
         for name in SERVER_SET {
             let body = format!(r#"{{"source":"s","type":"t","{name}":"x"}}"#);
@@ -511,6 +515,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_requests_are_refused() {
+        let _serial = serial().await;
         let router = router();
         let cases = [
             (Method::POST, URI, "not json"),
@@ -568,6 +573,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_oversized_body_is_refused() {
+        let _serial = serial().await;
         let body = format!(
             r#"{{"source":"s","type":"t","data":"{}"}}"#,
             "x".repeat(4096)
@@ -579,6 +585,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_routes_answer_in_json() {
+        let _serial = serial().await;
         let (status, body) = send(&router(), Method::GET, "/nope", Some(TOKEN), "").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(error_code(&body), "not_found");
@@ -586,6 +593,7 @@ mod tests {
 
     #[tokio::test]
     async fn polling_an_empty_topic_returns_nothing() {
+        let _serial = serial().await;
         let (status, body) = send(
             &router(),
             Method::GET,
@@ -744,6 +752,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_client_chosen_id_is_kept() {
+        let _serial = serial().await;
         let id = "0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3";
         let body =
             format!(r#"{{"id":"{id}","source":"s","type":"t","time":"2026-10-26T12:00:00Z"}}"#);
@@ -784,6 +793,7 @@ mod tests {
 
     #[tokio::test]
     async fn durable_publishes_pass_through_the_sink_and_take_its_record() {
+        let _serial = serial().await;
         let record = mansio_core::Record {
             id: "rec-1".parse().unwrap(),
             prev_hash: "a".repeat(64).parse().unwrap(),
@@ -809,6 +819,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failing_sink_stops_the_publish() {
+        let _serial = serial().await;
         let sink = Arc::new(ScriptedSink {
             seen: Default::default(),
             answer: Err(()),
@@ -895,15 +906,40 @@ mod tests {
         }
     }
 
+    /// Every test in this module holds this lock for its life, and
+    /// `Logs::capture` takes it too. Tracing keeps subscribers and callsite
+    /// interest in process-wide state. A callsite first reached on a thread
+    /// with no subscriber, while another thread's capture is live, is cached
+    /// as never interesting, and its events vanish from that capture.
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().await
+    }
+
+    /// Ends the capture when dropped, then releases the lock. Fields drop in
+    /// declaration order, so the subscriber is gone before the next test runs.
+    struct CaptureGuard {
+        _subscriber: tracing::subscriber::DefaultGuard,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+    }
+
     impl Logs {
-        fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+        async fn capture() -> (Self, CaptureGuard) {
+            let lock = serial().await;
             let logs = Self::default();
             let writer = logs.clone();
             let subscriber = tracing_subscriber::fmt()
                 .with_ansi(false)
                 .with_writer(move || writer.clone())
                 .finish();
-            (logs, tracing::subscriber::set_default(subscriber))
+            let subscriber = tracing::subscriber::set_default(subscriber);
+            tracing::callsite::rebuild_interest_cache();
+            let guard = CaptureGuard {
+                _subscriber: subscriber,
+                _lock: lock,
+            };
+            (logs, guard)
         }
 
         fn text(&self) -> String {
@@ -913,6 +949,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_stored_message_without_an_offset_is_still_a_201() {
+        let _serial = serial().await;
         let router = router_over(|| Ok(None));
         let (status, body) = send(&router, Method::POST, URI, Some(TOKEN), MINIMAL).await;
         assert_eq!(status, StatusCode::CREATED);
@@ -924,7 +961,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_refusal_by_the_broker_is_a_502_and_is_logged_with_where_and_why() {
-        let (logs, _guard) = Logs::capture();
+        let (logs, _guard) = Logs::capture().await;
         let router = router_over(|| Err(mansio_core::BrokerError::Rejected("no room".to_owned())));
         let (status, body) = send(&router, Method::POST, URI, Some(TOKEN), MINIMAL).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
@@ -943,7 +980,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unavailable_broker_is_a_503_and_is_logged() {
-        let (logs, _guard) = Logs::capture();
+        let (logs, _guard) = Logs::capture().await;
         let router = router_over(|| {
             Err(mansio_core::BrokerError::Unavailable(
                 "no answer".to_owned(),
@@ -959,7 +996,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failing_sink_is_logged_without_the_envelope() {
-        let (logs, _guard) = Logs::capture();
+        let (logs, _guard) = Logs::capture().await;
         let sink = Arc::new(ScriptedSink {
             seen: Default::default(),
             answer: Err(()),
@@ -977,7 +1014,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_topic_is_a_404_and_is_not_logged_as_a_failure() {
-        let (logs, _guard) = Logs::capture();
+        let (logs, _guard) = Logs::capture().await;
         let router = router_over(|| Err(mansio_core::BrokerError::NotFound("topic".to_owned())));
         let (status, _) = send(&router, Method::POST, URI, Some(TOKEN), MINIMAL).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
