@@ -5,7 +5,12 @@
 //! for that attempt say where it stands. A transition that was only half
 //! written before the server stopped is finished here: an item whose retry
 //! was published but not recorded owes its `retried` fact, and so does one
-//! whose copy on `dead` was published but not recorded.
+//! whose copy on `dead` was published but not recorded. The fact it owes is
+//! the one the engine made when it published the message (see
+//! [`Facts::owed`]).
+//!
+//! A message that cannot be read is skipped, with a warning naming where it
+//! is, so that one bad message does not stop a tenant.
 
 use std::collections::HashMap;
 
@@ -13,11 +18,12 @@ use mansio_core::{
     AlertEvent, AlertFact, Broker, BrokerError, Envelope, EventId, ItemId, Next, Segment, Stored,
     TenantId, Timestamp, Topic, WorkEvent, WorkFact,
 };
+use std::collections::HashSet;
 use tracing::warn;
 
 use crate::error::ApiError;
 use crate::facts::Facts;
-use crate::state::{AlertState, Lease, Phase, Queue, Then};
+use crate::state::{Lease, Phase, Queue, Then};
 
 /// Everything the engine reads from a tenant's topics, each in publish order.
 #[derive(Debug, Default)]
@@ -33,7 +39,10 @@ pub(crate) struct Logs {
 #[derive(Debug, Default)]
 pub(crate) struct Rebuilt {
     pub(crate) queues: HashMap<Segment, Queue>,
-    pub(crate) alerts: HashMap<EventId, AlertState>,
+    /// Alerts nobody acknowledged, with when each was published or last
+    /// surfaced.
+    pub(crate) alerts: HashMap<EventId, i64>,
+    pub(crate) acknowledged_alerts: HashSet<EventId>,
 }
 
 /// Read, in pages of `page`, every topic the engine replays.
@@ -70,10 +79,23 @@ async fn read_all(
 ) -> Result<Vec<Stored>, BrokerError> {
     let mut all = Vec::new();
     let mut offset = 0;
+    let mut width = page;
     loop {
-        let batch = match broker.poll(tenant, topic, offset, page).await {
+        let batch = match broker.poll(tenant, topic, offset, width).await {
             Ok(batch) => batch,
             Err(BrokerError::NotFound(_)) => break,
+            // A page with a message in it that is not an envelope fails as a
+            // whole. Read one at a time to find which, and step over it.
+            Err(BrokerError::Corrupt(_)) if width > 1 => {
+                width = 1;
+                continue;
+            }
+            Err(BrokerError::Corrupt(why)) => {
+                warn!(%tenant, %topic, offset, %why, "a message that cannot be read is skipped");
+                offset = offset.saturating_add(1);
+                width = page;
+                continue;
+            }
             Err(error) => return Err(error),
         };
         let Some(last) = batch.last() else { break };
@@ -82,6 +104,7 @@ async fn read_all(
             break;
         }
         offset = next;
+        width = page;
         all.extend(batch);
     }
     Ok(all)
@@ -188,7 +211,7 @@ impl Replay<'_> {
             return if attempt <= 1 {
                 Ok(Some(Phase::Ready))
             } else {
-                self.owed_retried(queue, item, message, attempt).map(Some)
+                self.owed_retried(queue, message).map(Some)
             };
         };
         let phase = match last.event {
@@ -198,7 +221,7 @@ impl Replay<'_> {
                 lease_of(&last.data, self.now).map_or(Phase::Ready, Phase::Leased)
             }
             WorkEvent::Failed | WorkEvent::Expired => match last.data.next {
-                Some(Next::Dead) => self.dead_phase(queue, item, message, attempt, last.at)?,
+                Some(Next::Dead) => self.dead_phase(queue, item, message, last.at)?,
                 Some(Next::Retry) | None => Phase::Backoff {
                     due: millis(last.data.retry_at.as_ref(), last.at),
                     next: Next::Retry,
@@ -209,26 +232,14 @@ impl Replay<'_> {
     }
 
     /// The `retried` fact of a message that was published without it.
-    fn owed_retried(
-        &self,
-        queue: &Segment,
-        item: &ItemId,
-        message: &Envelope,
-        attempt: u32,
-    ) -> Result<Phase, ApiError> {
-        let mut data = WorkFact::new(queue.clone(), message.id, attempt);
-        data.previous_message_id = message
+    fn owed_retried(&self, queue: &Segment, message: &Envelope) -> Result<Phase, ApiError> {
+        let previous = message
             .causation_id
             .as_ref()
             .and_then(|cause| cause.as_str().parse().ok());
-        let fact = self.facts.work(
-            self.tenant,
-            WorkEvent::Retried,
-            self.facts.engine(),
-            self.now,
-            item,
-            &data,
-        )?;
+        let fact = self
+            .facts
+            .owed(self.tenant, WorkEvent::Retried, queue, message, previous)?;
         Ok(Phase::Owed {
             fact: Box::new(fact),
             then: Then::Ready,
@@ -242,7 +253,6 @@ impl Replay<'_> {
         queue: &Segment,
         item: &ItemId,
         message: &Envelope,
-        attempt: u32,
         failed_at: i64,
     ) -> Result<Phase, ApiError> {
         let Some(copy) = self
@@ -255,15 +265,12 @@ impl Replay<'_> {
                 next: Next::Dead,
             });
         };
-        let mut data = WorkFact::new(queue.clone(), copy.envelope.id, attempt);
-        data.previous_message_id = Some(message.id);
-        let fact = self.facts.work(
+        let fact = self.facts.owed(
             self.tenant,
             WorkEvent::Dead,
-            self.facts.engine(),
-            self.now,
-            item,
-            &data,
+            queue,
+            &copy.envelope,
+            Some(message.id),
         )?;
         Ok(Phase::Owed {
             fact: Box::new(fact),
@@ -306,21 +313,21 @@ pub(crate) fn replay(
                 .flatten()
                 .filter(|fact| fact.data.attempt == attempt)
                 .collect();
-            if let Some(phase) = context.phase(name, &item, newest, &about_this_attempt)? {
-                queue.insert(item, newest.envelope.clone(), phase);
+            match context.phase(name, &item, newest, &about_this_attempt)? {
+                Some(phase) => queue.insert(item, newest.envelope.clone(), phase),
+                None => queue.finish(&item),
             }
         }
         rebuilt.queues.insert(name.clone(), queue);
     }
 
     for alert in &logs.alerts {
-        rebuilt.alerts.insert(
-            alert.envelope.id,
-            AlertState {
-                surfaced_at: millis(alert.envelope.time.as_ref(), now),
-                acknowledged_by: None,
-            },
-        );
+        // The first copy of an alert is the alert. The time it carries is the
+        // producer's, so one from the future counts from now.
+        rebuilt
+            .alerts
+            .entry(alert.envelope.id)
+            .or_insert_with(|| millis(alert.envelope.time.as_ref(), now).min(now));
     }
     for message in &logs.facts_alert {
         let envelope = &message.envelope;
@@ -335,18 +342,19 @@ pub(crate) fn replay(
             warn!(offset = message.offset, "an alert fact could not be read");
             continue;
         };
-        let Some(alert) = rebuilt.alerts.get_mut(&data.alert_id) else {
-            continue;
-        };
         let at = millis(envelope.time.as_ref(), now);
         match event {
+            // The first acknowledgement is the one that counts.
             AlertEvent::Acknowledged => {
-                alert.acknowledged_by = Some(
-                    data.acknowledged_by
-                        .unwrap_or_else(|| envelope.principal.clone()),
-                );
+                if rebuilt.alerts.remove(&data.alert_id).is_some() {
+                    rebuilt.acknowledged_alerts.insert(data.alert_id);
+                }
             }
-            AlertEvent::Resurfaced => alert.surfaced_at = alert.surfaced_at.max(at),
+            AlertEvent::Resurfaced => {
+                if let Some(surfaced_at) = rebuilt.alerts.get_mut(&data.alert_id) {
+                    *surfaced_at = (*surfaced_at).max(at);
+                }
+            }
         }
     }
     Ok(rebuilt)

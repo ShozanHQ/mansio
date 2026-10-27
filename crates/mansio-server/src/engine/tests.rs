@@ -46,6 +46,8 @@ fn consumer(name: &str) -> ConsumerName {
 struct FlakyBroker {
     inner: MemoryBroker,
     failing: StdMutex<HashSet<String>>,
+    lost: StdMutex<HashSet<String>>,
+    corrupt: StdMutex<Option<(Topic, u64)>>,
 }
 
 impl FlakyBroker {
@@ -53,8 +55,22 @@ impl FlakyBroker {
         self.failing.lock().unwrap().insert(topic.to_owned());
     }
 
+    /// The next publish to the topic, or of the event type, is stored and then
+    /// reported as an error, as a connection that drops after the write would.
+    fn lose_the_answer(&self, what: &str) {
+        self.lost.lock().unwrap().insert(what.to_owned());
+    }
+
+    /// A poll that covers the message at `offset` of `topic` fails, as one
+    /// does when a stored message is not an envelope.
+    fn corrupt(&self, topic: &str, offset: u64) {
+        *self.corrupt.lock().unwrap() = Some((topic.parse().unwrap(), offset));
+    }
+
     fn heal(&self) {
         self.failing.lock().unwrap().clear();
+        self.lost.lock().unwrap().clear();
+        *self.corrupt.lock().unwrap() = None;
     }
 }
 
@@ -85,7 +101,17 @@ impl Broker for FlakyBroker {
         if refused {
             return Err(BrokerError::Unavailable("injected".to_owned()));
         }
-        self.inner.publish(envelope).await
+        let stored = self.inner.publish(envelope).await;
+        let lost = {
+            let mut lost = self.lost.lock().unwrap();
+            lost.remove(&envelope.topic.to_string()) || lost.remove(envelope.event_type.as_str())
+        };
+        if lost {
+            return Err(BrokerError::Unavailable(
+                "the connection dropped after the write".to_owned(),
+            ));
+        }
+        stored
     }
 
     async fn poll(
@@ -95,6 +121,14 @@ impl Broker for FlakyBroker {
         offset: u64,
         max: u32,
     ) -> Result<Vec<Stored>, BrokerError> {
+        if let Some((bad, at)) = &*self.corrupt.lock().unwrap()
+            && bad == topic
+            && (offset..offset.saturating_add(u64::from(max))).contains(at)
+        {
+            return Err(BrokerError::Corrupt(format!(
+                "offset {at} of {topic} in {tenant}: injected"
+            )));
+        }
         self.inner.poll(tenant, topic, offset, max).await
     }
 }
@@ -196,21 +230,11 @@ impl Rig {
 
     async fn publish_item(&self, name: &str) -> ItemId {
         let id = EventId::generate();
-        let mut message = Envelope::new(
-            id,
-            "test".parse().unwrap(),
-            "job.requested".parse().unwrap(),
-            tenant(),
-            Topic::Work(queue()),
-            agent("planner"),
-        );
-        let item: ItemId = id.to_string().parse().unwrap();
-        message.item_id = Some(item.clone());
-        message.attempt = Some(1);
-        message.subject = Some(name.parse().unwrap());
-        message.data = Some(json!({"name": name}));
-        self.engine.work_publish(message).await.unwrap();
-        item
+        self.engine
+            .work_publish(item_envelope(id, name))
+            .await
+            .unwrap();
+        id.to_string().parse().unwrap()
     }
 
     async fn pull(&self, who: &str) -> Option<Claimed> {
@@ -248,6 +272,23 @@ impl Rig {
             .map(|fact| fact.event_type.as_str().replace("mansio.work.", ""))
             .collect()
     }
+}
+
+/// The message `work_publish` is given: named after its id, at attempt 1.
+fn item_envelope(id: EventId, name: &str) -> Envelope {
+    let mut message = Envelope::new(
+        id,
+        "test".parse().unwrap(),
+        "job.requested".parse().unwrap(),
+        tenant(),
+        Topic::Work(queue()),
+        agent("planner"),
+    );
+    message.item_id = Some(id.to_string().parse().unwrap());
+    message.attempt = Some(1);
+    message.subject = Some(name.parse().unwrap());
+    message.data = Some(json!({"name": name}));
+    message
 }
 
 fn data(fact: &Envelope) -> Value {
@@ -577,8 +618,7 @@ async fn an_item_id_that_is_still_open_cannot_be_published_again() {
     assert_eq!(rig.read(&Topic::Work(queue())).await.len(), 1);
 }
 
-async fn publish_alert(rig: &Rig) -> EventId {
-    let id = EventId::generate();
+fn alert_envelope(id: EventId, at: i64) -> Envelope {
     let mut alert = Envelope::new(
         id,
         "test".parse().unwrap(),
@@ -587,8 +627,16 @@ async fn publish_alert(rig: &Rig) -> EventId {
         Topic::Alerts,
         agent("monitor"),
     );
-    alert.time = Some(Timestamp::from_unix_millis(rig.clock.now_millis()).unwrap());
-    rig.engine.publish(alert).await.unwrap();
+    alert.time = Some(Timestamp::from_unix_millis(at).unwrap());
+    alert
+}
+
+async fn publish_alert(rig: &Rig) -> EventId {
+    let id = EventId::generate();
+    rig.engine
+        .publish(alert_envelope(id, rig.clock.now_millis()))
+        .await
+        .unwrap();
     id
 }
 
@@ -628,7 +676,9 @@ async fn an_alert_is_acknowledged_once_and_the_ack_names_the_principal() {
     );
 
     let second = rig.engine.alerts_ack(&tenant(), alert, &agent("sam")).await;
-    assert!(matches!(second, Err(ApiError::Conflict(message)) if message.contains("agent:pat")));
+    assert!(
+        matches!(second, Err(ApiError::Conflict(message)) if message.contains("already acknowledged"))
+    );
     let unknown = rig
         .engine
         .alerts_ack(&tenant(), EventId::generate(), &agent("pat"))
@@ -983,4 +1033,300 @@ fn the_engine_has_a_debug_form_that_names_no_state() {
         .unwrap()
         .block_on(async { Rig::new() });
     assert!(format!("{:?}", rig.engine).contains("Engine"));
+}
+
+// ---- an error does not say whether the message was stored -------------------
+
+#[tokio::test]
+async fn a_work_item_that_was_stored_but_whose_publish_errored_is_still_claimable() {
+    let rig = Rig::new();
+    rig.broker.lose_the_answer("work.builds");
+    let id = EventId::generate();
+    let refused = rig.engine.work_publish(item_envelope(id, "job")).await;
+    assert!(matches!(refused, Err(ApiError::Unavailable(_))));
+    assert_eq!(
+        rig.read(&Topic::Work(queue())).await.len(),
+        1,
+        "it is stored"
+    );
+
+    let claim = rig.pull("one").await.expect("a stored item can be claimed");
+    assert_eq!(claim.item.id, id);
+}
+
+#[tokio::test]
+async fn an_alert_ack_that_was_stored_but_errored_cannot_be_made_twice() {
+    let rig = Rig::new();
+    let alert = publish_alert(&rig).await;
+    rig.broker.lose_the_answer("mansio.alert.acknowledged");
+    let refused = rig.engine.alerts_ack(&tenant(), alert, &agent("pat")).await;
+    assert!(matches!(refused, Err(ApiError::Unavailable(_))));
+
+    let again = rig.engine.alerts_ack(&tenant(), alert, &agent("sam")).await;
+    assert!(matches!(again, Err(ApiError::Conflict(_))), "{again:?}");
+    assert_eq!(alert_facts(&rig).await, ["acknowledged"]);
+}
+
+#[tokio::test]
+async fn a_claim_that_was_stored_but_errored_holds_the_item() {
+    let rig = Rig::new();
+    rig.publish_item("job").await;
+    rig.broker.lose_the_answer("mansio.work.claimed");
+    let refused = rig
+        .engine
+        .work_pull(&tenant(), &queue(), &agent("one"), &consumer("w1"))
+        .await;
+    assert!(matches!(refused, Err(ApiError::Unavailable(_))));
+
+    // The claim is on the log, so the item is leased, and comes back after it.
+    assert!(rig.pull("two").await.is_none());
+    rig.pass(10).await;
+    rig.pass(2).await;
+    assert_eq!(rig.pull("two").await.unwrap().item.attempt, Some(2));
+}
+
+#[tokio::test]
+async fn a_dead_letter_that_was_stored_but_errored_is_not_sent_twice() {
+    let rig = Rig::new();
+    let item = rig.publish_item("job").await;
+    for _ in 0..2 {
+        let claim = rig.pull("one").await.unwrap();
+        rig.fail("one", &item, &claim.lease_id).await.unwrap();
+        rig.pass(5).await;
+    }
+    let claim = rig.pull("one").await.unwrap();
+    rig.broker.lose_the_answer("dead");
+    rig.fail("one", &item, &claim.lease_id).await.unwrap();
+    assert_eq!(rig.read(&Topic::Dead).await.len(), 1, "the copy is out");
+
+    rig.pass(1).await;
+    rig.pass(100).await;
+    assert_dead_once(&rig).await;
+}
+
+// ---- ids are not reused ----------------------------------------------------
+
+#[tokio::test]
+async fn an_item_id_is_not_reused_after_the_item_is_done() {
+    let rig = Rig::new();
+    let id = EventId::generate();
+    rig.engine
+        .work_publish(item_envelope(id, "job"))
+        .await
+        .unwrap();
+    let item: ItemId = id.to_string().parse().unwrap();
+    let claim = rig.pull("one").await.unwrap();
+    rig.ack("one", &item, &claim.lease_id).await.unwrap();
+
+    let again = rig.engine.work_publish(item_envelope(id, "job")).await;
+    assert!(matches!(again, Err(ApiError::Conflict(_))), "{again:?}");
+    assert!(
+        rig.pull("two").await.is_none(),
+        "done work does not run twice"
+    );
+
+    let rig = rig.restart().await;
+    assert!(rig.pull("two").await.is_none());
+    let again = rig.engine.work_publish(item_envelope(id, "job")).await;
+    assert!(matches!(again, Err(ApiError::Conflict(_))), "{again:?}");
+    assert_eq!(rig.read(&Topic::Work(queue())).await.len(), 1);
+}
+
+#[tokio::test]
+async fn an_item_id_is_not_reused_after_the_item_is_dead() {
+    let rig = Rig::new();
+    let id = EventId::generate();
+    rig.engine
+        .work_publish(item_envelope(id, "job"))
+        .await
+        .unwrap();
+    let item: ItemId = id.to_string().parse().unwrap();
+    for _ in 0..3 {
+        let claim = rig.pull("one").await.unwrap();
+        rig.fail("one", &item, &claim.lease_id).await.unwrap();
+        rig.pass(5).await;
+    }
+    assert_eq!(rig.read(&Topic::Dead).await.len(), 1);
+
+    let refused = rig.engine.work_publish(item_envelope(id, "job")).await;
+    assert!(matches!(refused, Err(ApiError::Conflict(_))));
+    let rig = rig.restart().await;
+    let refused = rig.engine.work_publish(item_envelope(id, "job")).await;
+    assert!(matches!(refused, Err(ApiError::Conflict(_))));
+    assert!(rig.pull("two").await.is_none());
+}
+
+#[tokio::test]
+async fn a_resent_alert_is_refused_and_does_not_reopen_it() {
+    let rig = Rig::new();
+    let id = EventId::generate();
+    rig.engine.publish(alert_envelope(id, START)).await.unwrap();
+    // Unacknowledged, a resend is refused and publishes nothing.
+    let resent = rig.engine.publish(alert_envelope(id, START)).await;
+    assert!(matches!(resent, Err(ApiError::Conflict(_))), "{resent:?}");
+    assert_eq!(rig.read(&Topic::Alerts).await.len(), 1);
+
+    rig.engine
+        .alerts_ack(&tenant(), id, &agent("pat"))
+        .await
+        .unwrap();
+    // Acknowledged, a resend does not make it acknowledgeable again.
+    let resent = rig.engine.publish(alert_envelope(id, START)).await;
+    assert!(matches!(resent, Err(ApiError::Conflict(_))), "{resent:?}");
+    let again = rig.engine.alerts_ack(&tenant(), id, &agent("sam")).await;
+    assert!(matches!(again, Err(ApiError::Conflict(_))));
+    rig.pass(300).await;
+    assert_eq!(alert_facts(&rig).await, ["acknowledged"]);
+
+    let rig = rig.restart().await;
+    let again = rig.engine.alerts_ack(&tenant(), id, &agent("kim")).await;
+    assert!(matches!(again, Err(ApiError::Conflict(_))));
+    rig.pass(300).await;
+    assert_eq!(alert_facts(&rig).await, ["acknowledged"]);
+}
+
+// ---- one failure does not stop the rest --------------------------------------
+
+#[tokio::test]
+async fn one_item_whose_retry_keeps_failing_does_not_stall_the_rest_of_the_tenant() {
+    let rig = Rig::new();
+    let poison = EventId::generate();
+    let mut message = item_envelope(poison, "poison");
+    message.event_type = "poison.job".parse().unwrap();
+    rig.engine.work_publish(message).await.unwrap();
+    let healthy = rig.publish_item("healthy").await;
+    let alert = publish_alert(&rig).await;
+
+    let poisoned = rig.pull("one").await.unwrap();
+    let ok = rig.pull("two").await.unwrap();
+    rig.fail(
+        "one",
+        &poison.to_string().parse().unwrap(),
+        &poisoned.lease_id,
+    )
+    .await
+    .unwrap();
+    rig.broker.fail("poison.job");
+    rig.fail("two", &healthy, &ok.lease_id).await.unwrap();
+
+    for _ in 0..20 {
+        rig.pass(10).await;
+    }
+    let again = rig.pull("three").await.expect("the healthy item came back");
+    assert_eq!(again.item.item_id, Some(healthy));
+    assert!(
+        alert_facts(&rig).await.iter().any(|t| t == "resurfaced"),
+        "alert {alert} was surfaced again"
+    );
+    // And the poison item is not lost: it comes back once the broker does.
+    rig.broker.heal();
+    rig.pass(10).await;
+    let poisoned = rig.pull("four").await.unwrap();
+    assert_eq!(poisoned.item.attempt, Some(2));
+}
+
+// ---- time and the clock ------------------------------------------------------
+
+#[tokio::test]
+async fn an_alert_with_a_time_in_the_future_is_still_surfaced_again() {
+    let rig = Rig::new();
+    let id = EventId::generate();
+    let tomorrow = START + 86_400_000;
+    rig.engine
+        .publish(alert_envelope(id, tomorrow))
+        .await
+        .unwrap();
+    rig.pass(29).await;
+    assert!(alert_facts(&rig).await.is_empty());
+    rig.pass(1).await;
+    assert_eq!(alert_facts(&rig).await, ["resurfaced"]);
+
+    // After a restart too: timed from the restart if its own time is later.
+    let rig = rig.restart().await;
+    rig.pass(30).await;
+    assert_eq!(alert_facts(&rig).await, ["resurfaced", "resurfaced"]);
+    rig.engine
+        .alerts_ack(&tenant(), id, &agent("pat"))
+        .await
+        .unwrap();
+}
+
+// ---- a message that cannot be read -------------------------------------------
+
+#[tokio::test]
+async fn a_message_that_cannot_be_read_is_skipped_when_the_state_is_rebuilt() {
+    let rig = Rig::new();
+    let first = rig.publish_item("first").await;
+    let claim = rig.pull("one").await.unwrap(); // facts.work 0: claimed
+    rig.ack("one", &first, &claim.lease_id).await.unwrap(); // 1: acked
+    rig.publish_item("second").await;
+    rig.pull("one").await.unwrap(); // 2: claimed
+    rig.publish_item("third").await;
+
+    // The ack cannot be read back. Everything else still can.
+    rig.broker.corrupt("facts.work", 1);
+    let rig = rig.restart().await;
+    // The third is claimable, the second is leased, and no request fails.
+    assert_eq!(rig.pull("two").await.unwrap().item.attempt, Some(1));
+    assert!(rig.pull("two").await.is_none());
+}
+
+// ---- what a restart keeps --------------------------------------------------
+
+#[tokio::test]
+async fn an_acknowledged_alert_leaves_only_its_id_in_memory() {
+    fn check(held: &TenantState, open: EventId, done: EventId) {
+        assert_eq!(held.alerts.keys().copied().collect::<Vec<_>>(), [open]);
+        assert!(held.acknowledged_alerts.contains(&done));
+    }
+
+    let rig = Rig::new();
+    let open = publish_alert(&rig).await;
+    let done = publish_alert(&rig).await;
+    rig.engine
+        .alerts_ack(&tenant(), done, &agent("pat"))
+        .await
+        .unwrap();
+    check(&rig.engine.lock(&tenant()).await.unwrap(), open, done);
+    let rig = rig.restart().await;
+    check(&rig.engine.lock(&tenant()).await.unwrap(), open, done);
+}
+
+#[tokio::test]
+async fn a_fact_rebuilt_after_a_restart_is_the_one_the_crashed_server_wrote() {
+    // A retry whose fact the sink recorded and the broker never got.
+    let rig = Rig::new();
+    let item = rig.publish_item("job").await;
+    let claim = rig.pull("one").await.unwrap();
+    rig.fail("one", &item, &claim.lease_id).await.unwrap();
+    rig.broker.fail("mansio.work.retried");
+    rig.pass(2).await;
+    let recorded = *rig.sink.topic("facts.work").last().unwrap();
+    let republished = rig.read(&Topic::Work(queue())).await.remove(1);
+
+    rig.broker.heal();
+    let rig = rig.restart().await;
+    rig.pass(1).await;
+    let facts = rig.read(&Topic::facts_work()).await;
+    let retried = facts.last().unwrap();
+    assert_eq!(retried.event_type.as_str(), "mansio.work.retried");
+    assert_eq!(
+        retried.id, recorded,
+        "the same fact, so a consumer sees one"
+    );
+    assert_eq!(retried.time, republished.time);
+    assert_eq!(rig.sink.topic("facts.work").last(), Some(&recorded));
+}
+
+#[tokio::test]
+async fn a_dead_fact_rebuilt_after_a_restart_is_the_one_the_crashed_server_wrote() {
+    let rig = failing_last_attempt("mansio.work.dead").await;
+    let recorded = *rig.sink.topic("facts.work").last().unwrap();
+    rig.broker.heal();
+    let rig = rig.restart().await;
+    rig.pass(1).await;
+    let facts = rig.read(&Topic::facts_work()).await;
+    let dead = facts.last().unwrap();
+    assert_eq!(dead.event_type.as_str(), "mansio.work.dead");
+    assert_eq!(dead.id, recorded);
 }

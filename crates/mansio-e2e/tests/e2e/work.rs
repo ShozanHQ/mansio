@@ -243,7 +243,10 @@ async fn only_the_holder_presenting_the_lease_id_can_ack_or_fail() -> anyhow::Re
 #[tokio::test]
 async fn an_acked_item_is_done() -> anyhow::Result<()> {
     let target = Target::start().await?;
-    target.work_publish(QUEUE, &job(1)).await?;
+    let mut body = job(1);
+    let id = EventId::generate().to_string();
+    body["id"] = json!(id);
+    target.work_publish(QUEUE, &body).await?;
     let claim = target.claim(QUEUE, "worker", SLACK).await?;
     let acked = target.ack_claim(QUEUE, &claim).await?;
     assert_eq!(acked.envelope.event_type.as_str(), "mansio.work.acked");
@@ -255,6 +258,12 @@ async fn an_acked_item_is_done() -> anyhow::Result<()> {
         .ack(QUEUE, &item_of(&claim)?, &claim.lease_id.to_string())
         .await?;
     assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Its id is not used again, so sending the same work twice does not run
+    // it twice.
+    let uri = target.tenant_uri(&format!("work/{QUEUE}/items"));
+    let (status, response) = target.authed(Method::POST, &uri, Some(&body)).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
 
     // Past where the lease would have ended, and the backoff after it.
     tokio::time::sleep(target.lease() + target.backoff(1) + target.settle()).await;

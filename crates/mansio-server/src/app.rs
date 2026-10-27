@@ -28,7 +28,7 @@ use crate::auth::{Auth, Authenticated};
 use crate::clock::{Clock, SystemClock};
 use crate::engine::Engine;
 use crate::error::ApiError;
-use crate::settings::{Limits, WorkSettings};
+use crate::settings::{Limits, SettingsError, WorkSettings};
 use crate::work_api;
 
 /// Attributes the server sets itself, from the path and the credential. A
@@ -63,13 +63,29 @@ pub struct Server {
     work: WorkSettings,
 }
 
-/// Aborts a task when dropped, so that a server that is dropped or stopped
-/// does not leave its timer running.
-struct AbortOnDrop(JoinHandle<()>);
+/// The engine's timer, running as a task. Dropping it aborts the task, so a
+/// server that is dropped does not leave its timer running; [`Timer::stop`]
+/// also waits until the task is gone.
+struct Timer(Option<JoinHandle<()>>);
 
-impl Drop for AbortOnDrop {
+impl Timer {
+    fn start(engine: Arc<Engine>) -> Self {
+        Self(Some(tokio::spawn(engine.run())))
+    }
+
+    async fn stop(mut self) {
+        if let Some(mut task) = self.0.take() {
+            task.abort();
+            let _ = (&mut task).await;
+        }
+    }
+}
+
+impl Drop for Timer {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
     }
 }
 
@@ -103,10 +119,15 @@ impl Server {
     }
 
     /// Use these work and alert settings instead of the defaults.
-    #[must_use]
-    pub fn with_work_settings(mut self, work: WorkSettings) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the setting if the settings do not fit
+    /// together, for example a tick of zero, which would stop the timer.
+    pub fn with_work_settings(mut self, work: WorkSettings) -> Result<Self, SettingsError> {
+        work.validate()?;
         self.work = work;
-        self
+        Ok(self)
     }
 
     /// Read time from `clock` instead of the system clock.
@@ -195,10 +216,12 @@ impl Server {
                 "the tenants could not be listed; the timer will try again"
             );
         }
-        let _timer = AbortOnDrop(tokio::spawn(engine.run()));
-        axum::serve(listener, router)
+        let timer = Timer::start(engine);
+        let served = axum::serve(listener, router)
             .with_graceful_shutdown(shutdown)
-            .await
+            .await;
+        timer.stop().await;
+        served
     }
 }
 
@@ -608,6 +631,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_work_and_alert_routes_need_the_token() {
+        let _serial = serial().await;
         let router = router();
         let routes = [
             (Method::GET, "/v1/settings"),
@@ -630,6 +654,7 @@ mod tests {
 
     #[tokio::test]
     async fn work_requests_are_checked_before_anything_happens() {
+        let _serial = serial().await;
         let router = router();
         let item = "/v1/tenants/acme/work/builds/items";
         let lease = "0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3";
@@ -712,6 +737,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_queue_answers_204_and_an_unknown_item_404() {
+        let _serial = serial().await;
         let router = router();
         let (status, _) = send(
             &router,
@@ -736,6 +762,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_settings_route_reports_what_the_server_runs_with() {
+        let _serial = serial().await;
         let (status, body) = send(&router(), Method::GET, "/v1/settings", Some(TOKEN), "").await;
         assert_eq!(status, StatusCode::OK);
         let settings: mansio_core::api::EffectiveSettings = serde_json::from_value(body).unwrap();
@@ -748,6 +775,53 @@ mod tests {
         assert_eq!(settings.max_body_bytes, 2048);
         assert_eq!(settings.poll_default_count, 3);
         assert_eq!(settings.poll_max_count, 5);
+    }
+
+    #[tokio::test]
+    async fn work_settings_that_would_stop_the_timer_are_refused() {
+        let _serial = serial().await;
+        let auth = || {
+            Auth::new(
+                SecretString::from(TOKEN.to_owned()),
+                "service:mansio".parse().unwrap(),
+            )
+        };
+        let zero_tick = WorkSettings {
+            tick: std::time::Duration::ZERO,
+            ..WorkSettings::default()
+        };
+        let refused = Server::new(Arc::new(MemoryBroker::new()), auth())
+            .with_work_settings(zero_tick)
+            .err();
+        assert!(matches!(
+            refused,
+            Some(SettingsError::Invalid {
+                name: "MANSIO_TICK_MILLIS",
+                ..
+            })
+        ));
+        let fine = Server::new(Arc::new(MemoryBroker::new()), auth())
+            .with_work_settings(WorkSettings::default());
+        assert!(fine.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_timer_of_an_engine_with_a_zero_tick_does_not_panic() {
+        let _serial = serial().await;
+        let engine = Arc::new(Engine::new(
+            Arc::new(MemoryBroker::new()),
+            Arc::new(NoSink),
+            Arc::new(SystemClock),
+            WorkSettings {
+                tick: std::time::Duration::ZERO,
+                ..WorkSettings::default()
+            },
+            10,
+        ));
+        let timer = tokio::spawn(engine.run());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!timer.is_finished(), "the timer is still running");
+        timer.abort();
     }
 
     #[tokio::test]

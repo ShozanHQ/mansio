@@ -51,5 +51,10 @@ All notable changes to mansio are listed here. The format follows
   hold them.
 - The generic messages route refuses `work.<queue>`, `facts.work` and
   `facts.alert`.
+- An item id and an alert id are used once: resending one the queue or tenant
+  has had is a 409.
+- After a publish fails, which may still have stored the message, the engine
+  rebuilds the tenant's state from its topics.
+- `Server::with_work_settings` checks the settings and returns an error.
 - `compose.yaml` passes the work settings through, and keeps the sink file in
   `MANSIO_SINK_DIR` when it is set.
