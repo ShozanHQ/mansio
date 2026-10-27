@@ -34,6 +34,8 @@ pub enum Op {
     WorkPublish,
     /// Claim the oldest item of a queue.
     WorkPull,
+    /// Move the end of a claimed item's lease later.
+    WorkExtend,
     /// Complete a claimed item.
     WorkAck,
     /// Give a claimed item back as failed.
@@ -172,12 +174,13 @@ const ENVELOPE: [Param; 8] = [
 
 impl Op {
     /// Every operation, in the order they are listed.
-    pub const ALL: [Op; 17] = [
+    pub const ALL: [Op; 18] = [
         Op::Publish,
         Op::Poll,
         Op::Watch,
         Op::WorkPublish,
         Op::WorkPull,
+        Op::WorkExtend,
         Op::WorkAck,
         Op::WorkFail,
         Op::AlertsPublish,
@@ -200,6 +203,7 @@ impl Op {
             Op::Watch => &["watch"],
             Op::WorkPublish => &["work", "publish"],
             Op::WorkPull => &["work", "pull"],
+            Op::WorkExtend => &["work", "extend"],
             Op::WorkAck => &["work", "ack"],
             Op::WorkFail => &["work", "fail"],
             Op::AlertsPublish => &["alerts", "publish"],
@@ -244,6 +248,9 @@ impl Op {
             }
             Op::WorkPull => {
                 "Claim the oldest claimable item of a queue under a lease and print the lease id, the consumer, the expiry and the item. Prints nothing if there is none. A consumer that holds a live lease is given it again, so asking again after a lost answer is safe."
+            }
+            Op::WorkExtend => {
+                "Move the end of the lease of an item you claimed later, so that work that takes longer than the lease keeps its item. Prints the extended fact: its data.expires_at is the new end. A lease is never shortened and never runs past the server's longest lease from the claim. Safe to repeat."
             }
             Op::WorkAck => {
                 "Complete an item you claimed, naming the consumer and presenting the lease."
@@ -322,6 +329,22 @@ impl Op {
                     "wait",
                     Kind::Int,
                     "Keep looking for this many seconds until an item can be claimed.",
+                ),
+            ],
+            Op::WorkExtend => vec![
+                TENANT,
+                QUEUE,
+                required("item", Kind::Text, "The item id."),
+                CONSUMER_HELD,
+                required(
+                    "lease_id",
+                    Kind::Text,
+                    "The lease the item was claimed under.",
+                ),
+                optional(
+                    "seconds",
+                    Kind::Int,
+                    "End the lease this many seconds from now, at least 1. The server's lease setting if not given.",
                 ),
             ],
             Op::WorkAck => vec![
@@ -774,20 +797,27 @@ pub async fn run(
             Ok(vec![member(answered(reply, "work_publish")?, "envelope")?])
         }
         Op::WorkPull => work_pull(client, &args).await,
-        Op::WorkAck | Op::WorkFail => {
+        Op::WorkExtend | Op::WorkAck | Op::WorkFail => {
             let tenant: TenantId = args.parse("tenant")?;
             let queue: Segment = args.parse("queue")?;
             let item = args.text("item").context("item is required")?;
             let lease: mansio_core::LeaseId = args.parse("lease_id")?;
             let consumer: ConsumerName = args.parse("consumer")?;
-            let (verb, body) = if op == Op::WorkAck {
-                ("ack", json!({ "lease_id": lease, "consumer": consumer }))
-            } else {
-                let reason = args.text("reason").context("reason is required")?;
-                (
-                    "fail",
-                    json!({ "lease_id": lease, "consumer": consumer, "reason": reason }),
-                )
+            let mut body = json!({ "lease_id": lease, "consumer": consumer });
+            let (verb, replay) = match op {
+                // An extension done twice leaves the lease running to the
+                // later of the two ends, as once would: safe to send again.
+                Op::WorkExtend => {
+                    if let Some(seconds) = args.int("seconds") {
+                        body["seconds"] = json!(seconds);
+                    }
+                    ("extend", Replay::Safe)
+                }
+                Op::WorkAck => ("ack", Replay::Unsafe),
+                _ => {
+                    body["reason"] = json!(args.text("reason").context("reason is required")?);
+                    ("fail", Replay::Unsafe)
+                }
             };
             let reply = client
                 .call(
@@ -804,7 +834,7 @@ pub async fn run(
                     ],
                     &[],
                     Some(&body),
-                    Replay::Unsafe,
+                    replay,
                 )
                 .await?;
             Ok(vec![member(answered(reply, &op.name())?, "envelope")?])
@@ -1007,6 +1037,11 @@ async fn work_pull(client: &Client, args: &Args<'_>) -> anyhow::Result<Vec<Value
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
     use super::*;
 
     fn object(value: Value) -> Map<String, Value> {
@@ -1027,6 +1062,7 @@ mod tests {
                 "watch",
                 "work_publish",
                 "work_pull",
+                "work_extend",
                 "work_ack",
                 "work_fail",
                 "alerts_publish",
@@ -1123,6 +1159,167 @@ mod tests {
         }));
         let checked = Args::check(Op::WorkPull, &args).unwrap();
         assert_eq!(checked.int("wait"), Some(5));
+    }
+
+    #[test]
+    fn work_extend_takes_the_lease_and_an_optional_number_of_seconds() {
+        let lease = "5b0c0b51-4a53-4a3c-9d3a-0d6e0e2f7a11";
+        let held = json!({
+            "tenant": "acme", "queue": "builds", "item": "item-1",
+            "consumer": "w", "lease_id": lease
+        });
+        assert!(Args::check(Op::WorkExtend, &object(held.clone())).is_ok());
+        let mut with_seconds = held.clone();
+        with_seconds["seconds"] = json!("30");
+        let values = object(with_seconds);
+        let checked = Args::check(Op::WorkExtend, &values).unwrap();
+        assert_eq!(checked.int("seconds"), Some(30));
+
+        for (field, bad, why) in [
+            ("seconds", json!(-1), "seconds must be a whole number"),
+            ("seconds", json!("soon"), "seconds must be a whole number"),
+            ("reason", json!("no"), "reason is not an argument"),
+        ] {
+            let mut values = held.clone();
+            values[field] = bad;
+            let error = Args::check(Op::WorkExtend, &object(values))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(why), "{error}");
+        }
+        for missing in ["tenant", "queue", "item", "consumer", "lease_id"] {
+            let mut values = held.clone();
+            values.as_object_mut().unwrap().remove(missing);
+            let error = Args::check(Op::WorkExtend, &object(values))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&format!("{missing} is required")), "{error}");
+        }
+    }
+
+    /// A server that reads each request and drops the first `drops` of them
+    /// without answering, as a connection that fails with the answer on its
+    /// way, and answers the rest. It keeps every request it read.
+    async fn lossy_server(drops: usize) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while let Ok(read) = socket.read(&mut chunk).await {
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&request).into_owned();
+                    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                        continue;
+                    };
+                    let wanted = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|n| n.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if body.len() >= wanted {
+                        break;
+                    }
+                }
+                let n = {
+                    let mut kept = kept.lock().unwrap();
+                    kept.push(String::from_utf8_lossy(&request).into_owned());
+                    kept.len()
+                };
+                if n > drops {
+                    let body = r#"{"envelope":{"type":"mansio.work.extended"}}"#;
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                }
+                drop(socket);
+            }
+        });
+        (base, seen)
+    }
+
+    fn client_for(base: &str) -> Client {
+        let base = base.to_owned();
+        Client::from_lookup(
+            crate::client::Connection::default(),
+            move |name| match name {
+                "MANSIO_TOKEN" => Some("t".to_owned()),
+                "MANSIO_URL" => Some(base.clone()),
+                "MANSIO_RETRY_BACKOFF_MILLIS" => Some("1".to_owned()),
+                _ => None,
+            },
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_work_extend_whose_answer_was_lost_is_sent_again_and_an_ack_is_not() {
+        let lease = "5b0c0b51-4a53-4a3c-9d3a-0d6e0e2f7a11";
+        let values = |extra: Value| {
+            let mut values = json!({
+                "tenant": "acme", "queue": "builds", "item": "item-1",
+                "consumer": "w", "lease_id": lease
+            });
+            values
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            object(values)
+        };
+
+        // An extension done twice leaves the lease where once would.
+        let (base, seen) = lossy_server(1).await;
+        let printed = run(
+            &client_for(&base),
+            Op::WorkExtend,
+            &values(json!({"seconds": 7})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(printed, [json!({"type": "mansio.work.extended"})]);
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "one lost, one answered");
+        for request in &seen {
+            assert!(
+                request.starts_with("POST /v1/tenants/acme/work/builds/items/item-1/extend "),
+                "{request}"
+            );
+            let body: Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(
+                body,
+                json!({"lease_id": lease, "consumer": "w", "seconds": 7})
+            );
+        }
+
+        // An extension without --seconds sends none, and an ack is not sent
+        // again once it was sent.
+        let (base, seen) = lossy_server(0).await;
+        run(&client_for(&base), Op::WorkExtend, &values(json!({})))
+            .await
+            .unwrap();
+        let sent = seen.lock().unwrap().clone();
+        let body: Value = serde_json::from_str(sent[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body, json!({"lease_id": lease, "consumer": "w"}));
+
+        let (base, seen) = lossy_server(1).await;
+        let failed = run(&client_for(&base), Op::WorkAck, &values(json!({}))).await;
+        assert!(failed.is_err());
+        assert_eq!(seen.lock().unwrap().len(), 1, "an ack is sent once");
     }
 
     #[test]

@@ -15,6 +15,8 @@ use crate::id::{ConsumerName, EventId, LeaseFingerprint, Principal, Segment};
 pub enum WorkEvent {
     /// A consumer took the item under a lease.
     Claimed,
+    /// The holder moved the end of its lease later.
+    Extended,
     /// The holder completed it.
     Acked,
     /// The holder gave it back as failed.
@@ -29,8 +31,9 @@ pub enum WorkEvent {
 
 impl WorkEvent {
     /// Every transition, in the order a healthy item meets them.
-    pub const ALL: [WorkEvent; 6] = [
+    pub const ALL: [WorkEvent; 7] = [
         WorkEvent::Claimed,
+        WorkEvent::Extended,
         WorkEvent::Acked,
         WorkEvent::Failed,
         WorkEvent::Expired,
@@ -43,6 +46,7 @@ impl WorkEvent {
     pub fn event_type(self) -> &'static str {
         match self {
             WorkEvent::Claimed => "mansio.work.claimed",
+            WorkEvent::Extended => "mansio.work.extended",
             WorkEvent::Acked => "mansio.work.acked",
             WorkEvent::Failed => "mansio.work.failed",
             WorkEvent::Expired => "mansio.work.expired",
@@ -117,8 +121,9 @@ pub struct WorkFact {
     pub previous_message_id: Option<EventId>,
     /// The attempt this is about, from 1.
     pub attempt: u32,
-    /// The lease, on `claimed`, `acked`, `failed` and `expired`: a fingerprint
-    /// of its id, which is the holder's proof and so is not recorded.
+    /// The lease, on `claimed`, `extended`, `acked`, `failed` and `expired`: a
+    /// fingerprint of its id, which is the holder's proof and so is not
+    /// recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<LeaseFingerprint>,
     /// The principal holding the lease.
@@ -127,7 +132,8 @@ pub struct WorkFact {
     /// The consumer name the lease was taken under.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consumer: Option<ConsumerName>,
-    /// When the lease ends.
+    /// When the lease ends: on `extended` the new end, and on a fact after
+    /// one, the end it was extended to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<Timestamp>,
     /// `failed`: why, as the holder said.

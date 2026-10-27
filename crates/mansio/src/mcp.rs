@@ -167,7 +167,7 @@ pub async fn handle(client: &Client, message: Value) -> Option<Value> {
                     "protocolVersion": version,
                     "capabilities": {"tools": {"listChanged": false}},
                     "serverInfo": {"name": "mansio", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": "Tools to publish to and read from the mansio bus, and to claim, complete and fail work items. A work_pull returns an item and a lease; pass the item's itemid, the consumer and the lease_id to work_ack or work_fail."
+                    "instructions": "Tools to publish to and read from the mansio bus, and to claim, extend, complete and fail work items. A work_pull returns an item and a lease; pass the item's itemid, the consumer and the lease_id to work_ack or work_fail. A lease ends at its expires_at: work that takes longer calls work_extend before then, again and again, and its answer's data.expires_at is the new end."
                 }),
             )
         }
@@ -307,6 +307,22 @@ mod tests {
         assert_eq!(schema["properties"]["wait"]["type"], "integer");
         assert_eq!(schema["properties"]["tenant"]["type"], "string");
         assert!(pull["description"].as_str().unwrap().contains("lease"));
+
+        let extend = listed.iter().find(|t| t["name"] == "work_extend").unwrap();
+        let schema = &extend["inputSchema"];
+        let mut required: Vec<&str> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        required.sort_unstable();
+        assert_eq!(
+            required,
+            ["consumer", "item", "lease_id", "queue", "tenant"]
+        );
+        assert_eq!(schema["properties"]["seconds"]["type"], "integer");
+        assert!(extend["description"].as_str().unwrap().contains("lease"));
 
         let create = listed
             .iter()

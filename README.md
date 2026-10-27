@@ -123,7 +123,7 @@ as a space, and each flag is a parameter of the operation, with `-` for `_`.
 | `poll` | The envelopes from `--offset` on, so the next poll starts at the offset plus the number of lines. |
 | `watch` | The envelopes of a topic as they arrive, until stopped. |
 | `work pull` | The lease: `{"lease_id", "consumer", "expires_at", "item"}`. Nothing, and exit 0, if there is no item. |
-| `work ack`, `work fail`, `alerts ack` | The envelope of the transition. |
+| `work extend`, `work ack`, `work fail`, `alerts ack` | The envelope of the transition. For `work extend` it is the `extended` fact, and `data.expires_at` is where the lease now ends. |
 | `principals create` | `{"principal", "credential"}`: the credential is shown this once. |
 | `principals list`, `webhooks list` | One principal, or webhook, a line. |
 | `principals revoke`, `webhooks delete` | The principal, or webhook. |
@@ -138,8 +138,12 @@ mansio publish --tenant acme --topic facts.build --type build.finished \
   --source ci --data '{"ok":true}' [--subject S] [--correlation-id ID] \
   [--causation-id ID] [--idempotency-key KEY] [--id UUID]
 
-# A worker: claim, then ack or fail with what the claim printed.
+# A worker: claim, then ack or fail with what the claim printed. Work that
+# takes longer than the lease extends it first, again and again, so that
+# nobody else is given the item.
 mansio work pull --tenant acme --queue builds --consumer worker-1 --wait 30
+mansio work extend --tenant acme --queue builds --item ITEMID \
+  --consumer worker-1 --lease-id LEASEID [--seconds 600]
 mansio work ack  --tenant acme --queue builds --item ITEMID \
   --consumer worker-1 --lease-id LEASEID
 mansio work fail --tenant acme --queue builds --item ITEMID \
@@ -173,7 +177,8 @@ mansio webhooks list --tenant acme
   may have been lost is sent again only if sending it twice does what
   sending it once does: a read, `work pull` (a consumer that holds a live
   lease is given it again, so a claim whose answer is lost does not leave an
-  item leased to nobody) and `consumers commit`. A `publish`, an `ack` and the
+  item leased to nobody), `work extend` (a repeat leaves the lease running to
+  the later of the two ends) and `consumers commit`. A `publish`, an `ack` and the
   like are not, so give a `publish`, `work publish` or `alerts publish` an
   `--id` and send it again yourself if it fails: a 409 then means the first
   attempt was stored.
@@ -194,7 +199,7 @@ and the tools and fails on any difference beyond `watch` and `mcp`.
 | Tool | |
 |---|---|
 | `publish`, `poll` | Publish to a topic; read a topic. |
-| `work_publish`, `work_pull`, `work_ack`, `work_fail` | Work items. `work_pull` takes `wait` seconds. |
+| `work_publish`, `work_pull`, `work_extend`, `work_ack`, `work_fail` | Work items. `work_pull` takes `wait` seconds, and `work_extend` takes `seconds`. |
 | `alerts_publish`, `alerts_ack` | Alerts. |
 | `consumers_get`, `consumers_commit` | Where a named consumer stands. |
 | `principals_create`, `principals_list`, `principals_revoke` | Credentials, with the admin token. |
@@ -248,7 +253,8 @@ envelope on `facts.work` and in the sink. Work does not go through the generic
 messages route, which refuses `work.<queue>` and the topics mansio writes
 itself: `facts.work`, `facts.alert`, `facts.principal`, `facts.webhook` and
 `dead`. The
-operations are `work_publish`, `work_pull`, `work_ack` and `work_fail`.
+operations are `work_publish`, `work_pull`, `work_extend`, `work_ack` and
+`work_fail`.
 
 ```sh
 # work_publish: the item is named by the id of its message, and starts at attempt 1.
@@ -264,6 +270,12 @@ curl -H "Authorization: Bearer $MANSIO_TOKEN" -H 'Content-Type: application/json
 # 200 {"lease_id":"<uuid>","consumer":"worker-1","expires_at":"2026-10-26T12:05:00.000Z","item":{...}}
 # 204 when nothing can be claimed
 
+# work_extend, by the holder, while it is still working: the lease now ends
+# `seconds` from now, or MANSIO_LEASE_SECONDS from now if there are none.
+curl ... -d '{"lease_id":"<uuid>","consumer":"worker-1","seconds":600}' \
+  http://127.0.0.1:7070/v1/tenants/acme/work/builds/items/<itemid>/extend
+# 200 {"offset":7,"envelope":{"type":"mansio.work.extended",...,"data":{...,"expires_at":"2026-10-26T12:15:00.000Z"}}}
+
 # work_ack, or work_fail with a reason, by the holder, with the consumer name
 # and the lease id.
 curl ... -d '{"lease_id":"<uuid>","consumer":"worker-1"}' \
@@ -273,7 +285,8 @@ curl ... -d '{"lease_id":"<uuid>","consumer":"worker-1","reason":"out of memory"
 ```
 
 - A claim is a lease of `MANSIO_LEASE_SECONDS`. Nobody else is given the item
-  while it holds, and two concurrent pulls never get the same one.
+  while it holds, and two concurrent pulls never get the same one. Work that
+  takes longer extends it (`work_extend`, below).
 - A pull by a consumer (the principal and the consumer name together) that
   already holds a live lease on the queue is answered with that lease again,
   with the same id and expiry, and nothing is recorded: it does not claim
@@ -288,6 +301,25 @@ curl ... -d '{"lease_id":"<uuid>","consumer":"worker-1","reason":"out of memory"
   Another lease id, consumer name or principal is a 403, an item with no live lease (never claimed, expired, waiting for its
   retry) is a 409, an item that is not open (done, dead, unknown) is a 404.
   Nothing changes then. An ack after the lease ended is a 409.
+- `work_extend` by the holder moves the end of the lease to `seconds` from now
+  (`MANSIO_LEASE_SECONDS` from now if there are none), so that a build or a
+  review that takes far longer than a lease keeps its item: extend every half
+  lease, and nothing else claims it, for as many lease lengths as the longest
+  lease allows. The longest a lease may run is `MANSIO_LEASE_MAX_SECONDS` (a day by default),
+  counted from the claim however often it is extended. An extension that would
+  pass it is capped there and not refused, and the answer says where the
+  lease ends (`data.expires_at` of the `extended` fact), so a consumer that
+  sees the end stop moving knows it has the last of it. An extension never
+  shortens a lease, so a small `seconds` leaves it where it is. The lease id
+  stays the same. It is refused as an ack is: another lease id, consumer name
+  or principal is a 403, an item with no live lease is a 409 (which includes a
+  lease that has ended, even before the timer has expired the item), an item
+  that is not open is a 404, and `seconds` of 0 is a 400. Nothing changes
+  then. Every accepted extension is recorded as a `mansio.work.extended` fact
+  with the lease's fingerprint and its new end, and a repeat of one whose
+  answer was lost is safe: the lease runs to the later of the two ends. A
+  restarted server takes the latest end recorded for the attempt, and counts
+  the longest lease from the first claim.
 - A fail, or a lease that ends unanswered, republishes the item to its queue
   as a new message with the same `itemid`, `attempt` plus one and
   `causationid` the message before. The wait is
@@ -319,8 +351,8 @@ curl ... -d '{"lease_id":"<uuid>","consumer":"worker-1","reason":"out of memory"
   Iggy 0.9 answers a read from offset 0 of a topic whose head it has deleted
   with the first message left, so the rebuild sees everything that remains.
 
-The transitions are `mansio.work.claimed`, `.acked`, `.failed`, `.expired`,
-`.retried` and `.dead` on `facts.work`, with the item id as `subject`, and
+The transitions are `mansio.work.claimed`, `.extended`, `.acked`, `.failed`,
+`.expired`, `.retried` and `.dead` on `facts.work`, with the item id as `subject`, and
 `data` naming the queue, the message id, the attempt, and as they apply the
 lease, holder, consumer, expiry, reason and what happens next. The lease is a
 fingerprint (32 hex digits of a digest of the lease id) and never the id, which
@@ -508,7 +540,7 @@ whole stream.
 |---|---|---|
 | `publish` | publish through the server: `messages`, `work_publish`, `alerts_publish` | any topic except `facts.work`, `facts.alert`, `facts.principal` and `dead`, which only mansio writes |
 | `subscribe` | read messages | any topic |
-| `claim` | read messages, `work_pull` from the queue, and `work_ack` and `work_fail` its own leases | `work.<queue>` |
+| `claim` | read messages, `work_pull` from the queue, and `work_extend`, `work_ack` and `work_fail` its own leases | `work.<queue>` |
 | `ack` | `alerts_ack` | `alerts` |
 | `approve` | do what `claim` does | `work.approvals` only |
 
@@ -598,7 +630,8 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_MAX_BODY_BYTES` | `1048576` | Largest request body. |
 | `MANSIO_POLL_DEFAULT_COUNT` | `100` | Envelopes a poll returns when `count` is not given. |
 | `MANSIO_POLL_MAX_COUNT` | `1000` | The most a poll may ask for. Also how many messages the server reads at a time when it rebuilds its state on start. |
-| `MANSIO_LEASE_SECONDS` | `300` | How long a claim holds. Past it the item expires and, after its backoff, is claimed again. |
+| `MANSIO_LEASE_SECONDS` | `300` | How long a claim holds, and how long an extension without `seconds` runs from now. Past it the item expires and, after its backoff, is claimed again. |
+| `MANSIO_LEASE_MAX_SECONDS` | `86400` | The longest a lease may run, counted from the claim however often it is extended. An extension that would pass it is capped there. At least `MANSIO_LEASE_SECONDS`. |
 | `MANSIO_MAX_ATTEMPTS` | `5` | Attempts an item gets. A failure or expiry of the last one sends it to `dead`. |
 | `MANSIO_BACKOFF_BASE_SECONDS` | `5` | The wait before an item is republished after its first failure. It doubles with each attempt. |
 | `MANSIO_BACKOFF_CAP_SECONDS` | `300` | The longest that wait gets. At least the base. |
@@ -667,7 +700,7 @@ it creates, and leaves the flush thresholds at Iggy's defaults.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MANSIO_E2E_URL` | unset | A running server for `mansio-e2e` to use, with `MANSIO_TOKEN` set to its token. Unset starts a server in the test process on the memory broker, with a lease of 2 s, 3 attempts, a backoff from 1 s to 4 s, alerts surfaced every 2 s, an agent credential that lasts 3 s, is checked every second and swept every second, streams that look every 50 ms and send a comment every second, and webhooks that retry after 1 s to 4 s, give up after 3 attempts and wait 2 s for an answer. Against a running server the tests read its settings from `GET /v1/settings`. |
+| `MANSIO_E2E_URL` | unset | A running server for `mansio-e2e` to use, with `MANSIO_TOKEN` set to its token. Unset starts a server in the test process on the memory broker, with a lease of 2 s that may run to 60 s, 3 attempts, a backoff from 1 s to 4 s, alerts surfaced every 2 s, an agent credential that lasts 3 s, is checked every second and swept every second, streams that look every 50 ms and send a comment every second, and webhooks that retry after 1 s to 4 s, give up after 3 attempts and wait 2 s for an answer. Against a running server the tests read its settings from `GET /v1/settings`. |
 | `MANSIO_E2E_STATE_DIR` | unset | A directory that the first and second passes of the restart and retention tests (see [Develop](#develop)) keep their state in. Required by those tests, which fail without it. |
 | `MANSIO_E2E_SINK_PATH` | unset | The sink file of the running server, as the test process can read it. With it the tests also check the order of the sink; without it they check the topics only. |
 | `MANSIO_E2E_IGGY_ADDRESS` | unset | Iggy's TCP address as the test process reaches it (`127.0.0.1:8090` for `compose.yaml`). With `MANSIO_E2E_URL` set it is required: the credential tests ask Iggy itself, without mansio-server, what a credential may do, and fail if they cannot. Without `MANSIO_E2E_URL` they ask the memory broker. |

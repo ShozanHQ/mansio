@@ -390,6 +390,7 @@ impl Engine {
             holder: principal.clone(),
             consumer: consumer.clone(),
             expires_at: now.saturating_add(millis(self.settings.lease)),
+            claimed_at: now,
         };
         self.record_claim(&mut held, tenant, queue, &id, &message, &lease)
             .await?;
@@ -463,6 +464,58 @@ impl Engine {
             expires_at,
             item: message,
         })
+    }
+
+    /// Move the end of an item's lease later, so that a consumer still working
+    /// on it keeps it. Only the holder, naming the consumer and presenting the
+    /// lease id, may.
+    ///
+    /// The lease runs to `seconds` from now, or to the lease setting from now
+    /// if there are none. It is never shortened, and it never runs past
+    /// `MANSIO_LEASE_MAX_SECONDS` after the claim: an extension that asks for
+    /// more is capped there. Whatever the end comes to is recorded as an
+    /// `extended` fact, even when it is the end the lease already had, so a
+    /// request that is sent again is answered the same way.
+    ///
+    /// # Errors
+    ///
+    /// Returns 404 if the queue has no such open item, 403 if the lease is
+    /// not the caller's, and 409 if there is no live lease, which includes a
+    /// lease that has ended and that the timer has not yet expired. Nothing
+    /// changes then.
+    pub async fn work_extend(
+        &self,
+        tenant: &TenantId,
+        queue: &Segment,
+        item: &ItemId,
+        holder: Holder<'_>,
+        seconds: Option<Duration>,
+    ) -> Result<Published, ApiError> {
+        let mut held = self.lock(tenant).await?;
+        let now = self.clock.now_millis();
+        let principal = holder.principal;
+        let (fact, extended) = {
+            let open = open_item(&held, queue, item)?;
+            let lease = held_lease(open, holder, now)?;
+            let extended = Lease {
+                expires_at: extended_expiry(
+                    lease,
+                    now,
+                    seconds.unwrap_or(self.settings.lease),
+                    self.settings.lease_max,
+                ),
+                ..lease.clone()
+            };
+            let data = lease_fact(queue, open, &extended);
+            let fact = self
+                .facts
+                .work(tenant, WorkEvent::Extended, principal, now, item, &data)?;
+            (fact, extended)
+        };
+        let stored = self.append(&mut held, fact).await?;
+        held.queue_mut(queue)
+            .set_phase(item, Phase::Leased(extended));
+        Ok(stored)
     }
 
     /// Complete an item. Only the holder, naming the consumer and presenting
@@ -855,6 +908,14 @@ fn open_item<'a>(
         .get(queue)
         .and_then(|q| q.get(item))
         .ok_or_else(|| ApiError::NotFound(format!("no open item {item} in {queue}")))
+}
+
+/// Where an extension at `now` ends `lease`: `wanted` from now, but not
+/// before the lease already ends and not after `max` from the claim.
+fn extended_expiry(lease: &Lease, now: i64, wanted: Duration, max: Duration) -> i64 {
+    let asked = now.saturating_add(millis(wanted));
+    let ceiling = lease.claimed_at.saturating_add(millis(max));
+    asked.min(ceiling).max(lease.expires_at)
 }
 
 /// The `data` of a fact about an item under a lease.

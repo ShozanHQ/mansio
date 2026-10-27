@@ -97,6 +97,13 @@ All notable changes to mansio are listed here. The format follows
   `MANSIO_WEBHOOK_MAX_ATTEMPTS` and `MANSIO_WEBHOOK_TIMEOUT_SECONDS` for the
   server, and `MANSIO_RETRIES`, `MANSIO_RETRY_BACKOFF_MILLIS` and
   `MANSIO_POLL_INTERVAL_MILLIS` for the CLI.
+- `work_extend` (`POST /v1/tenants/{tenant}/work/{queue}/items/{itemid}/extend`,
+  `mansio work extend`, the MCP tool `work_extend`): the holder of a lease
+  moves its end later, so work that takes longer than `MANSIO_LEASE_SECONDS`
+  keeps its item. A lease runs at most `MANSIO_LEASE_MAX_SECONDS` from the
+  claim; an extension past that is capped. Each is a `mansio.work.extended` fact
+  that a restarted server replays. `GET /v1/settings` reports
+  `lease_max_seconds`.
 
 ### Changed
 
