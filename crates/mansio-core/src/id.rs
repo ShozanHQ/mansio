@@ -224,11 +224,39 @@ text_type!(
     |what, s: &str| check_text(what, s, 256)
 );
 text_type!(
+    /// The name a consumer pulls work under. A principal may run several
+    /// consumers, and they are told apart by this name.
+    ConsumerName,
+    "consumer name",
+    check_name
+);
+text_type!(
     /// An event's id in the host ledger it came from.
     RecordId,
     "record id",
     |what, s: &str| check_text(what, s, 256)
 );
+
+impl Segment {
+    /// A segment from a name that is known to be valid, such as `work` in
+    /// `facts.work`. The tests parse every name passed here.
+    pub(crate) fn known(name: &'static str) -> Self {
+        Self(name.to_owned())
+    }
+}
+
+/// Read a lowercase hyphenated, non-nil UUID.
+fn parse_uuid(what: &'static str, s: &str) -> Result<Uuid, ParseError> {
+    const RULE: &str = "must be a lowercase hyphenated UUID";
+    let uuid = Uuid::try_parse(s).map_err(|_| invalid(what, s, RULE))?;
+    if uuid.hyphenated().to_string() != s {
+        return Err(invalid(what, s, RULE));
+    }
+    if uuid.is_nil() {
+        return Err(invalid(what, s, "must not be the nil UUID"));
+    }
+    Ok(uuid)
+}
 
 /// An event id: a lowercase hyphenated UUID, not nil. It is also the Iggy
 /// message id, so it must be a nonzero 128-bit value.
@@ -265,15 +293,7 @@ impl FromStr for EventId {
     type Err = ParseError;
 
     fn from_str(s: &str) -> Result<Self, ParseError> {
-        const RULE: &str = "must be a lowercase hyphenated UUID";
-        let uuid = Uuid::try_parse(s).map_err(|_| invalid("event id", s, RULE))?;
-        if uuid.hyphenated().to_string() != s {
-            return Err(invalid("event id", s, RULE));
-        }
-        if uuid.is_nil() {
-            return Err(invalid("event id", s, "must not be the nil UUID"));
-        }
-        Ok(Self(uuid))
+        parse_uuid("event id", s).map(Self)
     }
 }
 
@@ -290,6 +310,47 @@ impl Serialize for EventId {
 }
 
 impl<'de> Deserialize<'de> for EventId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = Cow::<str>::deserialize(deserializer)?;
+        s.parse().map_err(D::Error::custom)
+    }
+}
+
+/// The id of a lease on a work item: a random (version 4) UUID, so that
+/// holding it is proof of having been given it. Only the holder presents it
+/// to acknowledge or fail the item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LeaseId(Uuid);
+
+impl LeaseId {
+    /// A new unguessable id.
+    #[must_use]
+    pub fn generate() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl FromStr for LeaseId {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, ParseError> {
+        parse_uuid("lease id", s).map(Self)
+    }
+}
+
+impl fmt::Display for LeaseId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.hyphenated())
+    }
+}
+
+impl Serialize for LeaseId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for LeaseId {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = Cow::<str>::deserialize(deserializer)?;
         s.parse().map_err(D::Error::custom)
@@ -330,6 +391,19 @@ impl FromStr for Principal {
 impl fmt::Display for Principal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.kind, self.name)
+    }
+}
+
+impl Serialize for Principal {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Principal {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = Cow::<str>::deserialize(deserializer)?;
+        s.parse().map_err(D::Error::custom)
     }
 }
 
@@ -404,6 +478,38 @@ mod tests {
         ] {
             assert!(bad.parse::<EventId>().is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn lease_ids_are_random_canonical_uuids() {
+        let a = LeaseId::generate();
+        let b = LeaseId::generate();
+        assert_ne!(a, b);
+        assert_eq!(a.to_string().parse::<LeaseId>().unwrap(), a);
+        // Version 4: the first digit of the third group.
+        assert_eq!(a.to_string().as_bytes()[14], b'4');
+        for bad in ["", "nope", "00000000-0000-0000-0000-000000000000"] {
+            assert!(bad.parse::<LeaseId>().is_err(), "{bad:?}");
+        }
+        let json = serde_json::to_string(&a).unwrap();
+        assert_eq!(serde_json::from_str::<LeaseId>(&json).unwrap(), a);
+    }
+
+    #[test]
+    fn consumer_names_follow_the_principal_name_rule() {
+        assert!("worker-1".parse::<ConsumerName>().is_ok());
+        assert!("".parse::<ConsumerName>().is_err());
+        assert!("-x".parse::<ConsumerName>().is_err());
+        assert!("a b".parse::<ConsumerName>().is_err());
+    }
+
+    #[test]
+    fn principals_serialize_as_kind_colon_name() {
+        let p: Principal = "person:paul@example.com".parse().unwrap();
+        let json = serde_json::to_string(&p).unwrap();
+        assert_eq!(json, "\"person:paul@example.com\"");
+        assert_eq!(serde_json::from_str::<Principal>(&json).unwrap(), p);
+        assert!(serde_json::from_str::<Principal>("\"nobody\"").is_err());
     }
 
     #[test]

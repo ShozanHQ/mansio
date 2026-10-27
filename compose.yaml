@@ -12,6 +12,17 @@
 #                        change it before the first start or remove the
 #                        iggy-data volume
 #
+# The work settings can be set the same way. Empty means the default:
+#
+#   MANSIO_LEASE_SECONDS, MANSIO_MAX_ATTEMPTS, MANSIO_BACKOFF_BASE_SECONDS,
+#   MANSIO_BACKOFF_CAP_SECONDS, MANSIO_ALERT_RESURFACE_SECONDS,
+#   MANSIO_TICK_MILLIS
+#
+# The sink file lives in the "sink" volume. To keep it in a directory on the
+# host instead, so that something outside the container can read it, set
+# MANSIO_SINK_DIR to an absolute path the container's user (uid 10001) can
+# write to.
+#
 # Only mansio-server is published, and only on loopback.
 
 name: mansio
@@ -61,10 +72,16 @@ services:
       MANSIO_IGGY_ADDRESS: iggy:8090
       MANSIO_IGGY_USERNAME: ${IGGY_ROOT_USERNAME:-iggy}
       MANSIO_IGGY_PASSWORD: ${IGGY_ROOT_PASSWORD:-iggy}
+      MANSIO_LEASE_SECONDS: ${MANSIO_LEASE_SECONDS:-}
+      MANSIO_MAX_ATTEMPTS: ${MANSIO_MAX_ATTEMPTS:-}
+      MANSIO_BACKOFF_BASE_SECONDS: ${MANSIO_BACKOFF_BASE_SECONDS:-}
+      MANSIO_BACKOFF_CAP_SECONDS: ${MANSIO_BACKOFF_CAP_SECONDS:-}
+      MANSIO_ALERT_RESURFACE_SECONDS: ${MANSIO_ALERT_RESURFACE_SECONDS:-}
+      MANSIO_TICK_MILLIS: ${MANSIO_TICK_MILLIS:-}
     ports:
       - "127.0.0.1:7070:7070"
     volumes:
-      - sink:/data
+      - ${MANSIO_SINK_DIR:-sink}:/data
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "--output", "/dev/null", "http://127.0.0.1:7070/healthz"]
       interval: 5s

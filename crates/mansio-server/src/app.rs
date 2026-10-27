@@ -3,35 +3,46 @@
 
 use std::future::Future;
 use std::io;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::extract::rejection::{BytesRejection, PathRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
-use mansio_core::api::{Polled, Published};
+use mansio_core::api::{EffectiveSettings, Polled, Published};
 use mansio_core::{
     Broker, Envelope, EventId, NoSink, ParseError, Principal, Sink, Stored, TenantId, Timestamp,
     Topic,
 };
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
+use tracing::warn;
 
 use crate::auth::{Auth, Authenticated};
+use crate::clock::{Clock, SystemClock};
+use crate::engine::Engine;
 use crate::error::ApiError;
-use crate::settings::Limits;
+use crate::settings::{Limits, WorkSettings};
+use crate::work_api;
 
 /// Attributes the server sets itself, from the path and the credential. A
 /// body that carries one is refused.
 const SERVER_SET: [&str; 4] = ["tenant", "topic", "principalkind", "principalname"];
 
+/// Attributes `work_publish` sets itself: the item is named by the id of its
+/// first message, and starts at attempt 1.
+const WORK_SET: [&str; 2] = ["itemid", "attempt"];
+
 /// Everything a handler needs.
 pub struct AppState {
     pub(crate) broker: Arc<dyn Broker>,
-    pub(crate) sink: Arc<dyn Sink>,
+    pub(crate) engine: Arc<Engine>,
     pub(crate) auth: Auth,
     pub(crate) limits: Limits,
 }
@@ -39,55 +50,135 @@ pub struct AppState {
 /// The mansio HTTP server, ready to run.
 ///
 /// A host application builds one with its own [`Broker`] and [`Sink`] and
-/// calls [`Server::serve`], or takes the [`Router`] and mounts it itself.
+/// calls [`Server::serve`], which also runs the timer that expires leases,
+/// republishes items and surfaces alerts again. A host that mounts the
+/// [`Router`] itself takes it from [`Server::build`] together with the
+/// [`Engine`], and runs [`Engine::run`] alongside.
 pub struct Server {
-    state: AppState,
+    broker: Arc<dyn Broker>,
+    sink: Arc<dyn Sink>,
+    clock: Arc<dyn Clock>,
+    auth: Auth,
+    limits: Limits,
+    work: WorkSettings,
+}
+
+/// Aborts a task when dropped, so that a server that is dropped or stopped
+/// does not leave its timer running.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl Server {
-    /// A server over `broker` that accepts `auth`, records nothing in a sink
-    /// and uses the default limits.
+    /// A server over `broker` that accepts `auth`, records nothing in a sink,
+    /// reads the system clock and uses the default limits and work settings.
     #[must_use]
     pub fn new(broker: Arc<dyn Broker>, auth: Auth) -> Self {
         Self {
-            state: AppState {
-                broker,
-                sink: Arc::new(NoSink),
-                auth,
-                limits: Limits::default(),
-            },
+            broker,
+            sink: Arc::new(NoSink),
+            clock: Arc::new(SystemClock),
+            auth,
+            limits: Limits::default(),
+            work: WorkSettings::default(),
         }
     }
 
     /// Record every durable publish in `sink` first.
     #[must_use]
     pub fn with_sink(mut self, sink: Arc<dyn Sink>) -> Self {
-        self.state.sink = sink;
+        self.sink = sink;
         self
     }
 
     /// Use these limits instead of the defaults.
     #[must_use]
     pub fn with_limits(mut self, limits: Limits) -> Self {
-        self.state.limits = limits;
+        self.limits = limits;
         self
     }
 
-    /// The routes, as a [`Router`].
-    pub fn router(self) -> Router {
-        let max_body = self.state.limits.max_body_bytes;
-        Router::new()
+    /// Use these work and alert settings instead of the defaults.
+    #[must_use]
+    pub fn with_work_settings(mut self, work: WorkSettings) -> Self {
+        self.work = work;
+        self
+    }
+
+    /// Read time from `clock` instead of the system clock.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// The routes, and the engine behind them. Nothing drives the engine's
+    /// timer until [`Engine::run`] is, or [`Engine::tick`] is called.
+    pub fn build(self) -> (Router, Arc<Engine>) {
+        let max_body = self.limits.max_body_bytes;
+        let engine = Arc::new(Engine::new(
+            Arc::clone(&self.broker),
+            self.sink,
+            self.clock,
+            self.work,
+            self.limits.poll_max_count,
+        ));
+        let state = AppState {
+            broker: self.broker,
+            engine: Arc::clone(&engine),
+            auth: self.auth,
+            limits: self.limits,
+        };
+        let router = Router::new()
             .route("/healthz", get(healthz))
+            .route("/v1/settings", get(settings))
             .route(
                 "/v1/tenants/{tenant}/topics/{topic}/messages",
                 get(poll).post(publish),
             )
+            .route(
+                "/v1/tenants/{tenant}/work/{queue}/items",
+                post(work_api::work_publish),
+            )
+            .route(
+                "/v1/tenants/{tenant}/work/{queue}/pull",
+                post(work_api::work_pull),
+            )
+            .route(
+                "/v1/tenants/{tenant}/work/{queue}/items/{item}/ack",
+                post(work_api::work_ack),
+            )
+            .route(
+                "/v1/tenants/{tenant}/work/{queue}/items/{item}/fail",
+                post(work_api::work_fail),
+            )
+            .route(
+                "/v1/tenants/{tenant}/alerts",
+                post(work_api::alerts_publish),
+            )
+            .route(
+                "/v1/tenants/{tenant}/alerts/{alert}/ack",
+                post(work_api::alerts_ack),
+            )
             .fallback(not_found)
             .layer(DefaultBodyLimit::max(max_body))
-            .with_state(Arc::new(self.state))
+            .with_state(Arc::new(state));
+        (router, engine)
     }
 
-    /// Serve on `listener` until `shutdown` completes.
+    /// The routes. The engine's timer does not run; see [`Server::build`].
+    pub fn router(self) -> Router {
+        self.build().0
+    }
+
+    /// Serve on `listener` until `shutdown` completes. Before it accepts a
+    /// request the engine takes up what the broker holds, and while it runs
+    /// the timer drives expiries, republishes and alerts. Dropping the future
+    /// stops the timer too.
     ///
     /// # Errors
     ///
@@ -97,7 +188,15 @@ impl Server {
         listener: TcpListener,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> io::Result<()> {
-        axum::serve(listener, self.router())
+        let (router, engine) = self.build();
+        if let Err(error) = engine.recover().await {
+            warn!(
+                ?error,
+                "the tenants could not be listed; the timer will try again"
+            );
+        }
+        let _timer = AbortOnDrop(tokio::spawn(engine.run()));
+        axum::serve(listener, router)
             .with_graceful_shutdown(shutdown)
             .await
     }
@@ -107,33 +206,86 @@ async fn healthz() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
+async fn settings(
+    State(state): State<Arc<AppState>>,
+    _auth: Authenticated,
+) -> Json<EffectiveSettings> {
+    let work = state.engine.settings();
+    let limits = &state.limits;
+    let seconds = |d: std::time::Duration| d.as_secs();
+    Json(EffectiveSettings {
+        lease_seconds: seconds(work.lease),
+        max_attempts: work.max_attempts,
+        backoff_base_seconds: seconds(work.backoff_base),
+        backoff_cap_seconds: seconds(work.backoff_cap),
+        alert_resurface_seconds: seconds(work.alert_resurface),
+        tick_millis: u64::try_from(work.tick.as_millis()).unwrap_or(u64::MAX),
+        max_body_bytes: u64::try_from(limits.max_body_bytes).unwrap_or(u64::MAX),
+        poll_default_count: limits.poll_default_count,
+        poll_max_count: limits.poll_max_count,
+    })
+}
+
 async fn not_found() -> ApiError {
     ApiError::NotFound("no such route".to_owned())
+}
+
+/// Parse a piece of the path.
+pub(crate) fn parse_part<T: FromStr<Err = ParseError>>(text: &str) -> Result<T, ApiError> {
+    text.parse()
+        .map_err(|e: ParseError| ApiError::BadRequest(e.to_string()))
 }
 
 fn parse_target(
     path: Result<Path<(String, String)>, PathRejection>,
 ) -> Result<(TenantId, Topic), ApiError> {
     let Path((tenant, topic)) = path.map_err(|e| ApiError::BadRequest(e.body_text()))?;
-    let tenant = tenant
-        .parse()
-        .map_err(|e: ParseError| ApiError::BadRequest(e.to_string()))?;
-    let topic = topic
-        .parse()
-        .map_err(|e: ParseError| ApiError::BadRequest(e.to_string()))?;
-    Ok((tenant, topic))
+    Ok((parse_part(&tenant)?, parse_part(&topic)?))
+}
+
+/// The request body, or the refusal for a body that is too large or cannot be
+/// read.
+pub(crate) fn read_body(
+    state: &AppState,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Bytes, ApiError> {
+    body.map_err(|e| match e.status() {
+        StatusCode::PAYLOAD_TOO_LARGE => ApiError::PayloadTooLarge(format!(
+            "body is larger than {} bytes",
+            state.limits.max_body_bytes
+        )),
+        _ => ApiError::BadRequest(e.body_text()),
+    })
+}
+
+/// A request body that is a JSON object of a known shape.
+pub(crate) fn parse_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
+    serde_json::from_slice(body).map_err(|e| ApiError::BadRequest(format!("body: {e}")))
+}
+
+/// What the envelope being built is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// A message to any topic.
+    Message,
+    /// A work item: the server names it and sets its attempt.
+    WorkItem,
 }
 
 /// Make the envelope to store from a request body.
 ///
 /// The body is an envelope without the attributes the server sets. `id`,
 /// `time` and `specversion` are filled in when absent. Everything else is
-/// checked by the envelope's own rules.
-fn build_envelope(
+/// checked by the envelope's own rules. A work item is named by its `id`
+/// (`itemid`) and starts at `attempt` 1, and a body that sets either is
+/// refused.
+pub(crate) fn build_envelope(
     body: &[u8],
     tenant: &TenantId,
     topic: &Topic,
     principal: &Principal,
+    now: &Timestamp,
+    origin: Origin,
 ) -> Result<Envelope, ApiError> {
     let bad = |message: String| ApiError::BadRequest(message);
     let Value::Object(mut attributes) =
@@ -142,7 +294,11 @@ fn build_envelope(
         return Err(bad("body must be a JSON object".to_owned()));
     };
 
-    let present: Vec<&str> = SERVER_SET
+    let refused: Vec<&str> = match origin {
+        Origin::Message => SERVER_SET.to_vec(),
+        Origin::WorkItem => SERVER_SET.into_iter().chain(WORK_SET).collect(),
+    };
+    let present: Vec<&str> = refused
         .into_iter()
         .filter(|name| attributes.contains_key(*name))
         .collect();
@@ -160,8 +316,13 @@ fn build_envelope(
         .entry("id")
         .or_insert_with(|| EventId::generate().to_string().into());
     if !attributes.contains_key("time") {
-        let now = Timestamp::now().map_err(|_| ApiError::Internal)?;
         attributes.insert("time".to_owned(), now.to_string().into());
+    }
+    if origin == Origin::WorkItem
+        && let Some(Value::String(id)) = attributes.get("id").cloned()
+    {
+        attributes.insert("itemid".to_owned(), id.into());
+        attributes.insert("attempt".to_owned(), 1.into());
     }
     attributes.insert("tenant".to_owned(), tenant.to_string().into());
     attributes.insert("topic".to_owned(), topic.to_string().into());
@@ -184,34 +345,15 @@ async fn publish(
     body: Result<Bytes, BytesRejection>,
 ) -> Result<(StatusCode, Json<Published>), ApiError> {
     let (tenant, topic) = parse_target(path)?;
-    let body = body.map_err(|e| match e.status() {
-        StatusCode::PAYLOAD_TOO_LARGE => ApiError::PayloadTooLarge(format!(
-            "body is larger than {} bytes",
-            state.limits.max_body_bytes
-        )),
-        _ => ApiError::BadRequest(e.body_text()),
-    })?;
-    let envelope = build_envelope(&body, &tenant, &topic, &principal)?;
-    let published = store(&state, envelope)
+    let body = read_body(&state, body)?;
+    let now = state.engine.now()?;
+    let envelope = build_envelope(&body, &tenant, &topic, &principal, &now, Origin::Message)?;
+    let published = state
+        .engine
+        .publish(envelope)
         .await
         .map_err(|error| error.logged(&tenant, &topic))?;
     Ok((StatusCode::CREATED, Json(published)))
-}
-
-/// The part of a publish that needs the broker and the sink.
-async fn store(state: &AppState, mut envelope: Envelope) -> Result<Published, ApiError> {
-    state.broker.ensure_tenant(&envelope.tenant).await?;
-    state
-        .broker
-        .ensure_topic(&envelope.tenant, &envelope.topic)
-        .await?;
-    if envelope.topic.is_durable()
-        && let Some(record) = state.sink.record(&envelope).await?
-    {
-        envelope.record = Some(record);
-    }
-    let offset = state.broker.publish(&envelope).await?;
-    Ok(Published { offset, envelope })
 }
 
 #[derive(Debug, Deserialize)]
@@ -457,6 +599,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_work_and_alert_routes_need_the_token() {
+        let router = router();
+        let routes = [
+            (Method::GET, "/v1/settings"),
+            (Method::POST, "/v1/tenants/acme/work/builds/items"),
+            (Method::POST, "/v1/tenants/acme/work/builds/pull"),
+            (Method::POST, "/v1/tenants/acme/work/builds/items/i/ack"),
+            (Method::POST, "/v1/tenants/acme/work/builds/items/i/fail"),
+            (Method::POST, "/v1/tenants/acme/alerts"),
+            (
+                Method::POST,
+                "/v1/tenants/acme/alerts/0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3/ack",
+            ),
+        ];
+        for (method, uri) in routes {
+            let (status, body) = send(&router, method.clone(), uri, None, "{}").await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+            assert_eq!(error_code(&body), "unauthorized");
+        }
+    }
+
+    #[tokio::test]
+    async fn work_requests_are_checked_before_anything_happens() {
+        let router = router();
+        let item = "/v1/tenants/acme/work/builds/items";
+        let lease = "0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3";
+        let cases = [
+            // Work goes through work_publish.
+            (
+                Method::POST,
+                URI.replace("facts.build", "work.builds"),
+                MINIMAL.to_owned(),
+            ),
+            (
+                Method::POST,
+                item.to_owned(),
+                r#"{"source":"s","type":"t","itemid":"x"}"#.to_owned(),
+            ),
+            (
+                Method::POST,
+                item.to_owned(),
+                r#"{"source":"s","type":"t","attempt":2}"#.to_owned(),
+            ),
+            (
+                Method::POST,
+                item.to_owned(),
+                r#"{"source":"s","type":"t","topic":"alerts"}"#.to_owned(),
+            ),
+            (
+                Method::POST,
+                "/v1/tenants/acme/work/Bad/items".to_owned(),
+                MINIMAL.to_owned(),
+            ),
+            // A pull names its consumer, and nothing else.
+            (
+                Method::POST,
+                "/v1/tenants/acme/work/builds/pull".to_owned(),
+                "{}".to_owned(),
+            ),
+            (
+                Method::POST,
+                "/v1/tenants/acme/work/builds/pull".to_owned(),
+                r#"{"consumer":"a b"}"#.to_owned(),
+            ),
+            (
+                Method::POST,
+                "/v1/tenants/acme/work/builds/pull".to_owned(),
+                r#"{"consumer":"w","x":1}"#.to_owned(),
+            ),
+            // An ack and a fail carry a lease id, and a fail a reason.
+            (Method::POST, format!("{item}/i/ack"), "{}".to_owned()),
+            (
+                Method::POST,
+                format!("{item}/i/ack"),
+                r#"{"lease_id":"nope"}"#.to_owned(),
+            ),
+            (
+                Method::POST,
+                format!("{item}/i/fail"),
+                format!(r#"{{"lease_id":"{lease}"}}"#),
+            ),
+            (
+                Method::POST,
+                format!("{item}/i/fail"),
+                format!(r#"{{"lease_id":"{lease}","reason":" "}}"#),
+            ),
+            (
+                Method::POST,
+                "/v1/tenants/acme/alerts/nope/ack".to_owned(),
+                String::new(),
+            ),
+        ];
+        for (method, uri, body) in cases {
+            let (status, response) = send(&router, method.clone(), &uri, Some(TOKEN), &body).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{method} {uri} {body}: {response}"
+            );
+            assert_eq!(error_code(&response), "bad_request");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_queue_answers_204_and_an_unknown_item_404() {
+        let router = router();
+        let (status, _) = send(
+            &router,
+            Method::POST,
+            "/v1/tenants/acme/work/builds/pull",
+            Some(TOKEN),
+            r#"{"consumer":"w"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, body) = send(
+            &router,
+            Method::POST,
+            "/v1/tenants/acme/work/builds/items/i/ack",
+            Some(TOKEN),
+            r#"{"lease_id":"0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(error_code(&body), "not_found");
+    }
+
+    #[tokio::test]
+    async fn the_settings_route_reports_what_the_server_runs_with() {
+        let (status, body) = send(&router(), Method::GET, "/v1/settings", Some(TOKEN), "").await;
+        assert_eq!(status, StatusCode::OK);
+        let settings: mansio_core::api::EffectiveSettings = serde_json::from_value(body).unwrap();
+        assert_eq!(settings.lease_seconds, 300);
+        assert_eq!(settings.max_attempts, 5);
+        assert_eq!(settings.backoff_base_seconds, 5);
+        assert_eq!(settings.backoff_cap_seconds, 300);
+        assert_eq!(settings.alert_resurface_seconds, 3600);
+        assert_eq!(settings.tick_millis, 500);
+        assert_eq!(settings.max_body_bytes, 2048);
+        assert_eq!(settings.poll_default_count, 3);
+        assert_eq!(settings.poll_max_count, 5);
+    }
+
+    #[tokio::test]
     async fn a_client_chosen_id_is_kept() {
         let id = "0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3";
         let body =
@@ -544,6 +830,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Broker for ScriptedBroker {
+        async fn tenants(&self) -> Result<Vec<TenantId>, mansio_core::BrokerError> {
+            self.inner.tenants().await
+        }
+
+        async fn topics(&self, tenant: &TenantId) -> Result<Vec<Topic>, mansio_core::BrokerError> {
+            self.inner.topics(tenant).await
+        }
+
         async fn ensure_tenant(&self, tenant: &TenantId) -> Result<(), mansio_core::BrokerError> {
             self.inner.ensure_tenant(tenant).await
         }
