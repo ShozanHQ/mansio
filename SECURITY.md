@@ -30,12 +30,9 @@ the way mansio uses Iggy makes it worse.
 
 ## What to expect
 
-- An acknowledgement within 3 working days.
-- A first assessment within 10 working days: whether we take it to be a
-  vulnerability, how serious, and what we plan to do.
-- Updates when something changes, and a say in the timing of disclosure.
+- Your report is acknowledged, and you are kept informed of what we find and
+  what we plan to do, until there is a fix or a decision not to make one.
+- If we do not take it to be a vulnerability, you get an answer that says why.
+- You have a say in the timing of disclosure.
 - A fix on `main` and a published advisory that credits you, if you want to be
   credited.
-
-A report that turns out not to be a vulnerability still gets an answer that says
-why.
