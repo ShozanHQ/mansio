@@ -158,12 +158,13 @@ mansio webhooks list --tenant acme
 - `work pull --wait SECONDS` looks again every `MANSIO_POLL_INTERVAL_MILLIS`
   until an item can be claimed or the wait ends.
 - `watch --tenant T --topic X --consumer NAME` prints one envelope a line from
-  where the named consumer stopped (its offset is kept by the broker, see
+  where the named consumer stopped (mansio keeps its position, see
   [Consumers](#consumers)), and commits each offset after the line has been
   written and flushed. Stopped and started again with the same consumer, it
   prints every envelope once: none is missed, and none is printed twice unless
   the process was killed between the flush and the commit. On SIGINT or
-  SIGTERM it finishes the line it is on, commits it and exits 0.
+  SIGTERM it finishes the line it is on, commits it and exits 0; a second
+  signal while it does ends it at once, without the commit, with status 130.
   `--from OFFSET` starts at an offset and keeps no place (the default is 0),
   and `--limit N` stops after N envelopes. A topic nobody has published to is
   a 404.
@@ -220,7 +221,10 @@ cannot be loaded (the broker could not be read, or a record of it cannot be)
 it answers 503 `{"status":"degraded","credentials":"unavailable","message":...}`:
 the server is up, every credential gets 503, and only the admin token works.
 The server log says why, at `error`. `compose.yaml`'s health check fails on it,
-so the stack is not healthy until the registry loads.
+so the stack is not healthy until the registry loads. The registry of
+[webhooks](#webhooks) is the same: while it cannot be loaded `/healthz` says
+`"webhooks":"unavailable"` too, the webhooks admin API answers 503, and no
+webhook is delivered.
 
 ```sh
 curl -H "Authorization: Bearer $MANSIO_TOKEN" -H 'Content-Type: application/json' \
@@ -379,7 +383,11 @@ positions are kept in a log of mansio's own stream in the broker that no
 credential can reach, and not in Iggy's consumer offsets, which any credential
 that may read a topic could set for any consumer of it. Every commit is a
 record of that log, and the log is never trimmed. A webhook's position is kept
-the same way and is not reachable through this API at all.
+the same way and is not reachable through this API at all. A record of that log
+that cannot be read is skipped with a warning, not made to fail the load as the
+principals' and the webhooks' are: the cost is that a consumer or a webhook
+starts from an older position and sees some messages again, and delivery here is
+at least once anyway.
 
 ```sh
 # consumers_get: 200 {"consumer":"dash","offset":4,"next":5}
@@ -463,9 +471,9 @@ The key is the signing secret as text (`whsec_...`), and the body is the bytes
 of the request. [docs/webhooks.md](docs/webhooks.md) verifies it in a few
 lines. The timestamp is the moment of that attempt.
 
-- Each webhook is a durable consumer of its topic, `webhook-<id>`, so it
-  delivers in offset order, one envelope at a time, and a restarted server
-  resumes where the last one stopped. A new webhook starts at the first
+- Each webhook follows its topic from a position of its own that mansio keeps
+  (see [Consumers](#consumers)), so it delivers in offset order, one envelope
+  at a time, and a restarted server resumes where the last one stopped. A new webhook starts at the first
   message the topic holds, and a topic nobody has published to yet is waited
   for.
 - A 2xx is delivery. Any other answer, no answer within
@@ -485,6 +493,24 @@ lines. The timestamp is the moment of that attempt.
 - The secrets are kept on the server's own log in the broker, with the
   principals', where no credential can read. A topic cannot be delivered to
   its own failures: a webhook for `facts.webhook` is refused.
+- The registry of webhooks fails loud, as the principals' does. A record of
+  its log that cannot be read (damaged, or written by a newer version of the
+  format: each carries its version in `v`, 1 when absent) keeps the registry
+  unloaded, because skipping a deletion would revive a webhook that delivers
+  to an address the admin removed, and skipping a creation would lose the only
+  copy of its secret. The log says why, at `error`, once. Until it loads,
+  `webhooks_create`, `webhooks_list` and `webhooks_delete` answer 503,
+  `/healthz` is `degraded`, and no delivery task starts; it is read again after
+  a wait that grows from `MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS` to
+  `MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS`, by whichever request, health check or
+  start comes first.
+- A webhook that cannot read its position, its topic, or record a delivery it
+  gave up on (the broker is down) waits as long, with the same growing wait,
+  and logs it once when it starts and once when it ends, not on each try.
+- The fact for a delivery given up on has an `id` made from the webhook's and
+  the message's, so one recorded again after a restart is recognisably the
+  same fact.
+- The address is at most `MANSIO_WEBHOOK_URL_MAX_BYTES`.
 
 ### One server per broker
 
@@ -650,6 +676,7 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS` | `300` | The longest that wait gets. At least the base. |
 | `MANSIO_WEBHOOK_MAX_ATTEMPTS` | `8` | Attempts at one delivery before it is recorded as failed and the webhook moves on. |
 | `MANSIO_WEBHOOK_TIMEOUT_SECONDS` | `10` | How long one attempt may take. |
+| `MANSIO_WEBHOOK_URL_MAX_BYTES` | `2048` | The longest address a webhook may have. |
 | `MANSIO_IGGY_ADDRESS` | `127.0.0.1:8090` | Iggy's TCP address, `host:port`. |
 | `MANSIO_IGGY_USERNAME` | `mansio` | The Iggy user mansio-server acts as. It manages users and streams and reads and writes topics; it is not Iggy's root user. |
 | `MANSIO_IGGY_PASSWORD` | none, required with `iggy` | Its password. |

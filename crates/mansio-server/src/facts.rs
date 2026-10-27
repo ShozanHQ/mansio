@@ -41,6 +41,10 @@ pub(crate) const SOURCE: &str = "mansio";
 /// Mixed into a message's id to make the id of the fact that is owed for it.
 const OWED_SALT: u128 = 0x6d61_6e73_696f_2d6f_7765_6420_6661_6374;
 
+/// Mixed into a webhook's id and a message's to make the id of the fact that
+/// the webhook gave up on the message.
+const WEBHOOK_FAILED_SALT: u128 = 0x6d61_6e73_696f_2d77_6562_686f_6f6b_2166;
+
 /// Makes the engine's envelopes.
 #[derive(Debug)]
 pub(crate) struct Facts {
@@ -203,6 +207,12 @@ impl Facts {
 
     /// A change to a webhook, on `facts.webhook`, with the webhook id as its
     /// subject. The engine is who made it: nobody asked.
+    ///
+    /// Its id is made from the webhook's and the message's, as an owed fact's
+    /// is from its message's: a webhook that gives up on a message, is stopped
+    /// before the fact is stored, and gives up on it again after a restart makes
+    /// the very same fact, which a consumer that deduplicates on `id` sees
+    /// once.
     pub(crate) fn webhook(
         &self,
         tenant: &TenantId,
@@ -223,6 +233,10 @@ impl Facts {
             &data.webhook_id.to_string(),
         )?;
         envelope.data = Some(value);
+        envelope.id = EventId::from_u128(
+            data.webhook_id.as_u128() ^ data.message_id.as_u128() ^ WEBHOOK_FAILED_SALT,
+        )
+        .unwrap_or_else(|_| EventId::generate());
         Ok(envelope)
     }
 
@@ -374,8 +388,29 @@ mod tests {
             data.webhook_id.to_string()
         );
         assert_eq!(fact.principal.to_string(), ENGINE_PRINCIPAL);
-        let back: WebhookFact = serde_json::from_value(fact.data.unwrap()).unwrap();
+        let back: WebhookFact = serde_json::from_value(fact.data.clone().unwrap()).unwrap();
         assert_eq!(back, data);
+
+        // Giving up on the same message again makes the same fact, and another
+        // message or another webhook makes another.
+        let again = facts
+            .webhook(&tenant, WebhookEvent::Failed, 5_000, &data)
+            .unwrap();
+        assert_eq!(again.id, fact.id);
+        let other_message = WebhookFact {
+            message_id: EventId::generate(),
+            ..data.clone()
+        };
+        let other_webhook = WebhookFact {
+            webhook_id: mansio_core::WebhookId::generate(),
+            ..data
+        };
+        for other in [other_message, other_webhook] {
+            let made = facts
+                .webhook(&tenant, WebhookEvent::Failed, 0, &other)
+                .unwrap();
+            assert_ne!(made.id, fact.id);
+        }
     }
 
     #[test]

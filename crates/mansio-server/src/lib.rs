@@ -30,6 +30,7 @@ mod error;
 mod events_api;
 mod facts;
 mod principals_api;
+mod records;
 mod recover;
 mod registry;
 mod settings;

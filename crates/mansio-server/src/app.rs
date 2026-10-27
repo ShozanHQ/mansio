@@ -20,7 +20,7 @@ use mansio_core::{
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
@@ -431,23 +431,34 @@ impl Server {
     }
 }
 
-/// `200 {"status":"ok"}`, or `503 {"status":"degraded","credentials":"unavailable",..}`
-/// while the registry of principals is not loaded: the server is up, and no
-/// credential is accepted. Asking for it tries the load again when its time
-/// is up, which is what a health check that keeps asking wants.
+/// `200 {"status":"ok"}`, or `503 {"status":"degraded",..}` with
+/// `"credentials":"unavailable"` while the registry of principals is not
+/// loaded, and `"webhooks":"unavailable"` while the registry of webhooks is
+/// not: the server is up, and in the first case no credential is accepted, in
+/// the second no webhook is delivered. Asking for it tries each load again
+/// when its time is up, which is what a health check that keeps asking wants.
 async fn healthz(State(state): State<Arc<AppState>>) -> Response {
-    match state.credentials.load().await {
-        Ok(()) => Json(json!({ "status": "ok" })).into_response(),
-        Err(_) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "status": "degraded",
-                "credentials": "unavailable",
-                "message": "the registry of principals is not loaded, so no credential is accepted; see the server log",
-            })),
-        )
-            .into_response(),
+    let credentials = state.credentials.load().await.is_err();
+    let webhooks = state.webhooks.load().await.is_err();
+    if !credentials && !webhooks {
+        return Json(json!({ "status": "ok" })).into_response();
     }
+    let mut body = Map::new();
+    body.insert("status".to_owned(), json!("degraded"));
+    let mut messages = Vec::new();
+    if credentials {
+        body.insert("credentials".to_owned(), json!("unavailable"));
+        messages.push("the registry of principals is not loaded, so no credential is accepted");
+    }
+    if webhooks {
+        body.insert("webhooks".to_owned(), json!("unavailable"));
+        messages.push("the registry of webhooks is not loaded, so no webhook is delivered");
+    }
+    body.insert(
+        "message".to_owned(),
+        json!(format!("{}; see the server log", messages.join("; "))),
+    );
+    (StatusCode::SERVICE_UNAVAILABLE, Json(Value::Object(body))).into_response()
 }
 
 async fn settings(
@@ -479,6 +490,7 @@ async fn settings(
         webhook_backoff_cap_seconds: seconds(webhooks.backoff_cap),
         webhook_max_attempts: webhooks.max_attempts,
         webhook_timeout_seconds: seconds(webhooks.timeout),
+        webhook_url_max_bytes: u64::try_from(webhooks.url_max_bytes).unwrap_or(u64::MAX),
     })
 }
 
@@ -674,7 +686,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::testing::serial;
+    use crate::testing::{Logs, serial};
 
     const TOKEN: &str = "test-token";
 
@@ -1085,6 +1097,7 @@ mod tests {
         assert_eq!(settings.webhook_backoff_cap_seconds, 300);
         assert_eq!(settings.webhook_max_attempts, 8);
         assert_eq!(settings.webhook_timeout_seconds, 10);
+        assert_eq!(settings.webhook_url_max_bytes, 2048);
     }
 
     #[tokio::test]
@@ -1320,51 +1333,6 @@ mod tests {
         Server::new(Arc::new(broker), auth).router()
     }
 
-    /// What the tracing events emitted while it is in scope say.
-    #[derive(Clone, Default)]
-    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Logs {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// Ends the capture when dropped, then releases the lock. Fields drop in
-    /// declaration order, so the subscriber is gone before the next test runs.
-    struct CaptureGuard {
-        _subscriber: tracing::subscriber::DefaultGuard,
-        _lock: tokio::sync::MutexGuard<'static, ()>,
-    }
-
-    impl Logs {
-        async fn capture() -> (Self, CaptureGuard) {
-            let lock = serial().await;
-            let logs = Self::default();
-            let writer = logs.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .with_ansi(false)
-                .with_writer(move || writer.clone())
-                .finish();
-            let subscriber = tracing::subscriber::set_default(subscriber);
-            tracing::callsite::rebuild_interest_cache();
-            let guard = CaptureGuard {
-                _subscriber: subscriber,
-                _lock: lock,
-            };
-            (logs, guard)
-        }
-
-        fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-        }
-    }
-
     #[tokio::test]
     async fn a_stored_message_without_an_offset_is_still_a_201() {
         let _serial = serial().await;
@@ -1508,6 +1476,98 @@ mod tests {
         let (status, _) = send(&router, Method::GET, "/healthz", None, "").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(lines(&logs.text()), 2, "{}", logs.text());
+    }
+
+    #[tokio::test]
+    async fn a_registry_of_webhooks_that_cannot_be_loaded_is_logged_once_and_healthz_says_so() {
+        let (logs, _guard) = Logs::capture().await;
+        let broker = Arc::new(MemoryBroker::new());
+        // A deletion written by a newer version: skipping it would revive the
+        // webhook it deleted.
+        broker
+            .system_append(
+                SystemLog::Webhooks,
+                br#"{"op":"deleted","v":2,"id":"0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3","at":"2026-10-26T12:00:00Z"}"#,
+            )
+            .await
+            .unwrap();
+        let clock = Arc::new(crate::clock::manual::ManualClock::new(1_792_000_000_000));
+        let router = Server::new(
+            broker,
+            Auth::new(
+                SecretString::from(TOKEN.to_owned()),
+                "service:mansio".parse().unwrap(),
+            ),
+        )
+        .with_clock(clock.clone())
+        .router();
+
+        // Up, and not well, and only the webhooks are not: the principals
+        // loaded, and a credential that is not one is a plain 401.
+        let (status, body) = send(&router, Method::GET, "/healthz", None, "").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(body["webhooks"], "unavailable");
+        assert!(body.get("credentials").is_none(), "{body}");
+        assert!(!body.to_string().contains("offset"), "{body}");
+        let (status, _) = send(&router, Method::GET, URI, Some("a-credential"), "").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // The admin API of webhooks says 503, whatever is asked, and the rest
+        // of the server goes on.
+        let hooks = [
+            (Method::GET, "/v1/webhooks"),
+            (Method::POST, "/v1/webhooks"),
+            (
+                Method::DELETE,
+                "/v1/webhooks/0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3",
+            ),
+        ];
+        let create = r#"{"tenant":"acme","topic":"facts.build","url":"https://example.com/hook"}"#;
+        for (method, uri) in hooks {
+            let (status, body) = send(&router, method.clone(), uri, Some(TOKEN), create).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{method} {uri}");
+            assert_eq!(error_code(&body), "unavailable");
+        }
+        let (status, _) = send(&router, Method::POST, URI, Some(TOKEN), MINIMAL).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // One line at error, with the cause, for all of that.
+        let logged = logs.text();
+        assert_eq!(
+            logged.matches("webhooks could not be loaded").count(),
+            1,
+            "{logged}"
+        );
+        for expected in ["ERROR", "offset 0", "version 2"] {
+            assert!(logged.contains(expected), "{expected} is not in {logged}");
+        }
+    }
+
+    #[tokio::test]
+    async fn healthz_names_every_registry_that_is_not_loaded() {
+        let _serial = serial().await;
+        let broker = Arc::new(MemoryBroker::new());
+        broker
+            .system_append(SystemLog::Principals, b"not a record")
+            .await
+            .unwrap();
+        broker
+            .system_append(SystemLog::Webhooks, b"not a record")
+            .await
+            .unwrap();
+        let router = Server::new(
+            broker,
+            Auth::new(
+                SecretString::from(TOKEN.to_owned()),
+                "service:mansio".parse().unwrap(),
+            ),
+        )
+        .router();
+        let (status, body) = send(&router, Method::GET, "/healthz", None, "").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["credentials"], "unavailable");
+        assert_eq!(body["webhooks"], "unavailable");
     }
 
     #[tokio::test]
