@@ -323,18 +323,24 @@ async fn a_webhook_for_a_topic_nobody_has_published_to_waits_for_it() -> anyhow:
     Ok(())
 }
 
-/// A server that stops and starts again keeps the webhook, its secret and its
-/// place: what was delivered is not delivered again, and what came after is.
+/// A server that stops and starts again keeps the webhooks, their secrets and
+/// their places: what was delivered is not delivered again, and what came
+/// after is. There are two webhooks, and the server's broker gives way to the
+/// other tasks on every call as Iggy does, because the server starts a task
+/// for each webhook that reads its place at once: a server that read the
+/// places while it was still reading them would send the second webhook its
+/// whole topic from the first message.
 #[tokio::test]
-async fn a_restarted_server_resumes_a_webhook_where_it_stopped() -> anyhow::Result<()> {
+async fn a_restarted_server_resumes_every_webhook_where_it_stopped() -> anyhow::Result<()> {
     let mut target = Target::start().await?;
     if !target.is_local() {
         eprintln!("MANSIO_E2E_URL is set: a live server cannot be restarted from here");
         return Ok(());
     }
-    let receiver = Receiver::start(&target, []).await?;
-    let created = target.webhook("facts.build", &receiver.url).await?;
-    let secret = created["secret"].as_str().context("the secret")?.to_owned();
+    let first = Receiver::start(&target, []).await?;
+    let second = Receiver::start(&target, []).await?;
+    let first_secret = secret_of(&target.webhook("facts.build", &first.url).await?)?;
+    let second_secret = secret_of(&target.webhook("facts.build", &second.url).await?)?;
     let mut sent = Vec::new();
     for n in 0..2 {
         sent.push(
@@ -346,15 +352,18 @@ async fn a_restarted_server_resumes_a_webhook_where_it_stopped() -> anyhow::Resu
                 .to_string(),
         );
     }
-    receiver.wait_for(&target, 2, SLACK).await?;
-    // Wait until the place is kept, so that stopping now loses none.
+    first.wait_for(&target, 2, SLACK).await?;
+    second.wait_for(&target, 2, SLACK).await?;
+    // Wait until both places are kept, so that stopping now loses none.
     target
-        .until("both deliveries to be kept", SLACK, || async {
-            Ok(target
+        .until("both deliveries to be kept for both", SLACK, || async {
+            Ok((target
                 .webhooks()
                 .await?
                 .iter()
-                .any(|webhook| webhook["last_delivered_offset"] == 1)
+                .filter(|webhook| webhook["last_delivered_offset"] == 1)
+                .count()
+                == 2)
                 .then_some(()))
         })
         .await?;
@@ -371,21 +380,29 @@ async fn a_restarted_server_resumes_a_webhook_where_it_stopped() -> anyhow::Resu
                 .to_string(),
         );
     }
-    receiver.wait_for(&target, 4, SLACK).await?;
+    first.wait_for(&target, 4, SLACK).await?;
+    second.wait_for(&target, 4, SLACK).await?;
     tokio::time::sleep(target.settle()).await;
-    let requests = receiver.requests();
-    let got: Vec<String> = requests
-        .iter()
-        .map(|request| delivered_id(&request.body))
-        .collect::<anyhow::Result<_>>()?;
-    assert_eq!(got, sent, "the first two once, and the next two");
-    for request in &requests {
-        check_signed(request, &secret)?;
+    for (receiver, secret) in [(&first, &first_secret), (&second, &second_secret)] {
+        let requests = receiver.requests();
+        let got: Vec<String> = requests
+            .iter()
+            .map(|request| delivered_id(&request.body))
+            .collect::<anyhow::Result<_>>()?;
+        assert_eq!(got, sent, "the first two once, and the next two");
+        for request in &requests {
+            check_signed(request, secret)?;
+        }
     }
-    // The restarted server still lists it.
-    assert_eq!(target.webhooks().await?.len(), 1);
+    // The restarted server still lists both.
+    assert_eq!(target.webhooks().await?.len(), 2);
     target.delete_webhooks().await?;
     Ok(())
+}
+
+/// The signing secret in the answer to creating a webhook.
+fn secret_of(created: &Value) -> anyhow::Result<String> {
+    Ok(created["secret"].as_str().context("the secret")?.to_owned())
 }
 
 /// A webhook's position is the server's own: it is not reachable through the

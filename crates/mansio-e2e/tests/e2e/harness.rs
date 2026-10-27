@@ -23,13 +23,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail, ensure};
+use async_trait::async_trait;
 use iggy::prelude::{
     Client, IggyClientBuilder, IggyError, IggyMessage, MessageClient, Partitioning,
     PersonalAccessTokenClient,
 };
 use mansio_core::api::{Claimed, EffectiveSettings, Polled, Published};
 use mansio_core::{
-    Broker, BrokerError, Caller, Credential, Envelope, EventId, MemoryBroker, Timestamp,
+    Broker, BrokerError, BrokerUser, BrokerUserInfo, Caller, Credential, Envelope, EventId, Grant,
+    MemoryBroker, Minted, Stored, SystemLog, SystemRecord, TenantId, Timestamp, Topic,
 };
 use mansio_server::{
     Auth, CredentialSettings, FileSink, Limits, Server, StreamSettings, WebhookSettings,
@@ -122,6 +124,108 @@ impl Default for LocalSettings {
     }
 }
 
+/// The memory broker, except that every call gives way to the other tasks of
+/// the runtime before it is answered, as a call over the network does. A
+/// server over it starts its tasks interleaved the way they are against Iggy:
+/// one that begins reading a log is not done when the next one begins. The
+/// memory broker alone answers at once and hides that.
+struct Yielding(Arc<MemoryBroker>);
+
+#[async_trait]
+impl Broker for Yielding {
+    async fn tenants(&self) -> Result<Vec<TenantId>, BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.tenants().await
+    }
+
+    async fn topics(&self, tenant: &TenantId) -> Result<Vec<Topic>, BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.topics(tenant).await
+    }
+
+    async fn ensure_tenant(&self, tenant: &TenantId) -> Result<(), BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.ensure_tenant(tenant).await
+    }
+
+    async fn ensure_topic(&self, tenant: &TenantId, topic: &Topic) -> Result<(), BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.ensure_topic(tenant, topic).await
+    }
+
+    async fn publish(
+        &self,
+        caller: &Caller<'_>,
+        envelope: &Envelope,
+    ) -> Result<Option<u64>, BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.publish(caller, envelope).await
+    }
+
+    async fn poll(
+        &self,
+        caller: &Caller<'_>,
+        tenant: &TenantId,
+        topic: &Topic,
+        offset: u64,
+        max: u32,
+    ) -> Result<Vec<Stored>, BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.poll(caller, tenant, topic, offset, max).await
+    }
+
+    async fn system_append(&self, log: SystemLog, record: &[u8]) -> Result<(), BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.system_append(log, record).await
+    }
+
+    async fn system_read(
+        &self,
+        log: SystemLog,
+        offset: u64,
+        max: u32,
+    ) -> Result<Vec<SystemRecord>, BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.system_read(log, offset, max).await
+    }
+
+    async fn create_user(
+        &self,
+        tenant: &TenantId,
+        name: &str,
+        grants: &[Grant],
+        ttl: Option<Duration>,
+    ) -> Result<Minted, BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.create_user(tenant, name, grants, ttl).await
+    }
+
+    async fn set_grants(
+        &self,
+        user: BrokerUser,
+        tenant: &TenantId,
+        grants: &[Grant],
+    ) -> Result<(), BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.set_grants(user, tenant, grants).await
+    }
+
+    async fn list_users(&self) -> Result<Vec<BrokerUserInfo>, BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.list_users().await
+    }
+
+    async fn delete_user(&self, user: BrokerUser) -> Result<(), BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.delete_user(user).await
+    }
+
+    async fn identify(&self, credential: &Credential) -> Result<BrokerUser, BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.identify(credential).await
+    }
+}
+
 /// A server running in this process. It stops when dropped.
 struct LocalServer {
     base: String,
@@ -142,7 +246,7 @@ impl LocalServer {
             SecretString::from(LOCAL_TOKEN.to_owned()),
             PRINCIPAL.parse()?,
         );
-        let server = Server::new(broker.clone(), auth)
+        let server = Server::new(Arc::new(Yielding(broker.clone())), auth)
             .with_sink(Arc::new(FileSink::open(sink).await?))
             .with_limits(settings.limits)
             .with_work_settings(settings.work)?
