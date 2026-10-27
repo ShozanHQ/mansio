@@ -751,7 +751,13 @@ impl Broker for IggyBroker {
         max: u32,
     ) -> Result<Vec<Stored>, BrokerError> {
         let result = self.fetch(caller, tenant, topic, offset, max).await;
-        self.ensured.forget_if_missing(tenant, result)
+        // A credential reading a topic that is not there says nothing about
+        // what the server has found: it would otherwise make the server check
+        // the whole tenant again on anyone's say-so.
+        match caller {
+            Caller::Admin => self.ensured.forget_if_missing(tenant, result),
+            Caller::Credential(_) => result,
+        }
     }
 
     async fn system_append(&self, record: &[u8]) -> Result<(), BrokerError> {

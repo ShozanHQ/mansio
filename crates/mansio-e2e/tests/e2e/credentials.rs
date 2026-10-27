@@ -864,6 +864,7 @@ async fn a_restarted_server_knows_who_has_a_credential() -> anyhow::Result<()> {
 
     target.stop_server().await?;
     target.start_server().await?;
+    let (kept, dropped) = (kept.at(&target), dropped.at(&target));
 
     assert_eq!(kept.publish("facts.build").await?.0, StatusCode::CREATED);
     assert_eq!(

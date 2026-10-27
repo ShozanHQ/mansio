@@ -766,6 +766,13 @@ pub struct Issued {
 }
 
 impl Issued {
+    /// The same credential, used against the server the target runs now: after
+    /// the server is restarted it listens elsewhere.
+    pub fn at(mut self, target: &Target) -> Self {
+        self.base = target.base.clone();
+        self
+    }
+
     async fn call(
         &self,
         method: Method,
