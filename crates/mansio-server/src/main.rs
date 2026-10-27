@@ -55,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
         .with_sink(sink)
         .with_limits(settings.limits)
         .with_work_settings(settings.work)
+        .context("the work settings")?
         .serve(listener, shutdown_signal())
         .await
         .context("serving")?;

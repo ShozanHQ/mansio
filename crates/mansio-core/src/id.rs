@@ -330,6 +330,14 @@ impl LeaseId {
     }
 }
 
+impl LeaseId {
+    /// The id as a 128-bit number, for comparing in constant time.
+    #[must_use]
+    pub fn as_u128(&self) -> u128 {
+        self.0.as_u128()
+    }
+}
+
 impl FromStr for LeaseId {
     type Err = ParseError;
 

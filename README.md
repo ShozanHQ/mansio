@@ -182,8 +182,14 @@ curl ... -d '{"lease_id":"<uuid>","reason":"out of memory"}' \
   `MANSIO_BACKOFF_CAP_SECONDS`.
 - When the next attempt would pass `MANSIO_MAX_ATTEMPTS`, the item goes to
   `dead` at once instead, and to nowhere else.
+- An item id is used once. `work_publish` answers 409 for an id the queue has
+  already had, open or done, so resending finished work does not run it
+  again. The server keeps the id of every finished item.
 - A restarted server rebuilds all of this from `work.<queue>`, `facts.work`
-  and `dead`, so it drops no item and republishes none twice. Keep
+  and `dead`, so it drops no item and republishes none twice. A publish that
+  fails may still have been stored, so the server rebuilds the tenant from the
+  topics after one; a stored item or acknowledgement is not lost or repeated.
+  A message in a topic that cannot be read is skipped, with a warning. Keep
   `MANSIO_RETENTION_FACTS_SECONDS` no shorter than `MANSIO_RETENTION_WORK_SECONDS`:
   an item whose facts were deleted while its message was not is claimable
   again.
@@ -212,7 +218,16 @@ curl -X POST -H "Authorization: Bearer $MANSIO_TOKEN" \
 
 An alert nobody has acknowledged `MANSIO_ALERT_RESURFACE_SECONDS` after it was
 published gets a `mansio.alert.resurfaced` envelope on `facts.alert`, and
-another after each further interval, until it is acknowledged.
+another after each further interval, until it is acknowledged. The interval is
+counted from the server's clock when it accepts the alert, not from the `time`
+the producer wrote. An alert id is used once: publishing an id the tenant
+already has is a 409, so a resend cannot reopen an acknowledged alert.
+
+### One server per broker
+
+The lock that makes a claim atomic, and the state behind it, are in one
+mansio-server's memory. Run one mansio-server per broker; two on the same
+broker could give the same item to two consumers.
 
 ### Order
 
