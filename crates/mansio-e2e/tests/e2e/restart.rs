@@ -23,7 +23,7 @@ async fn a_restarted_server_keeps_the_lease_and_claims_the_item_again_exactly_on
     let started = Instant::now();
     let first = target.claim(QUEUE, "worker", SLACK).await?;
 
-    target.crash_server().await?;
+    target.stop_server().await?;
     target.start_server().await?;
 
     // The new server knows the lease: nobody else can claim the item.
@@ -67,7 +67,7 @@ async fn a_server_that_was_down_when_the_lease_ended_expires_it_on_start() -> an
     target.work_publish(QUEUE, &job(1)).await?;
     let first = target.claim(QUEUE, "worker", SLACK).await?;
 
-    target.crash_server().await?;
+    target.stop_server().await?;
     tokio::time::sleep(target.lease()).await;
     target.start_server().await?;
 
@@ -100,7 +100,7 @@ async fn a_failure_whose_retry_was_not_published_is_retried_once_after_a_restart
         .fail_claim(QUEUE, &first, "stopped before the retry")
         .await?;
 
-    target.crash_server().await?;
+    target.stop_server().await?;
     target.start_server().await?;
     assert!(target.pull(QUEUE, "worker").await?.is_none());
 
@@ -135,7 +135,7 @@ async fn acked_items_and_acknowledged_alerts_stay_done_after_a_restart() -> anyh
     let (status, _) = target.alert_ack(&alert.envelope.id.to_string()).await?;
     assert_eq!(status, StatusCode::OK);
 
-    target.crash_server().await?;
+    target.stop_server().await?;
     target.start_server().await?;
 
     let (status, _) = target.alert_ack(&alert.envelope.id.to_string()).await?;

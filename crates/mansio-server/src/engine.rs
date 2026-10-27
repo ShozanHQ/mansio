@@ -42,7 +42,7 @@ use crate::error::ApiError;
 use crate::facts::Facts;
 use crate::recover;
 use crate::settings::WorkSettings;
-use crate::state::{AlertState, Item, Lease, Phase, TenantState, Then, backoff, held_lease};
+use crate::state::{Item, Lease, Phase, TenantState, Then, backoff, held_lease};
 
 type Held = OwnedMutexGuard<TenantState>;
 
@@ -55,6 +55,17 @@ fn timestamp(millis: i64) -> Result<Timestamp, ApiError> {
         warn!(millis, %reason, "the clock is out of range");
         ApiError::Internal
     })
+}
+
+/// One thing the timer has to do. The order is the order to do them in.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Task {
+    /// A lease ran out.
+    Expire(Segment, ItemId),
+    /// An item's backoff is over, or it owes a fact.
+    Advance(Segment, ItemId),
+    /// An alert nobody acknowledged is due to be surfaced again.
+    Resurface(EventId),
 }
 
 /// The work and alert engine for every tenant of a server.
@@ -144,10 +155,18 @@ impl Engine {
         let rebuilt = recover::replay(tenant, &logs, &self.facts, self.clock.now_millis())?;
         let items: usize = rebuilt.queues.values().map(crate::state::Queue::len).sum();
         info!(%tenant, items, alerts = rebuilt.alerts.len(), "state rebuilt");
+        // An alert the state already holds keeps the time it was accepted or
+        // last surfaced, unless the log says later: the log only has the
+        // producer's time for one that was never surfaced.
+        let mut alerts = rebuilt.alerts;
+        for (alert, at) in &mut alerts {
+            if let Some(known) = state.alerts.get(alert) {
+                *at = (*at).max(*known);
+            }
+        }
         state.queues = rebuilt.queues;
-        state.alerts = rebuilt.alerts;
-        state.topics_ready = topics.into_iter().collect();
-        state.tenant_ready = false;
+        state.alerts = alerts;
+        state.acknowledged_alerts = rebuilt.acknowledged_alerts;
         state.loaded = true;
         Ok(())
     }
@@ -174,31 +193,39 @@ impl Engine {
     /// The one way anything durable reaches the broker: record it in the
     /// sink, set the record on it, publish it. The caller holds the tenant's
     /// lock, which is what keeps the sink and the topic in the same order.
-    /// The stream and topic are made by the admin identity, if they are not
-    /// there; the publish is made as `caller`, so that the broker holds a
-    /// credential to its scopes.
+    ///
+    /// The broker is asked, as the admin identity, to make sure the tenant and
+    /// the topic exist each time; it remembers what it has found, and
+    /// recreates what was deleted. The publish is made as `caller`, so that
+    /// the broker holds a credential to its scopes.
     async fn append_as(
         &self,
         held: &mut TenantState,
         mut envelope: Envelope,
         caller: &Caller<'_>,
     ) -> Result<Published, ApiError> {
-        if !held.tenant_ready {
-            self.broker.ensure_tenant(&envelope.tenant).await?;
-            held.tenant_ready = true;
-        }
-        if !held.topics_ready.contains(&envelope.topic) {
-            self.broker
-                .ensure_topic(&envelope.tenant, &envelope.topic)
-                .await?;
-            held.topics_ready.insert(envelope.topic.clone());
-        }
+        self.broker.ensure_tenant(&envelope.tenant).await?;
+        self.broker
+            .ensure_topic(&envelope.tenant, &envelope.topic)
+            .await?;
         if envelope.topic.is_durable()
             && let Some(record) = self.sink.record(&envelope).await?
         {
             envelope.record = Some(record);
         }
-        let offset = self.broker.publish(caller, &envelope).await?;
+        let offset = match self.broker.publish(caller, &envelope).await {
+            Ok(offset) => offset,
+            Err(error) => {
+                if outcome_unknown(&error) {
+                    // The connection may have dropped after the write. The
+                    // state no longer matches the logs, so the next use
+                    // rebuilds it from them, which finds the message if it
+                    // is there.
+                    held.loaded = false;
+                }
+                return Err(error.into());
+            }
+        };
         Ok(Published { offset, envelope })
     }
 
@@ -235,8 +262,9 @@ impl Engine {
     /// # Errors
     ///
     /// Returns 400 for those topics, 403 if the broker does not let the
-    /// credential send there, 503 if the sink or the broker is unavailable,
-    /// and 502 if the broker refuses.
+    /// credential send there, 409 for an alert whose id is already taken, 503
+    /// if the sink or the broker is unavailable, and 502 if the broker
+    /// refuses.
     pub async fn publish(
         &self,
         caller: &Caller<'_>,
@@ -265,20 +293,21 @@ impl Engine {
             return Ok(Published { offset, envelope });
         }
         let mut held = self.lock(&envelope.tenant).await?;
+        let is_alert = envelope.topic == Topic::Alerts;
+        if is_alert
+            && (held.alerts.contains_key(&envelope.id)
+                || held.acknowledged_alerts.contains(&envelope.id))
+        {
+            return Err(ApiError::Conflict(format!(
+                "an alert with id {} already exists",
+                envelope.id
+            )));
+        }
         let stored = self.append_as(&mut held, envelope, caller).await?;
-        if stored.envelope.topic == Topic::Alerts {
-            held.alerts.insert(
-                stored.envelope.id,
-                AlertState {
-                    surfaced_at: stored
-                        .envelope
-                        .time
-                        .as_ref()
-                        .and_then(Timestamp::unix_millis)
-                        .unwrap_or_else(|| self.clock.now_millis()),
-                    acknowledged_by: None,
-                },
-            );
+        if is_alert {
+            // Timed from now, not from the `time` the producer wrote.
+            held.alerts
+                .insert(stored.envelope.id, self.clock.now_millis());
         }
         Ok(stored)
     }
@@ -288,8 +317,8 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// Returns 409 if an open item in the queue already has the id, and the
-    /// errors of [`Engine::publish`].
+    /// Returns 409 if the queue has an item with the id, open or done, and
+    /// the errors of [`Engine::publish`].
     pub async fn work_publish(
         &self,
         caller: &Caller<'_>,
@@ -300,9 +329,9 @@ impl Engine {
             return Err(ApiError::Internal);
         };
         let mut held = self.lock(&envelope.tenant).await?;
-        if held.queues.get(&queue).is_some_and(|q| q.contains(&item)) {
+        if held.queues.get(&queue).is_some_and(|q| q.knows(&item)) {
             return Err(ApiError::Conflict(format!(
-                "an item with id {item} is already open in {queue}"
+                "{queue} already has an item with id {item}: an id is not used again, even when the item is done"
             )));
         }
         let stored = self.append_as(&mut held, envelope, caller).await?;
@@ -388,7 +417,7 @@ impl Engine {
                 .work(tenant, WorkEvent::Acked, principal, now, item, &data)?
         };
         let stored = self.append(&mut held, fact).await?;
-        held.queue_mut(queue).remove(item);
+        held.queue_mut(queue).finish(item);
         Ok(stored)
     }
 
@@ -458,7 +487,7 @@ impl Engine {
     /// # Errors
     ///
     /// Returns 404 if there is no such alert and 409 if it was already
-    /// acknowledged.
+    /// acknowledged. Whoever did, only the first acknowledgement counts.
     pub async fn alerts_ack(
         &self,
         tenant: &TenantId,
@@ -467,14 +496,13 @@ impl Engine {
     ) -> Result<Published, ApiError> {
         let mut held = self.lock(tenant).await?;
         let now = self.clock.now_millis();
-        let state = held
-            .alerts
-            .get(&alert)
-            .ok_or_else(|| ApiError::NotFound(format!("no alert {alert}")))?;
-        if let Some(by) = &state.acknowledged_by {
+        if held.acknowledged_alerts.contains(&alert) {
             return Err(ApiError::Conflict(format!(
-                "alert {alert} was already acknowledged by {by}"
+                "alert {alert} was already acknowledged"
             )));
+        }
+        if !held.alerts.contains_key(&alert) {
+            return Err(ApiError::NotFound(format!("no alert {alert}")));
         }
         let data = AlertFact {
             alert_id: alert,
@@ -486,9 +514,8 @@ impl Engine {
             .facts
             .alert(tenant, AlertEvent::Acknowledged, principal, now, &data)?;
         let stored = self.append(&mut held, fact).await?;
-        if let Some(state) = held.alerts.get_mut(&alert) {
-            state.acknowledged_by = Some(principal.clone());
-        }
+        held.alerts.remove(&alert);
+        held.acknowledged_alerts.insert(alert);
         Ok(stored)
     }
 
@@ -514,9 +541,7 @@ impl Engine {
                 continue;
             }
             let now = self.clock.now_millis();
-            if let Err(error) = self.process_due(&mut held, &tenant, now).await {
-                warn!(%tenant, ?error, "the timer could not finish its pass");
-            }
+            self.process_due(&mut held, &tenant, now).await;
         }
     }
 
@@ -524,7 +549,9 @@ impl Engine {
     /// tenants the broker holds, then [`Engine::tick`] every
     /// `MANSIO_TICK_MILLIS`.
     pub async fn run(self: Arc<Self>) {
-        let mut interval = tokio::time::interval(self.settings.tick);
+        // `interval` panics on a zero period; a tick is at least a millisecond.
+        let tick = self.settings.tick.max(Duration::from_millis(1));
+        let mut interval = tokio::time::interval(tick);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
@@ -537,69 +564,96 @@ impl Engine {
         }
     }
 
-    async fn process_due(
-        &self,
-        held: &mut TenantState,
-        tenant: &TenantId,
-        now: i64,
-    ) -> Result<(), ApiError> {
-        // Leases that ran out, oldest first.
-        let mut expired: Vec<(i64, Segment, ItemId)> = Vec::new();
-        // Items whose backoff is over, or that owe a fact.
-        let mut advancing: Vec<(i64, Segment, ItemId)> = Vec::new();
+    /// Everything that is due in a tenant at `now`, in the order to do it:
+    /// leases that ran out, oldest first, then items whose backoff is over or
+    /// that owe a fact, then alerts to surface again.
+    fn due(&self, held: &TenantState, now: i64) -> Vec<Task> {
+        let mut due: Vec<(u8, i64, Task)> = Vec::new();
         for (queue, items) in &held.queues {
             for (id, item) in items.iter() {
                 match &item.phase {
                     Phase::Leased(lease) if lease.expires_at <= now => {
-                        expired.push((lease.expires_at, queue.clone(), id.clone()));
+                        due.push((0, lease.expires_at, Task::Expire(queue.clone(), id.clone())))
                     }
-                    Phase::Backoff { due, .. } if *due <= now => {
-                        advancing.push((*due, queue.clone(), id.clone()));
+                    Phase::Backoff { due: at, .. } if *at <= now => {
+                        due.push((1, *at, Task::Advance(queue.clone(), id.clone())));
                     }
-                    Phase::Owed { .. } => advancing.push((now, queue.clone(), id.clone())),
+                    Phase::Owed { .. } => {
+                        due.push((1, now, Task::Advance(queue.clone(), id.clone())));
+                    }
                     _ => {}
                 }
             }
         }
-        expired.sort();
-        advancing.sort();
-        for (_, queue, id) in expired {
-            self.expire(held, tenant, &queue, &id, now).await?;
-        }
-        for (_, queue, id) in advancing {
-            self.advance(held, tenant, &queue, &id, now).await?;
-        }
-
         let interval = millis(self.settings.alert_resurface);
-        let mut resurfacing: Vec<(i64, EventId)> = held
-            .alerts
-            .iter()
-            .filter(|(_, alert)| {
-                alert.acknowledged_by.is_none() && alert.surfaced_at.saturating_add(interval) <= now
-            })
-            .map(|(id, alert)| (alert.surfaced_at, *id))
-            .collect();
-        resurfacing.sort();
-        for (_, alert) in resurfacing {
-            let data = AlertFact {
-                alert_id: alert,
-                acknowledged_by: None,
-                acknowledged_at: None,
-                surfaced_at: Some(timestamp(now)?),
-            };
-            let fact = self.facts.alert(
-                tenant,
-                AlertEvent::Resurfaced,
-                self.facts.engine(),
-                now,
-                &data,
-            )?;
-            self.append(held, fact).await?;
-            if let Some(state) = held.alerts.get_mut(&alert) {
-                state.surfaced_at = now;
+        for (alert, surfaced_at) in &held.alerts {
+            if surfaced_at.saturating_add(interval) <= now {
+                due.push((2, *surfaced_at, Task::Resurface(*alert)));
             }
-            debug!(%tenant, %alert, "alert surfaced again");
         }
+        due.sort();
+        due.into_iter().map(|(_, _, task)| task).collect()
+    }
+
+    /// Do what is due in a tenant.
+    ///
+    /// A task that fails is logged and left for the next tick; it does not
+    /// hold up the others. If the failure leaves the outcome of a publish
+    /// unknown, the state no longer matches the logs, and the pass ends: the
+    /// next tick rebuilds the state before it does anything. So a broker that
+    /// cannot be reached costs one rebuild per tick, however many tasks are
+    /// due.
+    async fn process_due(&self, held: &mut TenantState, tenant: &TenantId, now: i64) {
+        for task in self.due(held, now) {
+            if let Err(error) = self.do_task(held, tenant, &task, now).await {
+                warn!(%tenant, ?task, ?error, "the timer could not finish a task");
+                if !held.loaded {
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn do_task(
+        &self,
+        held: &mut TenantState,
+        tenant: &TenantId,
+        task: &Task,
+        now: i64,
+    ) -> Result<(), ApiError> {
+        match task {
+            Task::Expire(queue, id) => self.expire(held, tenant, queue, id, now).await,
+            Task::Advance(queue, id) => self.advance(held, tenant, queue, id, now).await,
+            Task::Resurface(alert) => self.resurface(held, tenant, *alert, now).await,
+        }
+    }
+
+    /// An alert nobody acknowledged is surfaced again.
+    async fn resurface(
+        &self,
+        held: &mut TenantState,
+        tenant: &TenantId,
+        alert: EventId,
+        now: i64,
+    ) -> Result<(), ApiError> {
+        let data = AlertFact {
+            alert_id: alert,
+            acknowledged_by: None,
+            acknowledged_at: None,
+            surfaced_at: Some(timestamp(now)?),
+        };
+        let fact = self.facts.alert(
+            tenant,
+            AlertEvent::Resurfaced,
+            self.facts.engine(),
+            now,
+            &data,
+        )?;
+        self.append(held, fact).await?;
+        if let Some(surfaced_at) = held.alerts.get_mut(&alert) {
+            *surfaced_at = now;
+        }
+        debug!(%tenant, %alert, "alert surfaced again");
         Ok(())
     }
 
@@ -673,15 +727,9 @@ impl Engine {
             };
             // Step one: the message. Whatever happens next, it is out.
             let stored = self.append(held, message).await?;
-            let mut data = WorkFact::new(
-                queue.clone(),
-                stored.envelope.id,
-                stored.envelope.attempt.unwrap_or(1),
-            );
-            data.previous_message_id = Some(current.id);
             let fact = self
                 .facts
-                .work(tenant, event, self.facts.engine(), now, id, &data)?;
+                .owed(tenant, event, queue, &stored.envelope, Some(current.id))?;
             let q = held.queue_mut(queue);
             if then == Then::Ready {
                 q.set_message(id, stored.envelope);
@@ -708,7 +756,7 @@ impl Engine {
         let q = held.queue_mut(queue);
         match then {
             Then::Ready => q.set_phase(id, Phase::Ready),
-            Then::Gone => q.remove(id),
+            Then::Gone => q.finish(id),
         }
         Ok(())
     }
@@ -719,6 +767,13 @@ fn is_written_by_mansio(topic: &Topic) -> bool {
     *topic == Topic::facts_work()
         || *topic == Topic::facts_alert()
         || *topic == Topic::facts_principal()
+}
+
+/// Whether a failed publish may still have stored the message. Only an error
+/// about reaching the broker may: a refusal, a missing topic or an invalid
+/// envelope all come before anything is stored.
+fn outcome_unknown(error: &BrokerError) -> bool {
+    matches!(error, BrokerError::Unavailable(_))
 }
 
 /// The open item, or 404.

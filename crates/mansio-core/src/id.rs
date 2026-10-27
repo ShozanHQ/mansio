@@ -330,6 +330,12 @@ macro_rules! random_uuid_type {
             pub fn generate() -> Self {
                 Self(Uuid::new_v4())
             }
+
+            /// The id as a 128-bit number, for comparing in constant time.
+            #[must_use]
+            pub fn as_u128(&self) -> u128 {
+                self.0.as_u128()
+            }
         }
 
         impl FromStr for $name {

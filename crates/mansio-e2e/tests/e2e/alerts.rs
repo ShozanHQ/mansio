@@ -59,8 +59,21 @@ async fn an_alert_is_acknowledged_once_and_the_ack_names_the_principal() -> anyh
         body["error"]["message"]
             .as_str()
             .unwrap_or("")
-            .contains(PRINCIPAL)
+            .contains("already acknowledged")
     );
+    // An alert id is used once: a resend cannot reopen it.
+    let mut again = alert();
+    again["id"] = json!(id);
+    let (status, response) = target
+        .authed(
+            reqwest::Method::POST,
+            &target.tenant_uri("alerts"),
+            Some(&again),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    let (status, _) = target.alert_ack(&id).await?;
+    assert_eq!(status, StatusCode::CONFLICT);
     // Not an alert, and not an id.
     let (status, _) = target.alert_ack(&EventId::generate().to_string()).await?;
     assert_eq!(status, StatusCode::NOT_FOUND);

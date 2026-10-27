@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 use mansio_core::{
     AlertEvent, AlertFact, CausationId, DataContentType, Envelope, EventId, EventType, ItemId,
-    Principal, PrincipalEvent, PrincipalFact, Source, Subject, TenantId, Timestamp, Topic,
+    Principal, PrincipalEvent, PrincipalFact, Segment, Source, Subject, TenantId, Timestamp, Topic,
     WorkEvent, WorkFact,
 };
 use tracing::error;
@@ -37,6 +37,9 @@ pub(crate) const ENGINE_PRINCIPAL: &str = "service:mansio-engine";
 
 /// The `source` of every fact the engine publishes.
 pub(crate) const SOURCE: &str = "mansio";
+
+/// Mixed into a message's id to make the id of the fact that is owed for it.
+const OWED_SALT: u128 = 0x6d61_6e73_696f_2d6f_7765_6420_6661_6374;
 
 /// Makes the engine's envelopes.
 #[derive(Debug)]
@@ -112,6 +115,39 @@ impl Facts {
         envelope.item_id = Some(item.clone());
         envelope.attempt = Some(data.attempt);
         Ok(envelope)
+    }
+
+    /// The fact owed for a message the engine has published: `retried` for
+    /// the next attempt of an item, or `dead` for its copy on `dead`.
+    ///
+    /// It is made from the message alone: its id is the message's id with a
+    /// fixed pattern mixed in, and its time is the message's time. So the
+    /// engine that publishes the message and a restarted one that finds it
+    /// without its fact make the same fact. If the first recorded it in the
+    /// sink before it stopped, the second records the same id again, and a
+    /// consumer that deduplicates on `id` sees one fact.
+    pub(crate) fn owed(
+        &self,
+        tenant: &TenantId,
+        event: WorkEvent,
+        queue: &Segment,
+        message: &Envelope,
+        previous: Option<EventId>,
+    ) -> Result<Envelope, ApiError> {
+        let item = message.item_id.clone().ok_or(ApiError::Internal)?;
+        let attempt = message.attempt.unwrap_or(1);
+        let mut data = WorkFact::new(queue.clone(), message.id, attempt);
+        data.previous_message_id = previous;
+        let at = message
+            .time
+            .as_ref()
+            .and_then(Timestamp::unix_millis)
+            .unwrap_or(0);
+        let mut fact = self.work(tenant, event, &self.engine, at, &item, &data)?;
+        fact.time.clone_from(&message.time);
+        fact.id = EventId::from_u128(message.id.as_u128() ^ OWED_SALT)
+            .unwrap_or_else(|_| EventId::generate());
+        Ok(fact)
     }
 
     /// A transition of an alert, on `facts.alert`.
@@ -289,6 +325,47 @@ mod tests {
         assert_eq!(fact.principal, by);
         let back: PrincipalFact = serde_json::from_value(fact.data.unwrap()).unwrap();
         assert_eq!(back, data);
+    }
+
+    #[test]
+    fn an_owed_fact_is_made_from_its_message_alone() {
+        let facts = Facts::new();
+        let tenant: TenantId = "acme".parse().unwrap();
+        let queue: Segment = "builds".parse().unwrap();
+        let current = work_message();
+        let next = facts.retry_message(&current, 1_792_000_000_123).unwrap();
+        let owed = |facts: &Facts| {
+            facts
+                .owed(&tenant, WorkEvent::Retried, &queue, &next, Some(current.id))
+                .unwrap()
+        };
+        let (first, second) = (owed(&facts), owed(&Facts::new()));
+        assert_eq!(first, second, "the same message always owes the same fact");
+        assert_ne!(first.id, next.id);
+        assert_eq!(first.time, next.time);
+        assert_eq!(first.attempt, next.attempt);
+        assert_eq!(first.item_id, next.item_id);
+        assert_eq!(first.event_type.as_str(), "mansio.work.retried");
+        assert_eq!(
+            first.data.as_ref().unwrap()["message_id"],
+            next.id.to_string()
+        );
+        assert_eq!(
+            first.data.as_ref().unwrap()["previous_message_id"],
+            current.id.to_string()
+        );
+        // And another message owes another fact.
+        let other = facts.retry_message(&current, 1_792_000_000_123).unwrap();
+        let other_fact = facts
+            .owed(
+                &tenant,
+                WorkEvent::Retried,
+                &queue,
+                &other,
+                Some(current.id),
+            )
+            .unwrap();
+        assert_ne!(other_fact.id, first.id);
     }
 
     #[test]

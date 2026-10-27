@@ -10,6 +10,7 @@ use tokio::task::JoinSet;
 use crate::harness::{SLACK, Target, job};
 
 const QUEUE: &str = "builds";
+const OTHER: &str = "reviews";
 
 /// `(topic, type)` of each envelope.
 fn shape(envelopes: &[Envelope]) -> Vec<(String, String)> {
@@ -32,16 +33,29 @@ fn sink_topic(records: &[Envelope], topic: &str) -> Vec<Envelope> {
         .collect()
 }
 
+/// The envelopes the sink recorded for any of `topics`, in order.
+fn sink_family(records: &[Envelope], topics: &[&str]) -> Vec<Envelope> {
+    records
+        .iter()
+        .filter(|e| topics.contains(&e.topic.to_string().as_str()))
+        .cloned()
+        .collect()
+}
+
 /// Done criterion 5: every transition appears on `facts` and in the sink, in
-/// order.
+/// order: claimed, acked, failed, expired, retried, dead, and an alert's
+/// resurfaced and acknowledged.
 #[tokio::test]
 async fn every_transition_appears_on_facts_and_in_the_sink_in_order() -> anyhow::Result<()> {
     let target = Target::start().await?;
     let wait = target.lease() + target.backoff(2) + SLACK;
-    ensure!(
-        target.settings.max_attempts >= 3,
-        "the test needs three attempts"
-    );
+    let max = target.settings.max_attempts;
+    ensure!(max >= 3, "the test needs three attempts");
+
+    // An alert, which goes unacknowledged while the rest happens.
+    let alert = target
+        .alert_publish(&json!({"source": "e2e", "type": "disk.full"}))
+        .await?;
 
     // One item, through a failure, an expiry, and an ack.
     target.work_publish(QUEUE, &job(1)).await?;
@@ -54,22 +68,47 @@ async fn every_transition_appears_on_facts_and_in_the_sink_in_order() -> anyhow:
         (Some(1), Some(2), Some(3))
     );
     target.ack_claim(QUEUE, &third).await?;
-    // And an alert, acknowledged.
-    let alert = target
-        .alert_publish(&json!({"source": "e2e", "type": "disk.full"}))
+
+    // Another, in another queue, that fails every attempt and goes to dead.
+    target.work_publish(OTHER, &job(2)).await?;
+    for attempt in 1..=max {
+        let claim = target
+            .claim(OTHER, "worker", target.backoff(attempt) + SLACK)
+            .await?;
+        assert_eq!(claim.item.attempt, Some(attempt));
+        target.fail_claim(OTHER, &claim, "no good").await?;
+    }
+
+    // The alert has been surfaced again by now; then it is acknowledged.
+    target
+        .until("the alert to be surfaced again", SLACK, || async {
+            Ok(target
+                .alert_transitions()
+                .await?
+                .contains(&"resurfaced".to_owned())
+                .then_some(()))
+        })
         .await?;
     let (_, body) = target.alert_ack(&alert.envelope.id.to_string()).await?;
     assert_eq!(body["envelope"]["type"], "mansio.alert.acknowledged");
 
     let work_facts = target.read("facts.work").await?;
-    assert_eq!(
-        target.work_transitions().await?,
-        [
-            "claimed", "failed", "retried", "claimed", "expired", "retried", "claimed", "acked"
-        ]
-    );
-    assert_eq!(target.alert_transitions().await?, ["acknowledged"]);
+    let mut expected = vec![
+        "claimed", "failed", "retried", "claimed", "expired", "retried", "claimed", "acked",
+    ];
+    expected.extend(["claimed", "failed", "retried"].repeat(max as usize - 1));
+    expected.extend(["claimed", "failed", "dead"]);
+    assert_eq!(target.work_transitions().await?, expected);
     let alert_facts = target.read("facts.alert").await?;
+    let alert_types = target.alert_transitions().await?;
+    assert_eq!(alert_types.last().map(String::as_str), Some("acknowledged"));
+    assert!(alert_types.len() >= 2, "{alert_types:?}");
+    assert!(
+        alert_types[..alert_types.len() - 1]
+            .iter()
+            .all(|t| t == "resurfaced"),
+        "{alert_types:?}"
+    );
     // Time does not run backwards along a topic.
     let times: Vec<_> = work_facts
         .iter()
@@ -81,34 +120,72 @@ async fn every_transition_appears_on_facts_and_in_the_sink_in_order() -> anyhow:
         eprintln!("MANSIO_E2E_SINK_PATH is not set: the order of the sink is not checked");
         return Ok(());
     };
-    // Each topic's facts are in the sink as they are on the topic.
-    assert_eq!(sink_topic(&records, "facts.work"), work_facts);
-    assert_eq!(sink_topic(&records, "facts.alert"), alert_facts);
-    assert_eq!(
-        sink_topic(&records, "work.builds"),
-        target.read("work.builds").await?
+    // Each topic's messages are in the sink as they are on the topic.
+    for topic in [
+        "facts.work",
+        "facts.alert",
+        "work.builds",
+        "work.reviews",
+        "alerts",
+        "dead",
+    ] {
+        assert_eq!(
+            sink_topic(&records, topic),
+            target.read(topic).await?,
+            "{topic}"
+        );
+    }
+
+    // And across topics, for the work: a message is recorded before the fact
+    // that says it was published, and nothing is out of place.
+    let work = sink_family(
+        &records,
+        &["work.builds", "work.reviews", "dead", "facts.work"],
     );
-    assert_eq!(sink_topic(&records, "alerts"), target.read("alerts").await?);
-    // And across topics: a message is recorded before the fact that says it
-    // was published, and nothing is out of place.
-    assert_eq!(
-        shape(&records),
-        [
-            pair("work.builds", "job.requested"),
+    let mut expected = vec![
+        pair("work.builds", "job.requested"),
+        pair("facts.work", "mansio.work.claimed"),
+        pair("facts.work", "mansio.work.failed"),
+        pair("work.builds", "job.requested"),
+        pair("facts.work", "mansio.work.retried"),
+        pair("facts.work", "mansio.work.claimed"),
+        pair("facts.work", "mansio.work.expired"),
+        pair("work.builds", "job.requested"),
+        pair("facts.work", "mansio.work.retried"),
+        pair("facts.work", "mansio.work.claimed"),
+        pair("facts.work", "mansio.work.acked"),
+        pair("work.reviews", "job.requested"),
+    ];
+    for _ in 1..max {
+        expected.extend([
             pair("facts.work", "mansio.work.claimed"),
             pair("facts.work", "mansio.work.failed"),
-            pair("work.builds", "job.requested"),
+            pair("work.reviews", "job.requested"),
             pair("facts.work", "mansio.work.retried"),
-            pair("facts.work", "mansio.work.claimed"),
-            pair("facts.work", "mansio.work.expired"),
-            pair("work.builds", "job.requested"),
-            pair("facts.work", "mansio.work.retried"),
-            pair("facts.work", "mansio.work.claimed"),
-            pair("facts.work", "mansio.work.acked"),
-            pair("alerts", "disk.full"),
-            pair("facts.alert", "mansio.alert.acknowledged"),
-        ]
+        ]);
+    }
+    expected.extend([
+        pair("facts.work", "mansio.work.claimed"),
+        pair("facts.work", "mansio.work.failed"),
+        pair("dead", "job.requested"),
+        pair("facts.work", "mansio.work.dead"),
+    ]);
+    assert_eq!(shape(&work), expected);
+
+    // And for the alert: published, surfaced again, acknowledged.
+    let alerts = shape(&sink_family(&records, &["alerts", "facts.alert"]));
+    assert_eq!(alerts.first(), Some(&pair("alerts", "disk.full")));
+    assert_eq!(
+        alerts.last(),
+        Some(&pair("facts.alert", "mansio.alert.acknowledged"))
     );
+    assert!(
+        alerts[1..alerts.len() - 1]
+            .iter()
+            .all(|p| *p == pair("facts.alert", "mansio.alert.resurfaced")),
+        "{alerts:?}"
+    );
+    assert_eq!(sink_topic(&records, "facts.alert"), alert_facts);
     Ok(())
 }
 

@@ -30,7 +30,7 @@ use crate::credentials::Credentials;
 use crate::engine::Engine;
 use crate::error::ApiError;
 use crate::principals_api;
-use crate::settings::{CredentialSettings, Limits, WorkSettings};
+use crate::settings::{CredentialSettings, Limits, SettingsError, WorkSettings};
 use crate::work_api;
 
 /// Attributes the server sets itself, from the path and the credential. A
@@ -79,13 +79,32 @@ pub struct Server {
     credentials: CredentialSettings,
 }
 
-/// Aborts a task when dropped, so that a server that is dropped or stopped
-/// does not leave its timer running.
-struct AbortOnDrop(JoinHandle<()>);
+/// The server's timers, running as tasks: the engine's, and the credential
+/// sweep. Dropping it aborts them, so a server that is dropped does not leave
+/// them running; [`Timer::stop`] also waits until they are gone.
+struct Timer(Vec<JoinHandle<()>>);
 
-impl Drop for AbortOnDrop {
+impl Timer {
+    fn start(engine: Arc<Engine>, credentials: Arc<Credentials>) -> Self {
+        Self(vec![
+            tokio::spawn(engine.run()),
+            tokio::spawn(credentials.run()),
+        ])
+    }
+
+    async fn stop(mut self) {
+        for mut task in self.0.drain(..) {
+            task.abort();
+            let _ = (&mut task).await;
+        }
+    }
+}
+
+impl Drop for Timer {
     fn drop(&mut self) {
-        self.0.abort();
+        for task in &self.0 {
+            task.abort();
+        }
     }
 }
 
@@ -120,10 +139,15 @@ impl Server {
     }
 
     /// Use these work and alert settings instead of the defaults.
-    #[must_use]
-    pub fn with_work_settings(mut self, work: WorkSettings) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the setting if the settings do not fit
+    /// together, for example a tick of zero, which would stop the timer.
+    pub fn with_work_settings(mut self, work: WorkSettings) -> Result<Self, SettingsError> {
+        work.validate()?;
         self.work = work;
-        self
+        Ok(self)
     }
 
     /// Use these credential settings instead of the defaults.
@@ -254,11 +278,12 @@ impl Server {
                 "the registry of principals could not be loaded; the next request will try again"
             );
         }
-        let _timer = AbortOnDrop(tokio::spawn(engine.run()));
-        let _sweep = AbortOnDrop(tokio::spawn(credentials.run()));
-        axum::serve(listener, router)
+        let timer = Timer::start(engine, credentials);
+        let served = axum::serve(listener, router)
             .with_graceful_shutdown(shutdown)
-            .await
+            .await;
+        timer.stop().await;
+        served
     }
 }
 
@@ -532,6 +557,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_needs_no_token() {
+        let _serial = serial().await;
         let (status, body) = send(&router(), Method::GET, "/healthz", None, "").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, json!({"status": "ok"}));
@@ -539,6 +565,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_api_needs_the_token() {
+        let _serial = serial().await;
         let router = router();
         for token in [None, Some("wrong"), Some("")] {
             let (status, body) = send(&router, Method::POST, URI, token, MINIMAL).await;
@@ -551,6 +578,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_fills_in_and_poll_returns_it() {
+        let _serial = serial().await;
         let router = router();
         let (status, body) = send(&router, Method::POST, URI, Some(TOKEN), MINIMAL).await;
         assert_eq!(status, StatusCode::CREATED);
@@ -570,6 +598,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_body_with_server_set_attributes_is_refused() {
+        let _serial = serial().await;
         let router = router();
         for name in SERVER_SET {
             let body = format!(r#"{{"source":"s","type":"t","{name}":"x"}}"#);
@@ -581,6 +610,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_requests_are_refused() {
+        let _serial = serial().await;
         let router = router();
         let cases = [
             (Method::POST, URI, "not json"),
@@ -638,6 +668,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_oversized_body_is_refused() {
+        let _serial = serial().await;
         let body = format!(
             r#"{{"source":"s","type":"t","data":"{}"}}"#,
             "x".repeat(4096)
@@ -649,6 +680,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_routes_answer_in_json() {
+        let _serial = serial().await;
         let (status, body) = send(&router(), Method::GET, "/nope", Some(TOKEN), "").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(error_code(&body), "not_found");
@@ -656,6 +688,7 @@ mod tests {
 
     #[tokio::test]
     async fn polling_a_topic_nobody_published_to_is_a_404_and_makes_nothing() {
+        let _serial = serial().await;
         let broker = Arc::new(MemoryBroker::new());
         let auth = Auth::new(
             SecretString::from(TOKEN.to_owned()),
@@ -689,6 +722,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_work_and_alert_routes_need_the_token() {
+        let _serial = serial().await;
         let router = router();
         let routes = [
             (Method::GET, "/v1/settings"),
@@ -711,6 +745,7 @@ mod tests {
 
     #[tokio::test]
     async fn work_requests_are_checked_before_anything_happens() {
+        let _serial = serial().await;
         let router = router();
         let item = "/v1/tenants/acme/work/builds/items";
         let lease = "0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3";
@@ -793,6 +828,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_queue_answers_204_and_an_unknown_item_404() {
+        let _serial = serial().await;
         let router = router();
         let (status, _) = send(
             &router,
@@ -817,6 +853,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_settings_route_reports_what_the_server_runs_with() {
+        let _serial = serial().await;
         let (status, body) = send(&router(), Method::GET, "/v1/settings", Some(TOKEN), "").await;
         assert_eq!(status, StatusCode::OK);
         let settings: mansio_core::api::EffectiveSettings = serde_json::from_value(body).unwrap();
@@ -832,7 +869,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn work_settings_that_would_stop_the_timer_are_refused() {
+        let _serial = serial().await;
+        let auth = || {
+            Auth::new(
+                SecretString::from(TOKEN.to_owned()),
+                "service:mansio".parse().unwrap(),
+            )
+        };
+        let zero_tick = WorkSettings {
+            tick: std::time::Duration::ZERO,
+            ..WorkSettings::default()
+        };
+        let refused = Server::new(Arc::new(MemoryBroker::new()), auth())
+            .with_work_settings(zero_tick)
+            .err();
+        assert!(matches!(
+            refused,
+            Some(SettingsError::Invalid {
+                name: "MANSIO_TICK_MILLIS",
+                ..
+            })
+        ));
+        let fine = Server::new(Arc::new(MemoryBroker::new()), auth())
+            .with_work_settings(WorkSettings::default());
+        assert!(fine.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_timer_of_an_engine_with_a_zero_tick_does_not_panic() {
+        let _serial = serial().await;
+        let engine = Arc::new(Engine::new(
+            Arc::new(MemoryBroker::new()),
+            Arc::new(NoSink),
+            Arc::new(SystemClock),
+            WorkSettings {
+                tick: std::time::Duration::ZERO,
+                ..WorkSettings::default()
+            },
+            10,
+        ));
+        let timer = tokio::spawn(engine.run());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!timer.is_finished(), "the timer is still running");
+        timer.abort();
+    }
+
+    #[tokio::test]
     async fn a_client_chosen_id_is_kept() {
+        let _serial = serial().await;
         let id = "0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3";
         let body =
             format!(r#"{{"id":"{id}","source":"s","type":"t","time":"2026-10-26T12:00:00Z"}}"#);
@@ -873,6 +958,7 @@ mod tests {
 
     #[tokio::test]
     async fn durable_publishes_pass_through_the_sink_and_take_its_record() {
+        let _serial = serial().await;
         let record = mansio_core::Record {
             id: "rec-1".parse().unwrap(),
             prev_hash: "a".repeat(64).parse().unwrap(),
@@ -898,6 +984,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failing_sink_stops_the_publish() {
+        let _serial = serial().await;
         let sink = Arc::new(ScriptedSink {
             seen: Default::default(),
             answer: Err(()),
@@ -986,15 +1073,40 @@ mod tests {
         }
     }
 
+    /// Every test in this module holds this lock for its life, and
+    /// `Logs::capture` takes it too. Tracing keeps subscribers and callsite
+    /// interest in process-wide state. A callsite first reached on a thread
+    /// with no subscriber, while another thread's capture is live, is cached
+    /// as never interesting, and its events vanish from that capture.
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().await
+    }
+
+    /// Ends the capture when dropped, then releases the lock. Fields drop in
+    /// declaration order, so the subscriber is gone before the next test runs.
+    struct CaptureGuard {
+        _subscriber: tracing::subscriber::DefaultGuard,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+    }
+
     impl Logs {
-        fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+        async fn capture() -> (Self, CaptureGuard) {
+            let lock = serial().await;
             let logs = Self::default();
             let writer = logs.clone();
             let subscriber = tracing_subscriber::fmt()
                 .with_ansi(false)
                 .with_writer(move || writer.clone())
                 .finish();
-            (logs, tracing::subscriber::set_default(subscriber))
+            let subscriber = tracing::subscriber::set_default(subscriber);
+            tracing::callsite::rebuild_interest_cache();
+            let guard = CaptureGuard {
+                _subscriber: subscriber,
+                _lock: lock,
+            };
+            (logs, guard)
         }
 
         fn text(&self) -> String {
@@ -1004,6 +1116,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_stored_message_without_an_offset_is_still_a_201() {
+        let _serial = serial().await;
         let router = router_over(|| Ok(None));
         let (status, body) = send(&router, Method::POST, URI, Some(TOKEN), MINIMAL).await;
         assert_eq!(status, StatusCode::CREATED);
@@ -1015,7 +1128,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_refusal_by_the_broker_is_a_502_and_is_logged_with_where_and_why() {
-        let (logs, _guard) = Logs::capture();
+        let (logs, _guard) = Logs::capture().await;
         let router = router_over(|| Err(mansio_core::BrokerError::Rejected("no room".to_owned())));
         let (status, body) = send(&router, Method::POST, URI, Some(TOKEN), MINIMAL).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
@@ -1034,7 +1147,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_refusal_by_the_brokers_permissions_is_a_403_and_a_bad_credential_a_401() {
-        let (logs, _guard) = Logs::capture();
+        let (logs, _guard) = Logs::capture().await;
         let router = router_over(|| {
             Err(mansio_core::BrokerError::Forbidden(
                 "the credential may not send to facts.build".to_owned(),
@@ -1057,7 +1170,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unavailable_broker_is_a_503_and_is_logged() {
-        let (logs, _guard) = Logs::capture();
+        let (logs, _guard) = Logs::capture().await;
         let router = router_over(|| {
             Err(mansio_core::BrokerError::Unavailable(
                 "no answer".to_owned(),
@@ -1073,7 +1186,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failing_sink_is_logged_without_the_envelope() {
-        let (logs, _guard) = Logs::capture();
+        let (logs, _guard) = Logs::capture().await;
         let sink = Arc::new(ScriptedSink {
             seen: Default::default(),
             answer: Err(()),
@@ -1091,7 +1204,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_topic_is_a_404_and_is_not_logged_as_a_failure() {
-        let (logs, _guard) = Logs::capture();
+        let (logs, _guard) = Logs::capture().await;
         let router = router_over(|| Err(mansio_core::BrokerError::NotFound("topic".to_owned())));
         let (status, _) = send(&router, Method::POST, URI, Some(TOKEN), MINIMAL).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
