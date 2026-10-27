@@ -609,7 +609,7 @@ async fn publishing_work_through_the_generic_route_is_refused() {
         Topic::Work(queue()),
         agent("planner"),
     );
-    for topic in ["work.builds", "facts.work", "facts.alert"] {
+    for topic in ["work.builds", "facts.work", "facts.alert", "dead"] {
         message.topic = topic.parse().unwrap();
         assert!(
             matches!(
@@ -622,6 +622,28 @@ async fn publishing_work_through_the_generic_route_is_refused() {
     assert!(rig.sink.all().is_empty());
     message.topic = "facts.build".parse().unwrap();
     assert!(rig.engine.publish(message).await.is_ok());
+}
+
+/// The replay takes a copy on `dead` for an item's own dead letter, so a copy
+/// a caller could write there would finish an open item without running it.
+#[tokio::test]
+async fn a_crafted_copy_on_dead_cannot_finish_an_open_item() {
+    let rig = Rig::new();
+    let item = rig.publish_item("job").await;
+    let original = rig.read(&Topic::Work(queue())).await.remove(0);
+    let mut crafted = original.clone();
+    crafted.id = EventId::generate();
+    crafted.topic = Topic::Dead;
+    crafted.causation_id = Some(original.id.to_string().parse().unwrap());
+    assert!(matches!(
+        rig.engine.publish(crafted).await,
+        Err(ApiError::BadRequest(_))
+    ));
+    assert!(rig.read(&Topic::Dead).await.is_empty());
+
+    let rig = rig.restart().await;
+    let claimed = rig.pull("one").await.expect("the item is still open");
+    assert_eq!(claimed.item.item_id, Some(item));
 }
 
 #[tokio::test]

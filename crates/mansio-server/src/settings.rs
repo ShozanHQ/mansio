@@ -13,7 +13,7 @@ use std::time::Duration;
 use mansio_core::Principal;
 use mansio_iggy::{
     DEFAULT_ADDRESS, DEFAULT_CONNECT_TIMEOUT, DEFAULT_LOCATE_WINDOW, DEFAULT_PRESENCE_RETENTION,
-    DEFAULT_USERNAME, DurabilityPolicy, IggyConfig, Retention,
+    DEFAULT_USERNAME, DurabilityPolicy, IggyConfig, Retention, check_segment_size,
 };
 use secrecy::SecretString;
 use thiserror::Error;
@@ -276,6 +276,11 @@ impl Settings {
             DEFAULT_CONNECT_TIMEOUT.as_secs(),
         )?);
         config.locate_window = env.parse("MANSIO_IGGY_LOCATE_WINDOW", DEFAULT_LOCATE_WINDOW)?;
+        config.segment_size_bytes = env.parse("MANSIO_IGGY_SEGMENT_SIZE_BYTES", 0_u64)?;
+        check_segment_size(config.segment_size_bytes).map_err(|reason| SettingsError::Invalid {
+            name: "MANSIO_IGGY_SEGMENT_SIZE_BYTES",
+            reason: reason.to_owned(),
+        })?;
         let durability = DurabilityPolicy::default();
         config.durability = DurabilityPolicy {
             durable: env.parse("MANSIO_IGGY_DURABILITY", durability.durable)?,
@@ -368,6 +373,7 @@ mod tests {
         assert_eq!(iggy.password.expose_secret(), "p");
         assert_eq!(iggy.connect_timeout, Duration::from_secs(60));
         assert_eq!(iggy.locate_window, 100);
+        assert_eq!(iggy.segment_size_bytes, 0);
         assert_eq!(iggy.retention, Retention::default());
         assert_eq!(iggy.durability.durable, Durability::Persisted);
         assert_eq!(iggy.durability.presence, Durability::Replicated);
@@ -534,6 +540,34 @@ mod tests {
         assert_eq!(retention.facts, Some(Duration::from_secs(86400)));
         assert_eq!(retention.presence, None);
         assert_eq!(retention.work, None);
+    }
+
+    #[test]
+    fn the_segment_size_is_read_and_checked_against_what_iggy_admits() {
+        let read = |value: &str| {
+            settings(&[
+                ("MANSIO_TOKEN", "t"),
+                ("MANSIO_IGGY_PASSWORD", "p"),
+                ("MANSIO_IGGY_SEGMENT_SIZE_BYTES", value),
+            ])
+        };
+        let Backend::Iggy(iggy) = read("1048576").unwrap().broker else {
+            panic!("expected the Iggy broker");
+        };
+        assert_eq!(iggy.segment_size_bytes, 1_048_576);
+        for bad in ["1024", "1048577", "2147483648", "big"] {
+            let error = read(bad).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    SettingsError::Invalid {
+                        name: "MANSIO_IGGY_SEGMENT_SIZE_BYTES",
+                        ..
+                    }
+                ),
+                "{bad}: {error:?}"
+            );
+        }
     }
 
     #[test]

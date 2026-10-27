@@ -345,7 +345,7 @@ async fn work_is_published_through_work_publish_only() -> anyhow::Result<()> {
     let target = Target::start().await?;
 
     // The generic route refuses work topics and the topics mansio writes.
-    for topic in ["work.builds", "facts.work", "facts.alert"] {
+    for topic in ["work.builds", "facts.work", "facts.alert", "dead"] {
         let (status, body) = target
             .authed(Method::POST, &target.messages_uri(topic), Some(&job(1)))
             .await?;
