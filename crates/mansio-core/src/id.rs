@@ -380,8 +380,8 @@ random_uuid_type!(
     "principal id"
 );
 random_uuid_type!(
-    /// The id of a webhook. It names the webhook in the API and its consumer
-    /// in the broker, and is not a secret.
+    /// The id of a webhook. It names the webhook in the API and its position
+    /// in the server's log of positions, and is not a secret.
     WebhookId,
     "webhook id"
 );
