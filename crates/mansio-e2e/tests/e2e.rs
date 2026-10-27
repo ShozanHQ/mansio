@@ -123,6 +123,14 @@ impl Target {
     }
 }
 
+/// Where the server said a message landed. These tests publish one message at
+/// a time and expect to be told.
+fn offset_of(published: &Published) -> anyhow::Result<u64> {
+    published
+        .offset
+        .context("the server stored the message but reported no offset")
+}
+
 /// An envelope body with every attribute a client may set.
 fn full_body(id: &str) -> Value {
     json!({
@@ -164,8 +172,9 @@ async fn a_published_envelope_is_polled_back_with_every_field_intact() -> anyhow
     expected["principalname"] = json!("mansio");
     assert_eq!(serde_json::to_value(&published.envelope)?, expected);
 
+    let offset = offset_of(&published)?;
     let polled = target
-        .poll("work.builds", &format!("offset={}", published.offset))
+        .poll("work.builds", &format!("offset={offset}"))
         .await?;
     ensure!(
         polled.messages.len() == 1,
@@ -173,7 +182,7 @@ async fn a_published_envelope_is_polled_back_with_every_field_intact() -> anyhow
         polled.messages.len()
     );
     let message = &polled.messages[0];
-    assert_eq!(message.offset, published.offset);
+    assert_eq!(message.offset, offset);
     assert_eq!(message.envelope.id.to_string(), id);
     assert_eq!(message.envelope, published.envelope);
     assert_eq!(serde_json::to_value(&message.envelope)?, expected);
@@ -203,7 +212,7 @@ async fn polling_continues_from_an_offset_in_publish_order() -> anyhow::Result<(
     let mut offsets = Vec::new();
     for n in 0..4 {
         let body = json!({"source": "e2e", "type": format!("e2e.n{n}")});
-        offsets.push(target.publish("alerts", &body).await?.offset);
+        offsets.push(offset_of(&target.publish("alerts", &body).await?)?);
     }
     ensure!(
         offsets.windows(2).all(|w| w[1] == w[0] + 1),

@@ -51,7 +51,7 @@ impl Broker for MemoryBroker {
         Ok(())
     }
 
-    async fn publish(&self, envelope: &Envelope) -> Result<u64, BrokerError> {
+    async fn publish(&self, envelope: &Envelope) -> Result<Option<u64>, BrokerError> {
         envelope.validate()?;
         let mut tenants = self.lock();
         let log = tenants
@@ -59,7 +59,7 @@ impl Broker for MemoryBroker {
             .and_then(|topics| topics.get_mut(&envelope.topic))
             .ok_or_else(|| missing_topic(&envelope.tenant, &envelope.topic))?;
         log.push(envelope.clone());
-        Ok(u64::try_from(log.len() - 1).unwrap_or(u64::MAX))
+        Ok(Some(u64::try_from(log.len() - 1).unwrap_or(u64::MAX)))
     }
 
     async fn poll(
@@ -123,7 +123,7 @@ mod tests {
         let broker = broker_with("acme", "facts.build").await;
         let sent = envelope("acme", "facts.build", "build.finished");
         let offset = broker.publish(&sent).await.unwrap();
-        assert_eq!(offset, 0);
+        assert_eq!(offset, Some(0));
 
         let tenant: TenantId = "acme".parse().unwrap();
         let topic: Topic = "facts.build".parse().unwrap();
@@ -145,7 +145,7 @@ mod tests {
                 .publish(&envelope("acme", "alerts", &format!("t{n}")))
                 .await
                 .unwrap();
-            assert_eq!(offset, n);
+            assert_eq!(offset, Some(n));
         }
         let tenant: TenantId = "acme".parse().unwrap();
         let page = broker.poll(&tenant, &Topic::Alerts, 1, 2).await.unwrap();

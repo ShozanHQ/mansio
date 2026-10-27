@@ -13,7 +13,8 @@ use axum::{Json, Router};
 use bytes::Bytes;
 use mansio_core::api::{Polled, Published};
 use mansio_core::{
-    Broker, Envelope, EventId, NoSink, ParseError, Principal, Sink, TenantId, Timestamp, Topic,
+    Broker, Envelope, EventId, NoSink, ParseError, Principal, Sink, Stored, TenantId, Timestamp,
+    Topic,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -190,17 +191,27 @@ async fn publish(
         )),
         _ => ApiError::BadRequest(e.body_text()),
     })?;
-    let mut envelope = build_envelope(&body, &tenant, &topic, &principal)?;
+    let envelope = build_envelope(&body, &tenant, &topic, &principal)?;
+    let published = store(&state, envelope)
+        .await
+        .map_err(|error| error.logged(&tenant, &topic))?;
+    Ok((StatusCode::CREATED, Json(published)))
+}
 
-    state.broker.ensure_tenant(&tenant).await?;
-    state.broker.ensure_topic(&tenant, &topic).await?;
-    if topic.is_durable()
+/// The part of a publish that needs the broker and the sink.
+async fn store(state: &AppState, mut envelope: Envelope) -> Result<Published, ApiError> {
+    state.broker.ensure_tenant(&envelope.tenant).await?;
+    state
+        .broker
+        .ensure_topic(&envelope.tenant, &envelope.topic)
+        .await?;
+    if envelope.topic.is_durable()
         && let Some(record) = state.sink.record(&envelope).await?
     {
         envelope.record = Some(record);
     }
     let offset = state.broker.publish(&envelope).await?;
-    Ok((StatusCode::CREATED, Json(Published { offset, envelope })))
+    Ok(Published { offset, envelope })
 }
 
 #[derive(Debug, Deserialize)]
@@ -229,13 +240,23 @@ async fn poll(
         )));
     }
 
-    state.broker.ensure_tenant(&tenant).await?;
-    state.broker.ensure_topic(&tenant, &topic).await?;
-    let messages = state
-        .broker
-        .poll(&tenant, &topic, query.offset.unwrap_or(0), count)
-        .await?;
+    let messages = fetch(&state, &tenant, &topic, query.offset.unwrap_or(0), count)
+        .await
+        .map_err(|error| error.logged(&tenant, &topic))?;
     Ok(Json(Polled { messages }))
+}
+
+/// The part of a poll that needs the broker.
+async fn fetch(
+    state: &AppState,
+    tenant: &TenantId,
+    topic: &Topic,
+    offset: u64,
+    count: u32,
+) -> Result<Vec<Stored>, ApiError> {
+    state.broker.ensure_tenant(tenant).await?;
+    state.broker.ensure_topic(tenant, topic).await?;
+    Ok(state.broker.poll(tenant, topic, offset, count).await?)
 }
 
 #[cfg(test)]
@@ -322,7 +343,7 @@ mod tests {
         let (status, body) = send(&router, Method::POST, URI, Some(TOKEN), MINIMAL).await;
         assert_eq!(status, StatusCode::CREATED);
         let published: Published = serde_json::from_value(body).unwrap();
-        assert_eq!(published.offset, 0);
+        assert_eq!(published.offset, Some(0));
         assert_eq!(published.envelope.principal.to_string(), "service:mansio");
         assert_eq!(published.envelope.tenant.as_str(), "acme");
         assert_eq!(published.envelope.topic.to_string(), "facts.build");
@@ -513,5 +534,159 @@ mod tests {
 
         let (_, body) = send(&router, Method::GET, URI, Some(TOKEN), "").await;
         assert_eq!(body, json!({"messages": []}));
+    }
+
+    /// A broker over [`MemoryBroker`] whose publish answers as told.
+    struct ScriptedBroker {
+        inner: MemoryBroker,
+        publish: fn() -> Result<Option<u64>, mansio_core::BrokerError>,
+    }
+
+    #[async_trait::async_trait]
+    impl Broker for ScriptedBroker {
+        async fn ensure_tenant(&self, tenant: &TenantId) -> Result<(), mansio_core::BrokerError> {
+            self.inner.ensure_tenant(tenant).await
+        }
+
+        async fn ensure_topic(
+            &self,
+            tenant: &TenantId,
+            topic: &Topic,
+        ) -> Result<(), mansio_core::BrokerError> {
+            self.inner.ensure_topic(tenant, topic).await
+        }
+
+        async fn publish(
+            &self,
+            _envelope: &Envelope,
+        ) -> Result<Option<u64>, mansio_core::BrokerError> {
+            (self.publish)()
+        }
+
+        async fn poll(
+            &self,
+            tenant: &TenantId,
+            topic: &Topic,
+            offset: u64,
+            max: u32,
+        ) -> Result<Vec<Stored>, mansio_core::BrokerError> {
+            self.inner.poll(tenant, topic, offset, max).await
+        }
+    }
+
+    fn router_over(publish: fn() -> Result<Option<u64>, mansio_core::BrokerError>) -> Router {
+        let auth = Auth::new(
+            SecretString::from(TOKEN.to_owned()),
+            "service:mansio".parse().unwrap(),
+        );
+        let broker = ScriptedBroker {
+            inner: MemoryBroker::new(),
+            publish,
+        };
+        Server::new(Arc::new(broker), auth).router()
+    }
+
+    /// What the tracing events emitted while it is in scope say.
+    #[derive(Clone, Default)]
+    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Logs {
+        fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+            let logs = Self::default();
+            let writer = logs.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            (logs, tracing::subscriber::set_default(subscriber))
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stored_message_without_an_offset_is_still_a_201() {
+        let router = router_over(|| Ok(None));
+        let (status, body) = send(&router, Method::POST, URI, Some(TOKEN), MINIMAL).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(body.get("offset").is_none(), "{body}");
+        let published: Published = serde_json::from_value(body).unwrap();
+        assert_eq!(published.offset, None);
+        assert_eq!(published.envelope.tenant.as_str(), "acme");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_by_the_broker_is_a_502_and_is_logged_with_where_and_why() {
+        let (logs, _guard) = Logs::capture();
+        let router = router_over(|| Err(mansio_core::BrokerError::Rejected("no room".to_owned())));
+        let (status, body) = send(&router, Method::POST, URI, Some(TOKEN), MINIMAL).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error_code(&body), "broker_refused");
+        let logged = logs.text();
+        for expected in [
+            "WARN",
+            "tenant=acme",
+            "topic=facts.build",
+            "status=502",
+            "no room",
+        ] {
+            assert!(logged.contains(expected), "{expected} is not in {logged}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_broker_is_a_503_and_is_logged() {
+        let (logs, _guard) = Logs::capture();
+        let router = router_over(|| {
+            Err(mansio_core::BrokerError::Unavailable(
+                "no answer".to_owned(),
+            ))
+        });
+        let (status, _) = send(&router, Method::POST, URI, Some(TOKEN), MINIMAL).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let logged = logs.text();
+        for expected in ["WARN", "status=503", "no answer"] {
+            assert!(logged.contains(expected), "{expected} is not in {logged}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_sink_is_logged_without_the_envelope() {
+        let (logs, _guard) = Logs::capture();
+        let sink = Arc::new(ScriptedSink {
+            seen: Default::default(),
+            answer: Err(()),
+        });
+        let router = router_with(sink);
+        let body = r#"{"source":"s","type":"t","data":"private-payload"}"#;
+        let (status, _) = send(&router, Method::POST, URI, Some(TOKEN), body).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let logged = logs.text();
+        for expected in ["WARN", "tenant=acme", "topic=facts.build", "disk full"] {
+            assert!(logged.contains(expected), "{expected} is not in {logged}");
+        }
+        assert!(!logged.contains("private-payload"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_topic_is_a_404_and_is_not_logged_as_a_failure() {
+        let (logs, _guard) = Logs::capture();
+        let router = router_over(|| Err(mansio_core::BrokerError::NotFound("topic".to_owned())));
+        let (status, _) = send(&router, Method::POST, URI, Some(TOKEN), MINIMAL).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(!logs.text().contains("WARN"), "{}", logs.text());
     }
 }

@@ -45,7 +45,7 @@ A tenant is an Iggy stream. Its topics:
 | `dead` | Work items past the attempt cap, and nowhere else. | setting |
 | `presence` | Heartbeats and progress. Ephemeral, short expiry, never sent to the sink. | setting, short |
 
-Segments match `[a-z0-9][a-z0-9_-]{0,62}`; so does a tenant id. Each topic has one partition, so order is publish order, and an offset counts from 0. The Iggy stream is named by the tenant id and the Iggy topic by the topic name. Topics are created on first use, by a publish or a poll, by the server's admin identity, with a message retention set per kind of topic (`MANSIO_RETENTION_<KIND>_SECONDS`, 0 keeps forever).
+Segments match `[a-z0-9][a-z0-9_-]{0,62}`; so does a tenant id. Each topic has one partition, so order is publish order, and an offset counts from 0. The Iggy stream is named by the tenant id and the Iggy topic by the topic name. Topics are created on first use, by a publish or a poll, by the server's admin identity, with a message retention set per kind of topic (`MANSIO_RETENTION_<KIND>_SECONDS`, 0 keeps forever, and a topic that keeps forever has no size cap) and a durability: `persisted` for everything that goes through the sink (`MANSIO_IGGY_DURABILITY`), `replicated` for `presence` (`MANSIO_IGGY_PRESENCE_DURABILITY`). `persisted` makes Iggy confirm a write only once it is on stable storage, so a 201 survives a crash of the host. The Iggy backend remembers the streams and topics it has found or created, and checks again for a tenant when Iggy says one is missing.
 
 ## Work items
 
@@ -75,10 +75,10 @@ Until per-principal credentials exist, one bearer token (`MANSIO_TOKEN`), compar
 One HTTP API under `/v1`:
 
 - `GET /healthz`, open: `{"status":"ok"}`.
-- `POST /v1/tenants/{tenant}/topics/{topic}/messages`: the body is an envelope without the four attributes above; the answer is 201 with `{"offset", "envelope"}`, the envelope as stored.
+- `POST /v1/tenants/{tenant}/topics/{topic}/messages`: the body is an envelope without the four attributes above; the answer is 201 with `{"offset", "envelope"}`, the envelope as stored. `offset` is absent when Iggy stored the message without saying where and it is not among the last `MANSIO_IGGY_LOCATE_WINDOW` messages: the message is stored, so the client must not send it again.
 - `GET /v1/tenants/{tenant}/topics/{topic}/messages?offset=N&count=M`: 200 with `{"messages": [{"offset", "envelope"}]}` from that offset, in publish order.
 
-Every refusal is `{"error": {"code", "message"}}` with 400 (malformed), 401 (no valid token), 404, 413 (body too large), 502 (the broker refused) or 503 (the broker or the sink is unavailable). Everything but `/healthz` needs `Authorization: Bearer <token>`.
+Every refusal is `{"error": {"code", "message"}}` with 400 (malformed), 401 (no valid token), 404, 413 (body too large), 502 (the broker refused) or 503 (the broker or the sink is unavailable). A 502 or 503 is logged at `warn` with the tenant, topic and cause. Everything but `/healthz` needs `Authorization: Bearer <token>`.
 
 The CLI, the MCP server, server-sent events (`GET /v1/events`, resuming from `Last-Event-ID`) and signed webhooks (CloudEvents JSON, HMAC-SHA256 signature header, retry with backoff) all use it, with the same operation names.
 

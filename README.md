@@ -126,8 +126,14 @@ curl -H "Authorization: Bearer $MANSIO_TOKEN" \
 # 200 {"messages":[{"offset":0,"envelope":{...}}]}
 ```
 
+`offset` is left out when Iggy stored the message but did not say where it
+landed and mansio could not find it among the recent messages (see
+`MANSIO_IGGY_LOCATE_WINDOW`). The answer is still 201: the message is stored,
+so do not publish it again. Poll and match on the envelope's `id` to find it.
+
 A refusal is `{"error":{"code":"...","message":"..."}}` with status 400, 401,
-404, 413, 502 or 503.
+404, 413, 502 or 503. A 502 or 503 is also logged at `warn` with the tenant,
+the topic and what the broker or the sink said.
 
 ## Settings
 
@@ -149,7 +155,9 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_IGGY_USERNAME` | `iggy` | The Iggy admin user mansio acts as. |
 | `MANSIO_IGGY_PASSWORD` | none, required with `iggy` | Its password. |
 | `MANSIO_IGGY_CONNECT_TIMEOUT_SECONDS` | `60` | How long startup waits for Iggy. |
-| `MANSIO_IGGY_LOCATE_WINDOW` | `100` | How many recent messages to search when Iggy accepts a publish without saying where it landed. 0 turns the search off. |
+| `MANSIO_IGGY_LOCATE_WINDOW` | `100` | How many recent messages to search, by message id, when Iggy accepts a publish without saying where it landed. 0 turns the search off. A message that is not found is still answered with 201, without an offset. |
+| `MANSIO_IGGY_DURABILITY` | `persisted` | When Iggy confirms a write to `facts.*`, `work.*`, `alerts` and `dead`: `persisted` or `replicated`. See [Durability](#durability). |
+| `MANSIO_IGGY_PRESENCE_DURABILITY` | `replicated` | The same for `presence`, which is ephemeral. |
 | `MANSIO_RETENTION_FACTS_SECONDS` | `0` | How long Iggy keeps `facts.*` messages. 0 keeps them forever. |
 | `MANSIO_RETENTION_WORK_SECONDS` | `0` | The same for `work.*`. |
 | `MANSIO_RETENTION_ALERTS_SECONDS` | `0` | The same for `alerts`. |
@@ -157,7 +165,19 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_RETENTION_PRESENCE_SECONDS` | `3600` | The same for `presence`. |
 | `RUST_LOG` | `info` | Log filter. |
 
-Retention is applied when a topic is created.
+Retention and durability are applied when a topic is created; a topic that
+already exists keeps the ones it was created with.
+
+#### Durability
+
+With `persisted`, Iggy answers a publish only after the message is on stable
+storage, so a 201 survives a crash of the host. With `replicated`, Iggy
+answers after its quorum commit without that barrier; on one node that is a
+write to the operating system, and a crash of the host can lose the messages
+acknowledged since the last flush, after the sink has already recorded them.
+`persisted` costs write latency, and Iggy's server setting
+`wal_group_commit_delay_micros` tunes that cost. mansio sets both Iggy's
+`durability` and `consumer_offset_durability` on the topics it creates.
 
 ### mansio (CLI)
 
