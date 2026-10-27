@@ -1,5 +1,7 @@
 //! How to reach Iggy and how to shape the topics mansio creates there.
 
+use std::fmt;
+use std::str::FromStr;
 use std::time::Duration;
 
 use mansio_core::TopicKind;
@@ -59,6 +61,73 @@ impl Default for Retention {
     }
 }
 
+/// When Iggy answers that a write is done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Durability {
+    /// After a quorum commit, with no stable-storage barrier. On one node that
+    /// is a write to the operating system, so a crash of the host can lose
+    /// the acknowledged tail.
+    Replicated,
+    /// After the data is on stable storage as well. Slower, and what a
+    /// durable topic needs.
+    Persisted,
+}
+
+impl fmt::Display for Durability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Durability::Replicated => "replicated",
+            Durability::Persisted => "persisted",
+        })
+    }
+}
+
+impl FromStr for Durability {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("replicated") {
+            Ok(Durability::Replicated)
+        } else if s.eq_ignore_ascii_case("persisted") {
+            Ok(Durability::Persisted)
+        } else {
+            Err("must be replicated or persisted")
+        }
+    }
+}
+
+/// The durability of the topics mansio creates, per kind of topic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurabilityPolicy {
+    /// `facts.<kind>`, `work.<queue>`, `alerts` and `dead`: everything that
+    /// goes through the sink.
+    pub durable: Durability,
+    /// `presence`, which is ephemeral.
+    pub presence: Durability,
+}
+
+impl DurabilityPolicy {
+    /// The durability for a kind of topic.
+    #[must_use]
+    pub fn for_kind(&self, kind: TopicKind) -> Durability {
+        match kind {
+            TopicKind::Presence => self.presence,
+            TopicKind::Facts | TopicKind::Work | TopicKind::Alerts | TopicKind::Dead => {
+                self.durable
+            }
+        }
+    }
+}
+
+impl Default for DurabilityPolicy {
+    fn default() -> Self {
+        Self {
+            durable: Durability::Persisted,
+            presence: Durability::Replicated,
+        }
+    }
+}
+
 /// Everything [`IggyBroker::connect`](crate::IggyBroker::connect) needs.
 #[derive(Debug, Clone)]
 pub struct IggyConfig {
@@ -75,11 +144,13 @@ pub struct IggyConfig {
     pub locate_window: u32,
     /// Message retention per kind of topic.
     pub retention: Retention,
+    /// When Iggy confirms a write, per kind of topic.
+    pub durability: DurabilityPolicy,
 }
 
 impl IggyConfig {
-    /// A configuration with the default timeout, search window and
-    /// retention.
+    /// A configuration with the default timeout, search window, retention and
+    /// durability.
     #[must_use]
     pub fn new(
         address: impl Into<String>,
@@ -93,6 +164,7 @@ impl IggyConfig {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             locate_window: DEFAULT_LOCATE_WINDOW,
             retention: Retention::default(),
+            durability: DurabilityPolicy::default(),
         }
     }
 }
@@ -115,6 +187,36 @@ mod tests {
             TopicKind::Dead,
         ] {
             assert_eq!(retention.for_kind(kind), None);
+        }
+    }
+
+    #[test]
+    fn durability_parses_and_prints_its_names() {
+        for (text, durability) in [
+            ("persisted", Durability::Persisted),
+            ("replicated", Durability::Replicated),
+            ("Persisted", Durability::Persisted),
+            ("REPLICATED", Durability::Replicated),
+        ] {
+            assert_eq!(text.parse::<Durability>(), Ok(durability));
+            assert_eq!(durability.to_string().parse::<Durability>(), Ok(durability));
+        }
+        for text in ["", "fsync", "persist", " persisted"] {
+            assert!(text.parse::<Durability>().is_err(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn everything_but_presence_is_persisted_by_default() {
+        let policy = DurabilityPolicy::default();
+        assert_eq!(policy.for_kind(TopicKind::Presence), Durability::Replicated);
+        for kind in [
+            TopicKind::Facts,
+            TopicKind::Work,
+            TopicKind::Alerts,
+            TopicKind::Dead,
+        ] {
+            assert_eq!(policy.for_kind(kind), Durability::Persisted);
         }
     }
 

@@ -1,9 +1,6 @@
 //! The mansio command line: publish to a topic and poll it, against the
 //! HTTP API.
 
-// The output of this program is its standard output.
-#![expect(clippy::print_stdout, reason = "the CLI prints envelopes to stdout")]
-
 mod client;
 
 use std::process::ExitCode;
@@ -111,6 +108,7 @@ fn publish_body(args: &PublishArgs) -> Map<String, Value> {
     body
 }
 
+#[expect(clippy::print_stdout, reason = "the CLI prints envelopes to stdout")]
 async fn run(cli: Cli) -> anyhow::Result<()> {
     let client = Client::from_lookup(|name| std::env::var(name).ok())?;
     match cli.command {

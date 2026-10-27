@@ -4,8 +4,8 @@ use axum::Json;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use mansio_core::api::{ErrorBody, ErrorDetail};
-use mansio_core::{BrokerError, SinkError};
-use tracing::error;
+use mansio_core::{BrokerError, SinkError, TenantId, Topic};
+use tracing::{error, warn};
 
 /// A refusal, with the status it maps to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +50,22 @@ impl ApiError {
             ApiError::Unavailable(_) => "unavailable",
             ApiError::Internal => "internal",
         }
+    }
+
+    /// Log a 502 or 503 with the tenant and topic it happened for and the
+    /// error from the broker or sink, then hand the refusal back unchanged.
+    /// The client sees the same message, so nothing here is a secret.
+    pub(crate) fn logged(self, tenant: &TenantId, topic: &Topic) -> Self {
+        if let ApiError::BadGateway(why) | ApiError::Unavailable(why) = &self {
+            warn!(
+                %tenant,
+                %topic,
+                status = self.status().as_u16(),
+                error = %why,
+                "the broker or the sink failed a request"
+            );
+        }
+        self
     }
 
     fn message(&self) -> String {

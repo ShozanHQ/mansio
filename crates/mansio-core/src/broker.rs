@@ -43,6 +43,9 @@ pub trait Broker: Send + Sync {
 
     /// Append the envelope to the topic named in it, and return its offset.
     ///
+    /// `None` means the broker accepted and stored the message but could not
+    /// say where it landed. The caller must not publish it again.
+    ///
     /// The broker does not deduplicate: publishing the same id twice stores
     /// it twice.
     ///
@@ -50,7 +53,7 @@ pub trait Broker: Send + Sync {
     ///
     /// Returns [`BrokerError::NotFound`] if the tenant or topic does not
     /// exist, or an error if the broker cannot be reached or refuses.
-    async fn publish(&self, envelope: &Envelope) -> Result<u64, BrokerError>;
+    async fn publish(&self, envelope: &Envelope) -> Result<Option<u64>, BrokerError>;
 
     /// Read up to `max` envelopes from `offset` on, in publish order. An
     /// offset past the end returns nothing.

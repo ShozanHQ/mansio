@@ -13,7 +13,7 @@ use std::time::Duration;
 use mansio_core::Principal;
 use mansio_iggy::{
     DEFAULT_ADDRESS, DEFAULT_CONNECT_TIMEOUT, DEFAULT_LOCATE_WINDOW, DEFAULT_PRESENCE_RETENTION,
-    DEFAULT_USERNAME, IggyConfig, Retention,
+    DEFAULT_USERNAME, DurabilityPolicy, IggyConfig, Retention,
 };
 use secrecy::SecretString;
 use thiserror::Error;
@@ -182,6 +182,11 @@ impl Settings {
             DEFAULT_CONNECT_TIMEOUT.as_secs(),
         )?);
         config.locate_window = env.parse("MANSIO_IGGY_LOCATE_WINDOW", DEFAULT_LOCATE_WINDOW)?;
+        let durability = DurabilityPolicy::default();
+        config.durability = DurabilityPolicy {
+            durable: env.parse("MANSIO_IGGY_DURABILITY", durability.durable)?,
+            presence: env.parse("MANSIO_IGGY_PRESENCE_DURABILITY", durability.presence)?,
+        };
         config.retention = Retention {
             facts: retention("MANSIO_RETENTION_FACTS_SECONDS", None)?,
             work: retention("MANSIO_RETENTION_WORK_SECONDS", None)?,
@@ -235,6 +240,7 @@ impl<F: Fn(&str) -> Option<String>> Env<F> {
 mod tests {
     use std::collections::HashMap;
 
+    use mansio_iggy::Durability;
     use secrecy::ExposeSecret;
 
     use super::*;
@@ -263,6 +269,8 @@ mod tests {
         assert_eq!(iggy.connect_timeout, Duration::from_secs(60));
         assert_eq!(iggy.locate_window, 100);
         assert_eq!(iggy.retention, Retention::default());
+        assert_eq!(iggy.durability.durable, Durability::Persisted);
+        assert_eq!(iggy.durability.presence, Durability::Replicated);
     }
 
     #[test]
@@ -352,6 +360,22 @@ mod tests {
     }
 
     #[test]
+    fn durability_is_set_for_durable_topics_and_for_presence() {
+        let settings = settings(&[
+            ("MANSIO_TOKEN", "t"),
+            ("MANSIO_IGGY_PASSWORD", "p"),
+            ("MANSIO_IGGY_DURABILITY", "replicated"),
+            ("MANSIO_IGGY_PRESENCE_DURABILITY", "Persisted"),
+        ])
+        .unwrap();
+        let Backend::Iggy(iggy) = settings.broker else {
+            panic!("expected the Iggy broker");
+        };
+        assert_eq!(iggy.durability.durable, Durability::Replicated);
+        assert_eq!(iggy.durability.presence, Durability::Persisted);
+    }
+
+    #[test]
     fn bad_values_name_the_variable() {
         for (name, value) in [
             ("MANSIO_BROKER", "kafka"),
@@ -362,6 +386,8 @@ mod tests {
             ("MANSIO_POLL_DEFAULT_COUNT", "0"),
             ("MANSIO_POLL_DEFAULT_COUNT", "2000"),
             ("MANSIO_IGGY_CONNECT_TIMEOUT_SECONDS", "soon"),
+            ("MANSIO_IGGY_DURABILITY", "fsync"),
+            ("MANSIO_IGGY_PRESENCE_DURABILITY", "never"),
         ] {
             let error = settings(&[
                 ("MANSIO_TOKEN", "t"),
