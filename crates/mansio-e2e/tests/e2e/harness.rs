@@ -623,6 +623,19 @@ impl Target {
         })
     }
 
+    /// A credential issued earlier, by an earlier process, in this target's
+    /// tenant: the means to use it, from what the issuing pass kept.
+    pub fn adopt(&self, id: &str, token: &str) -> Issued {
+        Issued {
+            id: id.to_owned(),
+            principal: Value::Null,
+            token: token.to_owned(),
+            http: self.http.clone(),
+            base: self.base.clone(),
+            tenant: self.tenant.clone(),
+        }
+    }
+
     /// `principals_revoke`, answering whatever the server says.
     pub async fn revoke(&self, id: &str) -> anyhow::Result<(StatusCode, Value)> {
         let uri = format!("{}/v1/principals/{id}", self.base);

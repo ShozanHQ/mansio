@@ -62,8 +62,12 @@ All notable changes to mansio are listed here. The format follows
   expires (an agent's always does), a revocation deletes the user, and a sweep
   revokes the expired. Each issue and revoke is recorded on `facts.principal`
   and in the sink first, and the principals are kept in a log in the broker
-  that no credential can read. On start the server deletes every broker user it
-  made for a principal that no record owns.
+  that no credential can read, each record with the version of its format. On
+  start, once the whole log is read, the server deletes every broker user it
+  made for a principal that no record owns. A record that cannot be read stops
+  the registry loading and deletes nothing: every credential gets 503, the
+  cause is logged at `error`, and `GET /healthz` answers 503
+  `{"status":"degraded","credentials":"unavailable"}` until it loads.
 - `MemoryBroker` holds users, scopes and expiring credentials as Iggy does, so
   credentials are tested without Iggy.
 - `mansio-server provision-admin`, which makes the Iggy user the server acts

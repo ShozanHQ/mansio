@@ -28,6 +28,8 @@ mod registry;
 mod settings;
 mod sink;
 mod state;
+#[cfg(test)]
+mod testing;
 mod work_api;
 
 pub use app::{AppState, Parts, Server};
