@@ -1,0 +1,20 @@
+[package]
+name = "mansio-iggy"
+description = "The mansio Broker over Apache Iggy."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+iggy.workspace = true
+mansio-core.workspace = true
+secrecy.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

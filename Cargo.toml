@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+repository = "https://github.com/snowloops/mansio"
+
+[workspace.dependencies]
+mansio-core = { path = "crates/mansio-core", version = "0.1.0" }
+mansio-iggy = { path = "crates/mansio-iggy", version = "0.1.0" }
+mansio-server = { path = "crates/mansio-server", version = "0.1.0" }
+
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+iggy = "=0.11.0"
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subtle = "2"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v7"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+
+[profile.release]
+overflow-checks = true
