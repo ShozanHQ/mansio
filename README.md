@@ -105,6 +105,84 @@ MANSIO_BROKER=memory MANSIO_TOKEN=dev MANSIO_SINK_PATH= cargo run -p mansio-serv
 An empty `MANSIO_SINK_PATH` turns the file sink off; otherwise every durable
 publish is also appended to `mansio-sink.jsonl`.
 
+## The guarantee
+
+Work is never dropped and never done twice, for consumers that are not always
+connected. [`tests/offline/run.sh`](tests/offline/run.sh) is that claim, run on
+every pull request by the `offline` job of CI, against Iggy through compose. It
+mints an agent credential for a fresh tenant with `mansio principals create`
+and runs three scenarios of N items (`MANSIO_OFFLINE_ITEMS`, 50) with a
+consumer, [`tests/offline/consumer.sh`](tests/offline/consumer.sh): a plain
+shell loop of `mansio work pull --wait` and `mansio work ack` that appends the
+item's id to a file only when the ack succeeds. Any harness can copy its shape;
+read the next paragraph before copying its order.
+
+1. A consumer is started and killed with `kill -9`. N items are published. A
+   new process of the consumer starts. The file ends with N lines, N distinct
+   ids, none twice, every published id in it, and `facts.work` holds one
+   claim and one ack, both of attempt 1, for each item.
+2. N items are published. A consumer that kills itself right after its first
+   claim dies holding that item's lease. A consumer under another name takes
+   the rest, and the held item once its lease has ended and its backoff has
+   passed. The file ends as in 1, and for the held item `facts.work` holds
+   exactly one `expired` and one `retried`, then the claim and the ack of
+   attempt 2.
+3. As in 2, but the consumer that died starts again under the same name while
+   its lease is live. A consumer that holds a live lease is given it again, so
+   it gets the held item back and acknowledges it once. The file ends as in 1,
+   and `facts.work` holds one claim and one ack of attempt 1 for every item,
+   the held one included: no expiry, no second attempt.
+
+The consumer appends after the ack so that the file counts acknowledgements and
+can never hold an item twice, which is what the test needs. The price is a lost
+effect: if the consumer dies between the ack and the append, or the answer to
+the ack is lost (the CLI does not send an ack again), the server has the item as
+done and the file does not hold it. A real worker does its effect first,
+idempotent on the item's `itemid` (the attempt is in the item), and then acks,
+so that a death between the two is a redelivery that the idempotent effect
+absorbs.
+
+The consumer that takes over in scenario 2 has a name of its own because the
+dead one's name would be given its lease back, and there would be no expiry to
+wait for.
+
+After the last item of a scenario is done the test goes on watching for as long
+as a redelivery can take, so that a duplicate that arrives late is still caught
+(`MANSIO_OFFLINE_SETTLE_SECONDS`).
+
+To run it you need a built `mansio`, `jq`, `curl`, `pkill` and `pgrep`, and a
+server with a lease of seconds, not the default five minutes, because scenario
+2 waits for it, and long enough to restart a consumer inside, because scenario
+3 does. The test reads the server's lease, backoff and tick from
+`GET /v1/settings` and refuses to start if its timeout, or a settle time you
+set, is shorter than they need. It also checks the consumers' logs: no ack
+may have failed, and the pulls that failed and were tried again are counted and
+printed, so that a broker that hiccups is visible in a passing run. On Linux,
+with Docker:
+
+```sh
+MANSIO_LEASE_SECONDS=8 MANSIO_MAX_ATTEMPTS=3 MANSIO_BACKOFF_BASE_SECONDS=1 \
+  MANSIO_BACKOFF_CAP_SECONDS=4 MANSIO_TICK_MILLIS=200 docker compose up --build --wait
+cargo build -p mansio
+MANSIO_TOKEN=mansio-dev-token MANSIO_BIN=target/debug/mansio tests/offline/run.sh
+docker compose down --volumes
+```
+
+Without Docker, on the memory broker (Iggy's server runs on Linux only), start
+the server in another terminal with the same settings and point the test at it:
+
+```sh
+MANSIO_BROKER=memory MANSIO_TOKEN=dev MANSIO_SINK_PATH= MANSIO_LEASE_SECONDS=8 \
+  MANSIO_MAX_ATTEMPTS=3 MANSIO_BACKOFF_BASE_SECONDS=1 MANSIO_BACKOFF_CAP_SECONDS=4 \
+  MANSIO_TICK_MILLIS=200 cargo run -p mansio-server
+cargo build -p mansio
+MANSIO_TOKEN=dev MANSIO_BIN=target/debug/mansio tests/offline/run.sh
+```
+
+It prints what it checks and ends with `PASS`, or with `FAIL` and the last
+lines of each consumer's log, and exits non-zero. Its settings are in
+[The offline test](#the-offline-test).
+
 ## The CLI
 
 `mansio` is a client of the HTTP API at `MANSIO_URL` (or `--url`) with the
@@ -748,6 +826,26 @@ topics it creates, and leaves Iggy's own settings at its defaults.
 | `MANSIO_IGGY_USERNAME`, `MANSIO_IGGY_PASSWORD` | `mansio`, `mansio-dev-admin` | The Iggy user mansio-server acts as, read by `compose.yaml` for `iggy-admin` and mansio-server. Development defaults. |
 | `IGGY_PORT` | `8090` | The port on `127.0.0.1` that `compose.yaml` publishes Iggy's TCP port on. |
 
+### The offline test
+
+Read by `tests/offline/run.sh` and `tests/offline/consumer.sh` (see [The
+guarantee](#the-guarantee)). The test also reads `MANSIO_URL` and
+`MANSIO_POLL_INTERVAL_MILLIS` (see the CLI settings) and takes the admin token
+from `MANSIO_TOKEN`; its consumers are given the credential it mints as their
+`MANSIO_TOKEN`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MANSIO_BIN` | `mansio` | The `mansio` command that the test and its consumers run. |
+| `MANSIO_OFFLINE_ITEMS` | `50` | Items published in each scenario. |
+| `MANSIO_OFFLINE_TIMEOUT_SECONDS` | `120` | How long a scenario waits for every item to be done. It must be longer than the server's lease plus its backoff cap, which the test checks before it starts. |
+| `MANSIO_OFFLINE_SETTLE_SECONDS` | the server's lease plus its backoff cap plus twice its tick and the CLI's poll interval, read from `GET /v1/settings` | How long the test keeps watching after the last item is done, before it checks for a duplicate that arrives late. The longest a redelivery can take is that default, so the test refuses to start with a shorter one. |
+| `MANSIO_OFFLINE_KILL_WAIT_SECONDS` | `5` | How long a consumer that was killed may take to disappear from the process table before the test fails. |
+| `MANSIO_OFFLINE_CREDENTIAL_TTL_SECONDS` | `3600` | How long the agent credentials the test mints last. |
+| `MANSIO_OFFLINE_PULL_WAIT_SECONDS` | `5` | How long one `work pull` of the consumer looks for an item. |
+| `MANSIO_OFFLINE_RETRY_SECONDS` | `1` | The consumer's wait after a pull that failed. |
+| `MANSIO_OFFLINE_STOP_AFTER_CLAIM` | `0` | `1` makes the consumer `kill -9` itself right after its first claim, holding the lease. The test sets it for the consumer that dies in scenarios 2 and 3. |
+
 ## Develop
 
 The toolchain is pinned in `rust-toolchain.toml`; every cargo command in CI
@@ -799,6 +897,9 @@ segment of `alerts`, waits for Iggy to delete it, publishes another alert, and
 after the restart checks that the server's rebuild, which reads from offset 0,
 finds the alerts that are left. The same checks as the restart pair run in one
 process, against the in-process server, on every `cargo test`.
+
+The `offline` job runs `tests/offline/run.sh` against a compose stack of its own;
+see [The guarantee](#the-guarantee).
 
 ## Licence
 
