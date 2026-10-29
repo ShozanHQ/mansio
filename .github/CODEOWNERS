@@ -1,5 +1,9 @@
-# Code owners. A change to a path below needs a review from its owner before it
-# can merge. Only two kinds of path are listed, on purpose:
+# Code owners. A change to a path below asks its owner to look; the merge does
+# not wait for them. A merge needs the checks green and every review thread
+# resolved, not a person's approval. A person reviews a versioned release: the
+# `release` environment waits for the owner's approval.
+#
+# Only two kinds of path are listed, on purpose:
 #
 #   the rules the project runs under: the workflows and the repository's own
 #   configuration, the dependency policy, the toolchain and lint profile, the
