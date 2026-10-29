@@ -944,6 +944,18 @@ process, against the in-process server, on every `cargo test`.
 The `offline` job runs `tests/offline/run.sh` against a compose stack of its own;
 see [The guarantee](#the-guarantee).
 
+Every image in the `Dockerfile` and `compose.yaml` is pinned by digest, with its
+tag kept beside it to read, and so is every action in the workflows by commit.
+Dependabot moves each pin and its comment or tag together. A scheduled workflow
+(`.github/workflows/scheduled.yml`) runs `cargo deny check` daily, and every
+Monday the same end-to-end suite against `apache/iggy:edge` in place of the
+pinned release. It reports and never blocks.
+
+## Contributing and security
+
+[CONTRIBUTING.md](CONTRIBUTING.md) says how to build, test and propose a change.
+To report a vulnerability, see [SECURITY.md](SECURITY.md); do not open an issue.
+
 ## Licence
 
 Apache-2.0. See [LICENSE](LICENSE).
