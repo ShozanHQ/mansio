@@ -21,10 +21,12 @@ jobs:
     name: check
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install the toolchain pinned in rust-toolchain.toml
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2.9.3
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -38,8 +40,10 @@ jobs:
     name: deny
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
           arguments: --all-features --locked
@@ -64,7 +68,9 @@ jobs:
       MANSIO_BACKOFF_CAP_SECONDS: "4"
       MANSIO_TICK_MILLIS: "200"
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Shellcheck the test and its consumer, if the runner has shellcheck
         run: |
           if command -v shellcheck >/dev/null 2>&1; then
@@ -74,7 +80,7 @@ jobs:
           fi
       - name: Install the toolchain pinned in rust-toolchain.toml
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2.9.3
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build the mansio command line
         run: cargo build -p mansio --locked
       - name: Start Iggy, make mansio's Iggy user, and start mansio-server
@@ -90,127 +96,19 @@ jobs:
         if: always()
         run: docker compose down --volumes
 
-  hygiene:
-    name: hygiene
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - name: Install the toolchain pinned in rust-toolchain.toml
-        run: rustup toolchain install
-      - name: The name of the system that builds mansio appears nowhere
-        run: |
-          # The pattern is built from two halves so that this file does not
-          # contain it either.
-          first=sho
-          second=zan
-          if git grep -i -n -e "${first}${second}"; then
-            echo "::error::the name above must not appear in the code or the docs"
-            exit 1
-          fi
-      - name: Every crate is Apache-2.0
-        run: |
-          metadata=$(cargo metadata --format-version 1 --no-deps --locked)
-          crates=$(jq '.packages | length' <<<"$metadata")
-          if [ "$crates" -lt 5 ]; then
-            echo "::error::expected at least 5 crates, found $crates"
-            exit 1
-          fi
-          others=$(jq -r '.packages[] | select(.license != "Apache-2.0") | .name' <<<"$metadata")
-          if [ -n "$others" ]; then
-            echo "::error::crates not licensed Apache-2.0: $others"
-            exit 1
-          fi
-
+  # The steps and the settings of the throwaway stack are in
+  # .github/actions/e2e, which the weekly run against Iggy's edge build in
+  # scheduled.yml uses too.
   e2e:
     name: e2e
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    env:
-      # Development values for a throwaway stack on the runner.
-      MANSIO_TOKEN: ci-e2e-token
-      MANSIO_E2E_URL: http://127.0.0.1:7070
-      # Iggy itself, which the credential tests ask directly what a credential
-      # may do. Without it they fail.
-      MANSIO_E2E_IGGY_ADDRESS: 127.0.0.1:8090
-      # Seconds-scale work settings, so that a lease, a backoff and an alert
-      # interval take seconds. The tests read them from GET /v1/settings.
-      MANSIO_LEASE_SECONDS: "2"
-      MANSIO_MAX_ATTEMPTS: "3"
-      MANSIO_BACKOFF_BASE_SECONDS: "1"
-      MANSIO_BACKOFF_CAP_SECONDS: "4"
-      MANSIO_ALERT_RESURFACE_SECONDS: "2"
-      MANSIO_TICK_MILLIS: "200"
-      # An agent credential lasts seconds, is checked with Iggy every 2 s, and
-      # the sweep runs every 2 s.
-      MANSIO_AGENT_CREDENTIAL_TTL_SECONDS: "5"
-      MANSIO_CREDENTIAL_RECHECK_SECONDS: "2"
-      MANSIO_CREDENTIAL_SWEEP_SECONDS: "2"
-      # Streams look for new messages every 100 ms and send a comment every
-      # second when quiet. A webhook retries after 1 s, 2 s, 4 s, gives up on a
-      # delivery after 3 attempts, and waits 2 s for an answer.
-      MANSIO_STREAM_POLL_MILLIS: "100"
-      MANSIO_SSE_KEEPALIVE_SECONDS: "1"
-      MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS: "1"
-      MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS: "4"
-      MANSIO_WEBHOOK_MAX_ATTEMPTS: "3"
-      MANSIO_WEBHOOK_TIMEOUT_SECONDS: "2"
-      # The name mansio-server, in its container, reaches the webhook receiver
-      # of the tests by. The receiver listens on the runner.
-      MANSIO_E2E_WEBHOOK_HOST: host.docker.internal
-      # Iggy's cleaner looks for expired segments this often (a minute by
-      # default), for the retention test further down.
-      IGGY_DATA_MAINTENANCE_MESSAGES_INTERVAL: 2s
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install the toolchain pinned in rust-toolchain.toml
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2.9.3
-      - name: A directory for the sink that the container can write and the tests can read
-        run: |
-          mkdir -p "$RUNNER_TEMP/mansio-sink"
-          chmod 777 "$RUNNER_TEMP/mansio-sink"
-          echo "MANSIO_SINK_DIR=$RUNNER_TEMP/mansio-sink" >> "$GITHUB_ENV"
-          echo "MANSIO_E2E_SINK_PATH=$RUNNER_TEMP/mansio-sink/sink.jsonl" >> "$GITHUB_ENV"
-      - name: A directory for what the two-pass tests leave for each other
-        run: |
-          mkdir -p "$RUNNER_TEMP/mansio-state"
-          echo "MANSIO_E2E_STATE_DIR=$RUNNER_TEMP/mansio-state" >> "$GITHUB_ENV"
-      - name: Start Iggy, make mansio's Iggy user, and start mansio-server
-        run: docker compose up --build --wait
-      - name: Publish, poll, claim, retry, acknowledge, stream, deliver webhooks and issue credentials through Iggy
-        run: cargo test -p mansio-e2e --locked
-      # The two-pass tests: a first pass leaves work and alerts in Iggy, the
-      # server is restarted, and a second pass checks what the new server made
-      # of them. They are #[ignore]d and selected by name, and they fail
-      # without a live server and a state directory.
-      - name: A server with pages of 5, a lease of 30 s, and a segment of 1 MiB and alerts kept 5 s
-        env:
-          MANSIO_LEASE_SECONDS: "30"
-          MANSIO_POLL_DEFAULT_COUNT: "5"
-          MANSIO_POLL_MAX_COUNT: "5"
-          MANSIO_IGGY_SEGMENT_SIZE_BYTES: "1048576"
-          MANSIO_RETENTION_ALERTS_SECONDS: "5"
-        run: docker compose up --detach --wait --no-deps --force-recreate mansio-server
-      - name: Retention, first pass (alerts lose their head to Iggy, then another is published)
-        run: cargo test -p mansio-e2e --locked -- --ignored retention_first_pass
-      - name: Restart, first pass (a queue longer than a page, one item claimed)
-        run: cargo test -p mansio-e2e --locked -- --ignored restart_first_pass
-      - name: Restart mansio-server and wait for /healthz
-        run: |
-          docker compose restart mansio-server
-          for _ in $(seq 1 240); do
-            if curl --fail --silent --max-time 2 --output /dev/null "$MANSIO_E2E_URL/healthz"; then
-              exit 0
-            fi
-            sleep 0.5
-          done
-          echo "::error::mansio-server did not answer /healthz after the restart"
-          exit 1
-      - name: Restart and retention, second pass (the lease holds, the retry happens once, the alerts are known)
-        run: cargo test -p mansio-e2e --locked -- --ignored restart_second_pass retention_second_pass
-      - name: Compose logs
-        if: failure()
-        run: docker compose logs --no-color
-      - name: Stop the stack
-        if: always()
-        run: docker compose down --volumes
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Start Iggy and mansio-server, run the end-to-end suite through compose, stop the stack
+        uses: ./.github/actions/e2e

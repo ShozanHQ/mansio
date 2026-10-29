@@ -1,0 +1,60 @@
+# Dependabot version updates, weekly. Minor and patch updates of an ecosystem
+# arrive as one pull request; a major update arrives on its own, so that it is
+# read on its own. Security updates are separate and not held back by this.
+version: 2
+
+updates:
+  # Rust crates. Cargo.lock is kept in step.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      cargo-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # The actions in the workflows. The versions are in comments beside the
+  # commits they are pinned to, and Dependabot moves both. The local action
+  # has no steps from elsewhere today; the second directory is for when it does.
+  - package-ecosystem: github-actions
+    directories:
+      - /
+      - /.github/actions/*
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      actions-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # The images in the Dockerfile, pinned by digest with the tag kept beside it.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      docker-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    ignore:
+      # The compiler moves by hand, together with rust-toolchain.toml and
+      # rust-version. Patch releases and a new digest of the same tag still come.
+      - dependency-name: rust
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+
+  # The image of Iggy in compose.yaml, the same way.
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      compose-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]

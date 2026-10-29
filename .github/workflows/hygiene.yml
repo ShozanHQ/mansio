@@ -1,0 +1,69 @@
+name: hygiene
+
+# The title and the body of a pull request can change without a push, and the
+# title becomes the body of the merge commit on main, so the check of them runs
+# when a pull request is edited as well. That is why hygiene is not in ci.yml:
+# every run of that one builds and restarts the whole stack, and an edit must
+# not start one. The job is named hygiene, which the ruleset requires.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hygiene-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hygiene:
+    name: hygiene
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The commits of a pull request, for the check of their messages.
+          fetch-depth: 0
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: rustup toolchain install
+      # What the check looks for, and the one address it lets through, are in
+      # the script. Its patterns are built from pieces, so it does not match
+      # itself.
+      - name: Nothing in the tree refers to how mansio is built
+        run: bash .github/scripts/names.sh tree
+      - name: Nor does a commit message, or the title or body of the pull request
+        if: github.event_name == 'pull_request'
+        # The title and the body are text of anyone who can open a pull request.
+        # They reach the script through the environment and are never part of it.
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          failed=0
+          printf '%s\n' "$TITLE" | bash .github/scripts/names.sh text "the pull request title" || failed=1
+          printf '%s\n' "$BODY" | bash .github/scripts/names.sh text "the pull request body" || failed=1
+          commits=$(git rev-list "$BASE..$HEAD")
+          for commit in $commits; do
+            git log -1 --format=%B "$commit" | bash .github/scripts/names.sh text "commit $commit" || failed=1
+          done
+          exit "$failed"
+      - name: Every crate is Apache-2.0
+        run: |
+          metadata=$(cargo metadata --format-version 1 --no-deps --locked)
+          crates=$(jq '.packages | length' <<<"$metadata")
+          if [ "$crates" -lt 5 ]; then
+            echo "::error::expected at least 5 crates, found $crates"
+            exit 1
+          fi
+          others=$(jq -r '.packages[] | select(.license != "Apache-2.0") | .name' <<<"$metadata")
+          if [ -n "$others" ]; then
+            echo "::error::crates not licensed Apache-2.0: $others"
+            exit 1
+          fi

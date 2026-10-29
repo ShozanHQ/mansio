@@ -1,5 +1,8 @@
 # mansio
 
+[![ci](https://github.com/ShozanHQ/mansio/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ShozanHQ/mansio/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/ShozanHQ/mansio/badge)](https://securityscorecards.dev/viewer/?uri=github.com/ShozanHQ/mansio)
+
 A message bus for agents, people and programs that are not connected all the
 time. A producer publishes facts and work to a topic; a consumer that joins
 later picks up what is waiting. [Apache Iggy](https://iggy.apache.org) is the
@@ -923,7 +926,8 @@ of passes, `restart_first_pass` and `restart_second_pass`, `retention_first_pass
 and `retention_second_pass` in `crates/mansio-e2e/tests/e2e/passes.rs`. They are
 `#[ignore]`d, so a plain `cargo test` leaves them alone, and they fail, not
 skip, without `MANSIO_E2E_URL` or `MANSIO_E2E_STATE_DIR`. The `e2e` job in
-`.github/workflows/ci.yml` runs them in order: it recreates mansio-server with
+`.github/workflows/ci.yml`, through the action in `.github/actions/e2e`, runs
+them in order: it recreates mansio-server with
 pages of 5, a lease of 30 s, a segment of 1 MiB and alerts kept for 5 s, runs
 the two first passes, restarts mansio-server (`docker compose restart`), and
 runs the two second passes. The restart pair publishes a queue longer than
@@ -939,6 +943,18 @@ process, against the in-process server, on every `cargo test`.
 
 The `offline` job runs `tests/offline/run.sh` against a compose stack of its own;
 see [The guarantee](#the-guarantee).
+
+Every image in the `Dockerfile` and `compose.yaml` is pinned by digest, with its
+tag kept beside it to read, and so is every action in the workflows by commit.
+Dependabot moves each pin and its comment or tag together. A scheduled workflow
+(`.github/workflows/scheduled.yml`) runs `cargo deny check` daily, and every
+Monday the same end-to-end suite against `apache/iggy:edge` in place of the
+pinned release. It reports and never blocks.
+
+## Contributing and security
+
+[CONTRIBUTING.md](CONTRIBUTING.md) says how to build, test and propose a change.
+To report a vulnerability, see [SECURITY.md](SECURITY.md); do not open an issue.
 
 ## Licence
 
