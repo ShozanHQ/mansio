@@ -311,6 +311,10 @@ impl Server {
                 post(work_api::work_pull),
             )
             .route(
+                "/v1/tenants/{tenant}/work/{queue}/items/{item}/extend",
+                post(work_api::work_extend),
+            )
+            .route(
                 "/v1/tenants/{tenant}/work/{queue}/items/{item}/ack",
                 post(work_api::work_ack),
             )
@@ -472,6 +476,7 @@ async fn settings(
     let seconds = |d: std::time::Duration| d.as_secs();
     Json(EffectiveSettings {
         lease_seconds: seconds(work.lease),
+        lease_max_seconds: seconds(work.lease_max),
         max_attempts: work.max_attempts,
         backoff_base_seconds: seconds(work.backoff_base),
         backoff_cap_seconds: seconds(work.backoff_cap),
@@ -908,6 +913,7 @@ mod tests {
             (Method::GET, "/v1/settings"),
             (Method::POST, "/v1/tenants/acme/work/builds/items"),
             (Method::POST, "/v1/tenants/acme/work/builds/pull"),
+            (Method::POST, "/v1/tenants/acme/work/builds/items/i/extend"),
             (Method::POST, "/v1/tenants/acme/work/builds/items/i/ack"),
             (Method::POST, "/v1/tenants/acme/work/builds/items/i/fail"),
             (Method::POST, "/v1/tenants/acme/alerts"),
@@ -1001,6 +1007,44 @@ mod tests {
                 "/v1/tenants/acme/work/builds/pull".to_owned(),
                 r#"{"consumer":"w","x":1}"#.to_owned(),
             ),
+            // An extension carries a consumer and a lease id, and may carry a
+            // number of seconds of at least 1.
+            (Method::POST, format!("{item}/i/extend"), "{}".to_owned()),
+            (
+                Method::POST,
+                format!("{item}/i/extend"),
+                r#"{"lease_id":"nope","consumer":"w"}"#.to_owned(),
+            ),
+            (
+                Method::POST,
+                format!("{item}/i/extend"),
+                format!(r#"{{"lease_id":"{lease}"}}"#),
+            ),
+            (
+                Method::POST,
+                format!("{item}/i/extend"),
+                format!(r#"{{"lease_id":"{lease}","consumer":"a b"}}"#),
+            ),
+            (
+                Method::POST,
+                format!("{item}/i/extend"),
+                format!(r#"{{"lease_id":"{lease}","consumer":"w","seconds":0}}"#),
+            ),
+            (
+                Method::POST,
+                format!("{item}/i/extend"),
+                format!(r#"{{"lease_id":"{lease}","consumer":"w","seconds":-1}}"#),
+            ),
+            (
+                Method::POST,
+                format!("{item}/i/extend"),
+                format!(r#"{{"lease_id":"{lease}","consumer":"w","seconds":"soon"}}"#),
+            ),
+            (
+                Method::POST,
+                format!("{item}/i/extend"),
+                format!(r#"{{"lease_id":"{lease}","consumer":"w","until":"noon"}}"#),
+            ),
             // An ack and a fail carry a consumer and a lease id, and a fail a
             // reason.
             (Method::POST, format!("{item}/i/ack"), "{}".to_owned()),
@@ -1083,6 +1127,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let settings: mansio_core::api::EffectiveSettings = serde_json::from_value(body).unwrap();
         assert_eq!(settings.lease_seconds, 300);
+        assert_eq!(settings.lease_max_seconds, 86_400);
         assert_eq!(settings.max_attempts, 5);
         assert_eq!(settings.backoff_base_seconds, 5);
         assert_eq!(settings.backoff_cap_seconds, 300);
@@ -1646,6 +1691,11 @@ mod tests {
                     Method::POST,
                     format!("{base}/work/builds/pull"),
                     r#"{"consumer":"w"}"#.to_owned(),
+                ),
+                (
+                    Method::POST,
+                    format!("{base}/work/builds/items/i/extend"),
+                    format!(r#"{{"lease_id":"{lease}","consumer":"w"}}"#),
                 ),
                 (
                     Method::POST,

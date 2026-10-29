@@ -45,8 +45,8 @@ MANSIO_TOKEN = "..."
 ```
 
 The tools are the commands of `mansio`, with the same names and parameters:
-`publish`, `poll`, `work_publish`, `work_pull`, `work_ack`, `work_fail`,
-`alerts_publish`, `alerts_ack`, `consumers_get`, `consumers_commit`,
+`publish`, `poll`, `work_publish`, `work_pull`, `work_extend`, `work_ack`,
+`work_fail`, `alerts_publish`, `alerts_ack`, `consumers_get`, `consumers_commit`,
 `principals_create`, `principals_list`, `principals_revoke`, `webhooks_create`,
 `webhooks_list` and `webhooks_delete`. The last six need the admin token and
 are refused to a credential like the one above.
@@ -80,6 +80,19 @@ was given:
 ```json
 {"tenant": "acme", "queue": "builds", "item": "0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3", "consumer": "codex-1", "lease_id": "5b0c0b51-4a53-4a3c-9d3a-0d6e0e2f7a11"}
 ```
+
+Work that takes longer than the lease calls `work_extend` with the same
+arguments (and `seconds`, if it wants a lease of a length of its own), before
+`expires_at` and again and again. The `data.expires_at` of the answer is the new
+end. A lease runs for `MANSIO_LEASE_MAX_SECONDS` (a day by default) at most from
+the claim.
+
+An agent works in tool calls and cannot call `work_extend` while one of them is
+still running. So before a step that may outlast the lease (a build, a test
+run, a long command), call `work_extend` with `seconds` at least as long as the
+step is expected to take, up to `MANSIO_LEASE_MAX_SECONDS`, and extend again
+between steps. A lease that ends during a step gives the item to another
+consumer while the step is still running.
 
 If it cannot do the work it calls `work_fail` with the same and a `reason`, and
 the item is offered again after a backoff. A `work_pull` that finds nothing

@@ -370,7 +370,7 @@ impl Engine {
             .map(|(id, item, lease)| (id.clone(), item.message.clone(), lease.clone()));
         if let Some((id, message, lease)) = existing {
             return self
-                .give_again(&mut held, tenant, queue, id, message, lease)
+                .give_again(&mut held, tenant, queue, id, message, lease, now)
                 .await
                 .map(Some);
         }
@@ -390,8 +390,9 @@ impl Engine {
             holder: principal.clone(),
             consumer: consumer.clone(),
             expires_at: now.saturating_add(millis(self.settings.lease)),
+            claimed_at: now,
         };
-        self.record_claim(&mut held, tenant, queue, &id, &message, &lease)
+        self.record_claim(&mut held, tenant, queue, &id, &message, &lease, now)
             .await?;
         held.queue_mut(queue)
             .set_phase(&id, Phase::Leased(lease.clone()));
@@ -403,7 +404,11 @@ impl Engine {
         }))
     }
 
-    /// Record that `lease` is held on the item, as a `claimed` fact.
+    /// Record that `lease` is held on the item, as a `claimed` fact made at
+    /// `now`. The caller reads the clock once and passes it here, so that the
+    /// fact of a fresh claim is timed at the moment the lease says it was
+    /// claimed: a replay counts the longest lease from that fact.
+    #[expect(clippy::too_many_arguments, reason = "a fact needs all of them")]
     async fn record_claim(
         &self,
         held: &mut TenantState,
@@ -412,8 +417,8 @@ impl Engine {
         item: &ItemId,
         message: &Envelope,
         lease: &Lease,
+        now: i64,
     ) -> Result<(), ApiError> {
-        let now = self.clock.now_millis();
         let mut data = WorkFact::new(queue.clone(), message.id, message.attempt.unwrap_or(1));
         data.lease = Some(lease.fingerprint);
         data.holder = Some(lease.holder.clone());
@@ -426,7 +431,12 @@ impl Engine {
         Ok(())
     }
 
-    /// The lease a consumer already holds, handed to it again.
+    /// The lease a consumer already holds, handed to it again. `now` is the
+    /// time of the pull.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the state, the item and the lease"
+    )]
     async fn give_again(
         &self,
         held: &mut TenantState,
@@ -435,6 +445,7 @@ impl Engine {
         item: ItemId,
         message: Envelope,
         lease: Lease,
+        now: i64,
     ) -> Result<Claimed, ApiError> {
         let expires_at = timestamp(lease.expires_at)?;
         if let Some(Remembered(lease_id)) = lease.id {
@@ -453,7 +464,7 @@ impl Engine {
             id: Some(Remembered(lease_id)),
             ..lease
         };
-        self.record_claim(held, tenant, queue, &item, &message, &renewed)
+        self.record_claim(held, tenant, queue, &item, &message, &renewed, now)
             .await?;
         held.queue_mut(queue)
             .set_phase(&item, Phase::Leased(renewed.clone()));
@@ -463,6 +474,58 @@ impl Engine {
             expires_at,
             item: message,
         })
+    }
+
+    /// Move the end of an item's lease later, so that a consumer still working
+    /// on it keeps it. Only the holder, naming the consumer and presenting the
+    /// lease id, may.
+    ///
+    /// The lease runs to `seconds` from now, or to the lease setting from now
+    /// if there are none. It is never shortened, and it never runs past
+    /// `MANSIO_LEASE_MAX_SECONDS` after the claim: an extension that asks for
+    /// more is capped there. Whatever the end comes to is recorded as an
+    /// `extended` fact, even when it is the end the lease already had, so a
+    /// request that is sent again is answered the same way.
+    ///
+    /// # Errors
+    ///
+    /// Returns 404 if the queue has no such open item, 403 if the lease is
+    /// not the caller's, and 409 if there is no live lease, which includes a
+    /// lease that has ended and that the timer has not yet expired. Nothing
+    /// changes then.
+    pub async fn work_extend(
+        &self,
+        tenant: &TenantId,
+        queue: &Segment,
+        item: &ItemId,
+        holder: Holder<'_>,
+        seconds: Option<Duration>,
+    ) -> Result<Published, ApiError> {
+        let mut held = self.lock(tenant).await?;
+        let now = self.clock.now_millis();
+        let principal = holder.principal;
+        let (fact, extended) = {
+            let open = open_item(&held, queue, item)?;
+            let lease = held_lease(open, holder, now)?;
+            let extended = Lease {
+                expires_at: extended_expiry(
+                    lease,
+                    now,
+                    seconds.unwrap_or(self.settings.lease),
+                    self.settings.lease_max,
+                ),
+                ..lease.clone()
+            };
+            let data = lease_fact(queue, open, &extended);
+            let fact = self
+                .facts
+                .work(tenant, WorkEvent::Extended, principal, now, item, &data)?;
+            (fact, extended)
+        };
+        let stored = self.append(&mut held, fact).await?;
+        held.queue_mut(queue)
+            .set_phase(item, Phase::Leased(extended));
+        Ok(stored)
     }
 
     /// Complete an item. Only the holder, naming the consumer and presenting
@@ -855,6 +918,14 @@ fn open_item<'a>(
         .get(queue)
         .and_then(|q| q.get(item))
         .ok_or_else(|| ApiError::NotFound(format!("no open item {item} in {queue}")))
+}
+
+/// Where an extension at `now` ends `lease`: `wanted` from now, but not
+/// before the lease already ends and not after `max` from the claim.
+fn extended_expiry(lease: &Lease, now: i64, wanted: Duration, max: Duration) -> i64 {
+    let asked = now.saturating_add(millis(wanted));
+    let ceiling = lease.claimed_at.saturating_add(millis(max));
+    asked.min(ceiling).max(lease.expires_at)
 }
 
 /// The `data` of a fact about an item under a lease.

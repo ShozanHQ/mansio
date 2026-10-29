@@ -1,7 +1,7 @@
 //! Work items: claim, lease, ack, fail, retry with backoff, the dead topic.
 
 use std::collections::HashSet;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, ensure};
 use mansio_core::EventId;
@@ -9,7 +9,8 @@ use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use tokio::task::JoinSet;
 
-use crate::harness::{PRINCIPAL, SLACK, Target, item_of, job, millis};
+use crate::harness::{PRINCIPAL, SLACK, Target, extended_to, item_of, job, millis};
+use crate::{only_line, run_cli};
 
 const QUEUE: &str = "builds";
 
@@ -479,5 +480,411 @@ async fn the_settings_are_served_and_need_the_token() -> anyhow::Result<()> {
             .to_lowercase()
             .contains("token")
     );
+    Ok(())
+}
+
+// ---- extending a lease -----------------------------------------------------
+
+/// What a comparison of a time the server read with one the test read may be
+/// out by, in milliseconds.
+const ROUNDING: i64 = 50;
+
+/// The lease setting in milliseconds.
+fn lease_millis(target: &Target) -> i64 {
+    i64::try_from(target.lease().as_millis()).unwrap_or(i64::MAX)
+}
+
+/// Where the longest lease from a claim ends: the claim's own expiry is the
+/// claim plus the lease setting.
+fn longest_end(target: &Target, claim: &mansio_core::api::Claimed) -> anyhow::Result<i64> {
+    let max = i64::try_from(target.lease_max().as_millis()).unwrap_or(i64::MAX);
+    Ok(millis(&claim.expires_at)? - lease_millis(target) + max)
+}
+
+/// Done criterion 1: the holder extends its lease, to now plus the lease
+/// setting or to a duration it asks for, and the `extended` fact says where it
+/// ends. Anyone else is refused as for an ack, and nothing changes.
+#[tokio::test]
+async fn the_holder_extends_its_lease_and_anyone_else_is_refused_as_for_an_ack()
+-> anyhow::Result<()> {
+    let target = Target::start().await?;
+    let lease = target.lease().as_secs();
+    ensure!(
+        target.lease_max() >= target.lease() * 3,
+        "the test asks for three leases"
+    );
+    target.work_publish(QUEUE, &job(1)).await?;
+    let started = Instant::now();
+    let claim = target.claim(QUEUE, "worker", SLACK).await?;
+    let item = item_of(&claim)?;
+    let id = claim.lease_id.to_string();
+    let first_end = millis(&claim.expires_at)?;
+
+    // Refused, and none of it changes anything.
+    let stranger = EventId::generate().to_string();
+    let (status, body) = target
+        .extend(QUEUE, &item, "worker", &stranger, None)
+        .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "forbidden");
+    let (status, body) = target.extend(QUEUE, &item, "another", &id, None).await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, _) = target.extend(QUEUE, &item, "worker", "nope", None).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, body) = target.extend(QUEUE, &item, "worker", &id, Some(0)).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let uri = target.tenant_uri(&format!("work/{QUEUE}/items/{item}/extend"));
+    let (status, _) = target.authed(Method::POST, &uri, None).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    for bad in [
+        json!({"lease_id": id, "consumer": "worker", "seconds": "soon"}),
+        json!({"lease_id": id, "consumer": "worker", "seconds": -5}),
+        json!({"lease_id": id, "consumer": "worker", "until": "tomorrow"}),
+    ] {
+        let (status, _) = target.authed(Method::POST, &uri, Some(&bad)).await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    let (status, body) = target
+        .extend(QUEUE, "no-such-item", "worker", &id, None)
+        .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, _) = target
+        .call(
+            Method::POST,
+            &uri,
+            None,
+            Some(&json!({"lease_id": id, "consumer": "worker"})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(target.work_transitions().await?, ["claimed"]);
+
+    // By the lease setting from now: the end moves by how long the holder
+    // waited, no more.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let by_default = target.extend_claim(QUEUE, &claim, None).await?;
+    assert_eq!(
+        by_default.envelope.event_type.as_str(),
+        "mansio.work.extended"
+    );
+    assert_eq!(by_default.envelope.principal.to_string(), PRINCIPAL);
+    assert_eq!(by_default.envelope.item_id, claim.item.item_id);
+    assert_eq!(by_default.envelope.attempt, Some(1));
+    let moved = extended_to(&by_default)? - first_end;
+    assert!(moved >= 100, "the end moved {moved} ms");
+    let waited = i64::try_from(started.elapsed().as_millis())? + ROUNDING;
+    assert!(moved <= waited, "the end moved {moved} ms in {waited} ms");
+
+    // To a duration of its own, from now.
+    let long = target.extend_claim(QUEUE, &claim, Some(lease * 3)).await?;
+    let long_end = extended_to(&long)?;
+    let moved = long_end - first_end;
+    let waited = i64::try_from(started.elapsed().as_millis())? + ROUNDING;
+    assert!(
+        moved >= 2 * lease_millis(&target) && moved <= 2 * lease_millis(&target) + waited,
+        "the end moved {moved} ms"
+    );
+    // Never to an earlier end than the lease already has.
+    let shorter = target.extend_claim(QUEUE, &claim, Some(1)).await?;
+    assert_eq!(extended_to(&shorter)?, long_end);
+
+    // The fact says which lease, whose and where it ends, and not its id.
+    let facts = target.read("facts.work").await?;
+    assert_eq!(
+        target.work_transitions().await?,
+        ["claimed", "extended", "extended", "extended"]
+    );
+    let fact = &facts[1];
+    assert_eq!(fact.item_id, claim.item.item_id);
+    let data = fact.data.as_ref().context("data")?;
+    assert_eq!(data["lease"], claim.lease_id.fingerprint().to_string());
+    assert_eq!(data["holder"], PRINCIPAL);
+    assert_eq!(data["consumer"], "worker");
+    assert_eq!(data["queue"], QUEUE);
+    assert_eq!(data["message_id"], claim.item.id.to_string());
+    for fact in &facts {
+        assert!(!serde_json::to_string(fact)?.contains(&id));
+    }
+    if let Some(recorded) = target.sink_records()? {
+        let in_sink: Vec<_> = recorded
+            .iter()
+            .filter(|e| e.event_type.as_str() == "mansio.work.extended")
+            .map(|e| e.id)
+            .collect();
+        let on_topic: Vec<_> = facts
+            .iter()
+            .filter(|e| e.event_type.as_str() == "mansio.work.extended")
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(in_sink, on_topic, "the sink recorded each extension");
+    }
+
+    // Past where the first lease ended it still holds: nobody else is given
+    // the item, nothing expired, and the holder is told the end it has now.
+    tokio::time::sleep(target.lease() + target.settle()).await;
+    assert!(target.pull(QUEUE, "other").await?.is_none());
+    let held = target
+        .pull(QUEUE, "worker")
+        .await?
+        .context("the lease it holds")?;
+    assert_eq!(held.lease_id, claim.lease_id);
+    assert_eq!(millis(&held.expires_at)?, long_end);
+    assert!(
+        !target
+            .work_transitions()
+            .await?
+            .iter()
+            .any(|t| t == "expired")
+    );
+
+    // It acks once, and a done item is not extended.
+    target.ack_claim(QUEUE, &claim).await?;
+    let (status, _) = target.extend(QUEUE, &item, "worker", &id, None).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+/// An extension after the lease has ended is refused with 409 and changes
+/// nothing. Once another consumer holds the item, the old lease is not the
+/// holder's.
+#[tokio::test]
+async fn an_extension_after_the_lease_has_ended_is_a_409_and_changes_nothing() -> anyhow::Result<()>
+{
+    let target = Target::start().await?;
+    target.work_publish(QUEUE, &job(1)).await?;
+    let first = target.claim(QUEUE, "worker", SLACK).await?;
+    let item = item_of(&first)?;
+
+    tokio::time::sleep(target.lease() + target.settle()).await;
+    let (status, body) = target
+        .extend(
+            QUEUE,
+            &item,
+            "worker",
+            &first.lease_id.to_string(),
+            Some(60),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "conflict");
+    let transitions = target.work_transitions().await?;
+    assert!(
+        !transitions.iter().any(|t| t == "extended"),
+        "{transitions:?}"
+    );
+
+    // The item comes back as the next attempt, and the old lease is not the
+    // new holder's.
+    let wait = target.backoff(1) + SLACK;
+    let second = target.claim(QUEUE, "other", wait).await?;
+    assert_eq!(second.item.attempt, Some(2));
+    let (status, _) = target
+        .extend(
+            QUEUE,
+            &item,
+            "worker",
+            &first.lease_id.to_string(),
+            Some(60),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let extended = target.extend_claim(QUEUE, &second, None).await?;
+    assert_eq!(extended.envelope.attempt, Some(2));
+    target.ack_claim(QUEUE, &second).await?;
+    let transitions = target.work_transitions().await?;
+    assert_eq!(
+        transitions.iter().filter(|t| *t == "extended").count(),
+        1,
+        "{transitions:?}"
+    );
+    Ok(())
+}
+
+/// Done criterion 2: a consumer that extends every half lease keeps an item
+/// for many lease lengths, and acks it once. Nothing else claims it.
+#[tokio::test]
+async fn a_consumer_that_extends_every_half_lease_keeps_its_item_for_many_leases_and_acks_it_once()
+-> anyhow::Result<()> {
+    let target = Target::start().await?;
+    target.work_publish(QUEUE, &job(1)).await?;
+    let claim = target.claim(QUEUE, "worker", SLACK).await?;
+    let lease = target.lease();
+    ensure!(
+        target.lease_max() >= lease * 6,
+        "the test holds the item for five leases"
+    );
+
+    // Extend on a schedule of half leases from the start, so that a slow
+    // answer does not push the next extension later. Hold it for five leases
+    // of wall time, however many extensions that takes on this machine.
+    let started = Instant::now();
+    let half = lease / 2;
+    let mut end = millis(&claim.expires_at)?;
+    let mut extensions = 0_u32;
+    let mut held = Duration::ZERO;
+    while held < lease * 5 {
+        extensions += 1;
+        tokio::time::sleep_until(tokio::time::Instant::from_std(started + half * extensions)).await;
+        let extended = extended_to(&target.extend_claim(QUEUE, &claim, None).await?)?;
+        assert!(extended > end, "the end moved from {end} to {extended}");
+        end = extended;
+        held = started.elapsed();
+        // Nobody else is given it, whatever they ask.
+        assert!(target.pull(QUEUE, "other").await?.is_none());
+    }
+    // Each extension reaches a lease from the time it is made, so holding the
+    // item for a stretch of time takes a count of them that the stretch
+    // fixes: the claim covers the first lease and the rest are extensions.
+    let leases_held = held.as_millis() / lease.as_millis();
+    assert!(
+        u128::from(extensions) + 1 >= leases_held,
+        "{extensions} extensions held it for {held:?}, which is {leases_held} leases"
+    );
+
+    target.ack_claim(QUEUE, &claim).await?;
+    let mut expected = vec!["claimed"];
+    expected.extend(std::iter::repeat_n(
+        "extended",
+        usize::try_from(extensions)?,
+    ));
+    expected.push("acked");
+    assert_eq!(target.work_transitions().await?, expected);
+    assert_eq!(
+        target.read("work.builds").await?.len(),
+        1,
+        "the item was never republished"
+    );
+    Ok(())
+}
+
+/// The longest a lease may run is counted from the claim. An extension that
+/// asks for more is capped there and not refused, and none ever shortens the
+/// lease.
+#[tokio::test]
+async fn an_extension_is_capped_at_the_longest_lease_counted_from_the_claim() -> anyhow::Result<()>
+{
+    let target = Target::start().await?;
+    target.work_publish(QUEUE, &job(1)).await?;
+    let claim = target.claim(QUEUE, "worker", SLACK).await?;
+    let cap = longest_end(&target, &claim)?;
+
+    for seconds in [
+        Some(u64::MAX),
+        Some(target.lease_max().as_secs() * 10),
+        None,
+    ] {
+        let extended = target.extend_claim(QUEUE, &claim, seconds).await?;
+        assert_eq!(extended_to(&extended)?, cap, "asked for {seconds:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // And a short one does not bring it back.
+    let shorter = target.extend_claim(QUEUE, &claim, Some(1)).await?;
+    assert_eq!(extended_to(&shorter)?, cap);
+    target.ack_claim(QUEUE, &claim).await?;
+    Ok(())
+}
+
+/// Done criterion 3: a restarted server keeps the extended lease, and the
+/// longest lease still counts from the claim and not from the restart.
+#[tokio::test]
+async fn a_restarted_server_keeps_the_extended_lease_and_the_longest_lease_from_the_claim()
+-> anyhow::Result<()> {
+    let mut target = Target::start().await?;
+    if !target.is_local() {
+        eprintln!("MANSIO_E2E_URL is set: a live server cannot be restarted from here");
+        return Ok(());
+    }
+    target.work_publish(QUEUE, &job(1)).await?;
+    let first = target.claim(QUEUE, "worker", SLACK).await?;
+    let extended = target
+        .extend_claim(QUEUE, &first, Some(target.lease().as_secs() * 4))
+        .await?;
+    let end = extended_to(&extended)?;
+    assert!(end > millis(&first.expires_at)?);
+
+    target.stop_server().await?;
+    target.start_server().await?;
+
+    // Past where the first lease ended, the extended one holds.
+    tokio::time::sleep(target.lease() + target.settle()).await;
+    assert!(target.pull(QUEUE, "other").await?.is_none());
+    let held = target
+        .pull(QUEUE, "worker")
+        .await?
+        .context("the lease it holds")?;
+    assert_eq!(held.item, first.item);
+    assert_eq!(millis(&held.expires_at)?, end, "the extended end");
+    assert_ne!(held.lease_id, first.lease_id, "a restart cannot say the id");
+
+    // The longest lease counts from the claim.
+    let capped = target.extend_claim(QUEUE, &held, Some(u64::MAX)).await?;
+    assert_eq!(extended_to(&capped)?, longest_end(&target, &first)?);
+    target.ack_claim(QUEUE, &held).await?;
+    assert_eq!(
+        target.work_transitions().await?,
+        ["claimed", "extended", "claimed", "extended", "acked"]
+    );
+    Ok(())
+}
+
+/// Done criterion 4: the command line extends a lease and prints the fact.
+#[tokio::test]
+async fn the_cli_extends_a_lease_and_prints_the_fact() -> anyhow::Result<()> {
+    let target = Target::start().await?;
+    target.work_publish(QUEUE, &job(1)).await?;
+    let claim = target.claim(QUEUE, "worker", SLACK).await?;
+    let item = item_of(&claim)?;
+    let id = claim.lease_id.to_string();
+    let seconds = (target.lease().as_secs() * 3).to_string();
+    let words = |lease: &str, more: &[&str]| -> Vec<String> {
+        [
+            "work",
+            "extend",
+            "--tenant",
+            &target.tenant,
+            "--queue",
+            QUEUE,
+            "--item",
+            &item,
+            "--consumer",
+            "worker",
+            "--lease-id",
+            lease,
+        ]
+        .into_iter()
+        .chain(more.iter().copied())
+        .map(str::to_owned)
+        .collect()
+    };
+
+    let output = run_cli(&target, words(&id, &["--seconds", &seconds])).await?;
+    let fact = only_line(&output)?;
+    assert_eq!(fact["type"], "mansio.work.extended");
+    assert_eq!(fact["itemid"], json!(item));
+    assert_eq!(fact["attempt"], 1);
+    let ends = millis(&serde_json::from_value(fact["data"]["expires_at"].clone())?)?;
+    assert!(ends > millis(&claim.expires_at)?);
+
+    // Without --seconds it is the lease setting, and not earlier than it was.
+    let output = run_cli(&target, words(&id, &[])).await?;
+    let fact = only_line(&output)?;
+    let again = millis(&serde_json::from_value(fact["data"]["expires_at"].clone())?)?;
+    assert_eq!(again, ends, "the lease is not shortened");
+
+    // A lease that is not the holder's is refused, with the reason on stderr.
+    let stranger = EventId::generate().to_string();
+    let output = run_cli(&target, words(&stranger, &[])).await?;
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("403") && stderr.contains("not yours"),
+        "{stderr}"
+    );
+    assert_eq!(
+        target.work_transitions().await?,
+        ["claimed", "extended", "extended"]
+    );
+    target.ack_claim(QUEUE, &claim).await?;
     Ok(())
 }

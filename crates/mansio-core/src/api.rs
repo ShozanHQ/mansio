@@ -56,8 +56,8 @@ pub struct PullRequest {
 }
 
 /// The answer to a `work_pull` that found an item: the item and the lease on
-/// it. The lease holds until `expires_at`; `work_ack` and `work_fail` need
-/// its id.
+/// it. The lease holds until `expires_at`; `work_extend`, `work_ack` and
+/// `work_fail` need its id.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Claimed {
     /// The id to present to acknowledge or fail the item. It is the holder's
@@ -81,6 +81,21 @@ pub struct AckRequest {
     /// The consumer it was claimed as: the holder is the principal, the
     /// consumer and the lease together.
     pub consumer: ConsumerName,
+}
+
+/// The body of `work_extend`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtendRequest {
+    /// The lease the item was claimed under.
+    pub lease_id: LeaseId,
+    /// The consumer it was claimed as.
+    pub consumer: ConsumerName,
+    /// Extend the lease to this many seconds from now, at least 1. Left out,
+    /// `MANSIO_LEASE_SECONDS`. A lease is never shortened, and never runs past
+    /// `MANSIO_LEASE_MAX_SECONDS` after the claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seconds: Option<u64>,
 }
 
 /// The body of `work_fail`.
@@ -201,6 +216,9 @@ pub struct Webhooks {
 pub struct EffectiveSettings {
     /// `MANSIO_LEASE_SECONDS`: how long a claim holds.
     pub lease_seconds: u64,
+    /// `MANSIO_LEASE_MAX_SECONDS`: the longest a lease may be extended to,
+    /// counted from the claim.
+    pub lease_max_seconds: u64,
     /// `MANSIO_MAX_ATTEMPTS`: attempts before an item goes to `dead`.
     pub max_attempts: u32,
     /// `MANSIO_BACKOFF_BASE_SECONDS`: the wait after the first failure.

@@ -48,11 +48,20 @@ impl Default for Limits {
     }
 }
 
+/// The longest a lease, or the longest a lease may be extended to, can be set
+/// to: ten years. A lease is an absolute time in the facts, and one far enough
+/// away would pass the range of an RFC 3339 timestamp, which a restart could
+/// not read back as it was.
+pub const MAX_LEASE: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
+
 /// How the work and alert engine behaves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkSettings {
     /// How long a claim holds (`MANSIO_LEASE_SECONDS`).
     pub lease: Duration,
+    /// The longest a lease may be extended to, counted from the claim
+    /// (`MANSIO_LEASE_MAX_SECONDS`).
+    pub lease_max: Duration,
     /// Attempts an item gets before it goes to `dead`
     /// (`MANSIO_MAX_ATTEMPTS`).
     pub max_attempts: u32,
@@ -74,6 +83,7 @@ impl Default for WorkSettings {
     fn default() -> Self {
         Self {
             lease: Duration::from_secs(300),
+            lease_max: Duration::from_secs(86_400),
             max_attempts: 5,
             backoff_base: Duration::from_secs(5),
             backoff_cap: Duration::from_secs(300),
@@ -96,6 +106,24 @@ impl WorkSettings {
         };
         if self.lease < Duration::from_secs(1) {
             return Err(invalid("MANSIO_LEASE_SECONDS", "must be at least 1"));
+        }
+        if self.lease > MAX_LEASE {
+            return Err(invalid(
+                "MANSIO_LEASE_SECONDS",
+                "must be at most 315360000 (ten years)",
+            ));
+        }
+        if self.lease_max > MAX_LEASE {
+            return Err(invalid(
+                "MANSIO_LEASE_MAX_SECONDS",
+                "must be at most 315360000 (ten years)",
+            ));
+        }
+        if self.lease_max < self.lease {
+            return Err(invalid(
+                "MANSIO_LEASE_MAX_SECONDS",
+                "must be at least MANSIO_LEASE_SECONDS",
+            ));
         }
         if self.max_attempts == 0 {
             return Err(invalid("MANSIO_MAX_ATTEMPTS", "must be at least 1"));
@@ -396,6 +424,7 @@ impl Settings {
         let work_defaults = WorkSettings::default();
         let work = WorkSettings {
             lease: env.seconds("MANSIO_LEASE_SECONDS", work_defaults.lease)?,
+            lease_max: env.seconds("MANSIO_LEASE_MAX_SECONDS", work_defaults.lease_max)?,
             max_attempts: env.parse("MANSIO_MAX_ATTEMPTS", work_defaults.max_attempts)?,
             backoff_base: env.seconds("MANSIO_BACKOFF_BASE_SECONDS", work_defaults.backoff_base)?,
             backoff_cap: env.seconds("MANSIO_BACKOFF_CAP_SECONDS", work_defaults.backoff_cap)?,
@@ -708,6 +737,7 @@ mod tests {
     fn the_defaults_for_work_are_the_documented_ones() {
         let work = WorkSettings::default();
         assert_eq!(work.lease, Duration::from_secs(300));
+        assert_eq!(work.lease_max, Duration::from_secs(86_400));
         assert_eq!(work.max_attempts, 5);
         assert_eq!(work.backoff_base, Duration::from_secs(5));
         assert_eq!(work.backoff_cap, Duration::from_secs(300));
@@ -722,6 +752,7 @@ mod tests {
             ("MANSIO_TOKEN", "t"),
             ("MANSIO_BROKER", "memory"),
             ("MANSIO_LEASE_SECONDS", "2"),
+            ("MANSIO_LEASE_MAX_SECONDS", "60"),
             ("MANSIO_MAX_ATTEMPTS", "3"),
             ("MANSIO_BACKOFF_BASE_SECONDS", "1"),
             ("MANSIO_BACKOFF_CAP_SECONDS", "4"),
@@ -733,6 +764,7 @@ mod tests {
             settings.work,
             WorkSettings {
                 lease: Duration::from_secs(2),
+                lease_max: Duration::from_secs(60),
                 max_attempts: 3,
                 backoff_base: Duration::from_secs(1),
                 backoff_cap: Duration::from_secs(4),
@@ -746,6 +778,12 @@ mod tests {
     fn work_settings_that_do_not_fit_are_refused_by_name() {
         for (name, value) in [
             ("MANSIO_LEASE_SECONDS", "0"),
+            ("MANSIO_LEASE_MAX_SECONDS", "soon"),
+            // Past ten years, where a lease would pass the range of a time.
+            ("MANSIO_LEASE_SECONDS", "315360001"),
+            ("MANSIO_LEASE_MAX_SECONDS", "315360001"),
+            ("MANSIO_LEASE_MAX_SECONDS", "18446744073709551615"),
+            ("MANSIO_LEASE_SECONDS", "18446744073709551615"),
             ("MANSIO_MAX_ATTEMPTS", "0"),
             ("MANSIO_BACKOFF_BASE_SECONDS", "0"),
             ("MANSIO_ALERT_RESURFACE_SECONDS", "0"),
@@ -764,6 +802,21 @@ mod tests {
                 "{name}={value}: {error:?}"
             );
         }
+        // The longest lease may not be below the lease.
+        let error = settings(&[
+            ("MANSIO_TOKEN", "t"),
+            ("MANSIO_BROKER", "memory"),
+            ("MANSIO_LEASE_SECONDS", "30"),
+            ("MANSIO_LEASE_MAX_SECONDS", "29"),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SettingsError::Invalid {
+                name: "MANSIO_LEASE_MAX_SECONDS",
+                ..
+            }
+        ));
         // The cap may not be below the base.
         let error = settings(&[
             ("MANSIO_TOKEN", "t"),
@@ -779,6 +832,34 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_lease_of_ten_years_is_accepted_and_its_end_is_still_a_time() {
+        let settings = settings(&[
+            ("MANSIO_TOKEN", "t"),
+            ("MANSIO_BROKER", "memory"),
+            ("MANSIO_LEASE_SECONDS", "315360000"),
+            ("MANSIO_LEASE_MAX_SECONDS", "315360000"),
+        ])
+        .unwrap();
+        assert_eq!(settings.work.lease, MAX_LEASE);
+        assert_eq!(settings.work.lease_max, MAX_LEASE);
+        // Ten years from a date well after now still reads back from a fact.
+        let ceiling = i64::try_from(MAX_LEASE.as_millis()).unwrap();
+        assert!(mansio_core::Timestamp::from_unix_millis(4_000_000_000_000 + ceiling).is_ok());
+        // One second more is refused, naming the variable.
+        let error = self::settings(&[
+            ("MANSIO_TOKEN", "t"),
+            ("MANSIO_BROKER", "memory"),
+            ("MANSIO_LEASE_MAX_SECONDS", "315360001"),
+        ])
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("MANSIO_LEASE_MAX_SECONDS"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("ten years"), "{error}");
     }
 
     #[test]

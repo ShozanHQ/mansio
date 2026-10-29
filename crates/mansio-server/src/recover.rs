@@ -162,7 +162,19 @@ fn newest_versions(messages: &[Stored]) -> Vec<(ItemId, &Stored)> {
     versions
 }
 
-fn lease_of(data: &WorkFact, now: i64) -> Option<Lease> {
+/// The lease an attempt stands under, from the facts recorded for it. The
+/// holder and the lease are those of the last `claimed` or `extended`, and so
+/// is the end of the lease, which each extension moved later. The lease began
+/// at the first `claimed`: a second one is the same lease given a new id by a
+/// restarted server.
+fn lease_of(recorded: &[&Fact], now: i64) -> Option<Lease> {
+    let held = |fact: &&&Fact| matches!(fact.event, WorkEvent::Claimed | WorkEvent::Extended);
+    let latest = recorded.iter().rev().find(held)?;
+    let first = recorded
+        .iter()
+        .find(|fact| fact.event == WorkEvent::Claimed)
+        .unwrap_or(latest);
+    let data = &latest.data;
     Some(Lease {
         fingerprint: data.lease?,
         id: None,
@@ -172,6 +184,7 @@ fn lease_of(data: &WorkFact, now: i64) -> Option<Lease> {
             .expires_at
             .as_ref()
             .map_or(now, |at| millis(Some(at), now)),
+        claimed_at: first.at,
     })
 }
 
@@ -207,8 +220,8 @@ impl Replay<'_> {
         let phase = match last.event {
             WorkEvent::Retried => Phase::Ready,
             WorkEvent::Acked | WorkEvent::Dead => return Ok(None),
-            WorkEvent::Claimed => {
-                lease_of(&last.data, self.now).map_or(Phase::Ready, Phase::Leased)
+            WorkEvent::Claimed | WorkEvent::Extended => {
+                lease_of(recorded, self.now).map_or(Phase::Ready, Phase::Leased)
             }
             WorkEvent::Failed | WorkEvent::Expired => match last.data.next {
                 Some(Next::Dead) => self.dead_phase(queue, item, message, last.at)?,

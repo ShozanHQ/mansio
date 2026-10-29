@@ -24,7 +24,7 @@ pub enum Chosen {
 const GROUPS: [(&str, &str); 5] = [
     (
         "work",
-        "Work items: publish, claim, complete and fail them.",
+        "Work items: publish, claim, extend, complete and fail them.",
     ),
     ("alerts", "Alerts: publish and acknowledge them."),
     (

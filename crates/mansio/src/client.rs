@@ -4,7 +4,8 @@
 //! could not be made, because nothing was sent, and for a request that is safe
 //! to repeat also when the answer may have been lost on the way. A request is
 //! safe to repeat if doing it twice leaves the same state as doing it once, as
-//! a read, a `work_pull` (which returns the lease a consumer already holds)
+//! a read, a `work_pull` (which returns the lease a consumer already holds), a
+//! `work_extend` (which leaves the lease running to the later of the two ends)
 //! and a `consumers_commit` do.
 
 use std::time::Duration;

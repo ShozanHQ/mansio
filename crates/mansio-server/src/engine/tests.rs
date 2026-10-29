@@ -16,6 +16,7 @@ const START: i64 = 1_792_000_000_000;
 fn settings() -> WorkSettings {
     WorkSettings {
         lease: Duration::from_secs(10),
+        lease_max: Duration::from_secs(120),
         max_attempts: 3,
         backoff_base: Duration::from_secs(2),
         backoff_cap: Duration::from_secs(5),
@@ -332,6 +333,28 @@ impl Rig {
                     lease_id: lease,
                 },
                 "it broke",
+            )
+            .await
+    }
+
+    async fn extend(
+        &self,
+        who: &str,
+        item: &ItemId,
+        lease: &LeaseId,
+        seconds: Option<u64>,
+    ) -> Result<Published, ApiError> {
+        self.engine
+            .work_extend(
+                &tenant(),
+                &queue(),
+                item,
+                Holder {
+                    principal: &agent(who),
+                    consumer: &taken_as(lease),
+                    lease_id: lease,
+                },
+                seconds.map(Duration::from_secs),
             )
             .await
     }
@@ -1808,6 +1831,9 @@ async fn no_fact_and_no_sink_record_holds_a_lease_id() {
     rig.fail("one", &item, &first.lease_id).await.unwrap();
     rig.pass(100).await;
     let second = rig.pull("one").await.unwrap();
+    rig.extend("one", &item, &second.lease_id, None)
+        .await
+        .unwrap();
     rig.pass(100).await; // the second lease expires unanswered
     rig.pass(10).await; // and its backoff passes
     let third = rig.pull("one").await.unwrap();
@@ -1815,7 +1841,7 @@ async fn no_fact_and_no_sink_record_holds_a_lease_id() {
 
     let facts = rig.read(&Topic::facts_work()).await;
     let transitions = rig.transitions().await;
-    for kind in ["claimed", "failed", "expired", "acked"] {
+    for kind in ["claimed", "extended", "failed", "expired", "acked"] {
         assert!(
             transitions.iter().any(|t| t == kind),
             "{kind} in {transitions:?}"
@@ -1841,6 +1867,7 @@ async fn no_fact_and_no_sink_record_holds_a_lease_id() {
         .filter_map(|fact| data(fact)["lease"].as_str().map(str::to_owned))
         .collect();
     assert!(leased.contains(&first.lease_id.fingerprint().to_string()));
+    assert!(leased.contains(&second.lease_id.fingerprint().to_string()));
     assert!(leased.contains(&third.lease_id.fingerprint().to_string()));
 }
 
@@ -1873,4 +1900,445 @@ async fn another_consumer_of_the_same_principal_cannot_ack_or_fail_the_lease() {
     }
     assert_eq!(rig.sink.all().len(), before, "a refusal records nothing");
     rig.ack("one", &item, &claim.lease_id).await.unwrap();
+}
+
+// ---- extending a lease -----------------------------------------------------
+
+/// Where the lease ends, as an `extended` fact says.
+fn ends_at(fact: &Envelope) -> i64 {
+    serde_json::from_value::<Timestamp>(data(fact)["expires_at"].clone())
+        .unwrap()
+        .unix_millis()
+        .unwrap()
+}
+
+fn secs_after_start(seconds: i64) -> i64 {
+    START + seconds * 1000
+}
+
+#[tokio::test]
+async fn the_holder_extends_its_lease_and_the_new_end_is_recorded() {
+    let rig = Rig::new();
+    let item = rig.publish_item("job").await;
+    let claim = rig.pull_as("one", "worker").await.unwrap();
+    assert_eq!(claim.expires_at.unix_millis(), Some(secs_after_start(10)));
+
+    // By the lease setting from now.
+    rig.clock.advance(Duration::from_secs(5));
+    let extended = rig
+        .extend("one", &item, &claim.lease_id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        extended.envelope.event_type.as_str(),
+        "mansio.work.extended"
+    );
+    assert_eq!(extended.envelope.principal, agent("one"));
+    assert_eq!(extended.envelope.item_id, Some(item.clone()));
+    assert_eq!(extended.envelope.attempt, Some(1));
+    assert_eq!(ends_at(&extended.envelope), secs_after_start(15));
+    let fact = data(&extended.envelope);
+    assert_eq!(fact["queue"], "builds");
+    assert_eq!(fact["holder"], "agent:one");
+    assert_eq!(fact["consumer"], "worker");
+    assert_eq!(fact["lease"], claim.lease_id.fingerprint().to_string());
+    assert_eq!(fact["message_id"], claim.item.id.to_string());
+
+    // The sink has it, and it is the fact on the topic.
+    let facts = rig.read(&Topic::facts_work()).await;
+    assert_eq!(facts.last(), Some(&extended.envelope));
+    let recorded = rig.sink.all_envelopes();
+    let in_sink = recorded
+        .iter()
+        .find(|e| e.id == extended.envelope.id)
+        .expect("the sink recorded the fact");
+    assert_eq!(ends_at(in_sink), secs_after_start(15));
+
+    // The holder is told the new end when it asks for its lease again, and
+    // nobody else can take the item at the old end.
+    let again = rig.pull_as("one", "worker").await.unwrap();
+    assert_eq!(again.lease_id, claim.lease_id);
+    assert_eq!(again.expires_at.unix_millis(), Some(secs_after_start(15)));
+    rig.pass(6).await;
+    assert!(rig.pull("two").await.is_none());
+    assert_eq!(rig.transitions().await, ["claimed", "extended"]);
+
+    // A duration of its own counts from now.
+    let extended = rig
+        .extend("one", &item, &claim.lease_id, Some(40))
+        .await
+        .unwrap();
+    assert_eq!(ends_at(&extended.envelope), secs_after_start(11 + 40));
+    // An extension never shortens a lease.
+    let extended = rig
+        .extend("one", &item, &claim.lease_id, Some(1))
+        .await
+        .unwrap();
+    assert_eq!(ends_at(&extended.envelope), secs_after_start(11 + 40));
+
+    // Acking ends it as ever, with the extended lease's fingerprint.
+    let acked = rig.ack("one", &item, &claim.lease_id).await.unwrap();
+    assert_eq!(ends_at(&acked.envelope), secs_after_start(11 + 40));
+    assert_eq!(
+        rig.transitions().await,
+        ["claimed", "extended", "extended", "extended", "acked"]
+    );
+}
+
+#[tokio::test]
+async fn anyone_but_the_holder_is_refused_an_extension_as_for_an_ack_and_nothing_changes() {
+    let rig = Rig::new();
+    let item = rig.publish_item("job").await;
+    let claim = rig.pull_as("one", "worker").await.unwrap();
+    let before = rig.sink.all().len();
+
+    let stranger = LeaseId::generate();
+    assert!(matches!(
+        rig.extend("one", &item, &stranger, None).await,
+        Err(ApiError::Forbidden(_))
+    ));
+    // Someone else with the right lease id.
+    assert!(matches!(
+        rig.extend("two", &item, &claim.lease_id, None).await,
+        Err(ApiError::Forbidden(_))
+    ));
+    // The same principal under another consumer name.
+    let principal = agent("one");
+    let other = consumer("worker-2");
+    let refused = rig
+        .engine
+        .work_extend(
+            &tenant(),
+            &queue(),
+            &item,
+            Holder {
+                principal: &principal,
+                consumer: &other,
+                lease_id: &claim.lease_id,
+            },
+            None,
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(ApiError::Forbidden(_))),
+        "{refused:?}"
+    );
+    let unknown: ItemId = "no-such-item".parse().unwrap();
+    assert!(matches!(
+        rig.extend("one", &unknown, &claim.lease_id, None).await,
+        Err(ApiError::NotFound(_))
+    ));
+    assert_eq!(rig.sink.all().len(), before, "a refusal records nothing");
+    assert_eq!(rig.transitions().await, ["claimed"]);
+
+    // None of it moved the end: the item is expired and claimed again on time.
+    rig.pass(10).await;
+    rig.pass(2).await;
+    assert_eq!(
+        rig.transitions().await,
+        ["claimed", "expired", "retried"],
+        "the lease ended when it was given to"
+    );
+}
+
+#[tokio::test]
+async fn a_lease_that_has_ended_is_not_extended_and_neither_is_one_nobody_holds() {
+    let rig = Rig::new();
+    let item = rig.publish_item("job").await;
+    let claim = rig.pull_as("one", "worker").await.unwrap();
+
+    // The end has passed and the timer has not yet noticed: 409, and the
+    // item is not saved.
+    rig.clock.advance(Duration::from_secs(10));
+    assert!(matches!(
+        rig.extend("one", &item, &claim.lease_id, None).await,
+        Err(ApiError::Conflict(_))
+    ));
+    assert_eq!(rig.transitions().await, ["claimed"]);
+    rig.engine.tick().await;
+    assert_eq!(rig.transitions().await, ["claimed", "expired"]);
+
+    // Waiting out its backoff: nobody holds it.
+    assert!(matches!(
+        rig.extend("one", &item, &claim.lease_id, None).await,
+        Err(ApiError::Conflict(_))
+    ));
+    rig.pass(2).await;
+    assert!(matches!(
+        rig.extend("one", &item, &claim.lease_id, None).await,
+        Err(ApiError::Conflict(_))
+    ));
+
+    // Once it is done it is gone.
+    let second = rig.pull_as("two", "worker").await.unwrap();
+    rig.ack("two", &item, &second.lease_id).await.unwrap();
+    assert!(matches!(
+        rig.extend("two", &item, &second.lease_id, None).await,
+        Err(ApiError::NotFound(_))
+    ));
+    assert_eq!(
+        rig.transitions().await,
+        ["claimed", "expired", "retried", "claimed", "acked"]
+    );
+}
+
+#[tokio::test]
+async fn an_extension_is_capped_at_the_longest_lease_counted_from_the_claim() {
+    let rig = Rig::new();
+    let item = rig.publish_item("job").await;
+    let claim = rig.pull_as("one", "worker").await.unwrap();
+    let cap = secs_after_start(120);
+
+    // Asking for more than there is to give is capped, not refused.
+    rig.clock.advance(Duration::from_secs(5));
+    let extended = rig
+        .extend("one", &item, &claim.lease_id, Some(1_000_000))
+        .await
+        .unwrap();
+    assert_eq!(ends_at(&extended.envelope), cap);
+    let huge = rig
+        .extend("one", &item, &claim.lease_id, Some(u64::MAX))
+        .await
+        .unwrap();
+    assert_eq!(ends_at(&huge.envelope), cap);
+
+    // Extending again, later, does not move the cap, which is from the claim.
+    rig.clock.advance(Duration::from_secs(100));
+    let near = rig
+        .extend("one", &item, &claim.lease_id, None)
+        .await
+        .unwrap();
+    assert_eq!(ends_at(&near.envelope), cap, "10 s more would be 115 s");
+    rig.clock.advance(Duration::from_secs(10));
+    let last = rig
+        .extend("one", &item, &claim.lease_id, None)
+        .await
+        .unwrap();
+    assert_eq!(ends_at(&last.envelope), cap);
+
+    // At the cap the lease ends like any other: the holder is refused and the
+    // timer expires the item.
+    rig.clock.advance(Duration::from_secs(5));
+    assert!(matches!(
+        rig.extend("one", &item, &claim.lease_id, None).await,
+        Err(ApiError::Conflict(_))
+    ));
+    rig.engine.tick().await;
+    assert_eq!(
+        rig.transitions().await,
+        [
+            "claimed", "extended", "extended", "extended", "extended", "expired"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_consumer_that_extends_every_half_lease_keeps_its_item_for_many_leases_and_acks_it_once()
+{
+    let rig = Rig::new();
+    let item = rig.publish_item("build").await;
+    let claim = rig.pull_as("one", "worker").await.unwrap();
+
+    // Ten lease lengths, each half lease extended. Nobody else is given it,
+    // and it is not expired, however often the timer looks.
+    for half in 1..=20 {
+        rig.pass(5).await;
+        assert!(
+            rig.pull_as("two", "other").await.is_none(),
+            "another consumer was given the item at half lease {half}"
+        );
+        rig.extend("one", &item, &claim.lease_id, None)
+            .await
+            .unwrap();
+    }
+    let transitions = rig.transitions().await;
+    assert_eq!(transitions.len(), 21, "{transitions:?}");
+    assert_eq!(transitions[0], "claimed");
+    assert!(transitions[1..].iter().all(|t| t == "extended"));
+
+    // And it acks it once.
+    rig.ack("one", &item, &claim.lease_id).await.unwrap();
+    assert!(matches!(
+        rig.ack("one", &item, &claim.lease_id).await,
+        Err(ApiError::NotFound(_))
+    ));
+    assert_eq!(rig.transitions().await.last().unwrap(), "acked");
+    assert_eq!(
+        rig.read(&Topic::Work(queue())).await.len(),
+        1,
+        "the item was never republished"
+    );
+}
+
+#[tokio::test]
+async fn a_restart_keeps_the_extended_lease_and_the_cap_counted_from_the_claim() {
+    let rig = Rig::new();
+    let item = rig.publish_item("job").await;
+    let claim = rig.pull_as("one", "worker").await.unwrap();
+    rig.pass(5).await;
+    rig.extend("one", &item, &claim.lease_id, None)
+        .await
+        .unwrap();
+    rig.pass(5).await;
+    let extended = rig
+        .extend("one", &item, &claim.lease_id, Some(20))
+        .await
+        .unwrap();
+    assert_eq!(ends_at(&extended.envelope), secs_after_start(30));
+
+    // The replay takes the latest end: the lease first ran out at 10 s, and
+    // the first extension ended it at 15 s.
+    let rig = rig.restart().await;
+    rig.pass(10).await; // 20 s
+    assert!(rig.pull("two").await.is_none());
+    assert_eq!(rig.transitions().await, ["claimed", "extended", "extended"]);
+
+    // The holder is recognised by what the facts hold, and its lease runs to
+    // the end it was extended to.
+    let again = rig.pull_as("one", "worker").await.unwrap();
+    assert_eq!(again.item, claim.item);
+    assert_eq!(again.expires_at.unix_millis(), Some(secs_after_start(30)));
+    assert_ne!(
+        again.lease_id, claim.lease_id,
+        "a restart cannot say the id"
+    );
+
+    // The cap is still counted from the claim, not from the restart.
+    let capped = rig
+        .extend("one", &item, &again.lease_id, Some(1_000_000))
+        .await
+        .unwrap();
+    assert_eq!(ends_at(&capped.envelope), secs_after_start(120));
+
+    // And that holds across another restart, with the new lease's fingerprint.
+    let rig = rig.restart().await;
+    rig.pass(90).await; // 110 s
+    assert!(rig.pull("two").await.is_none());
+    let more = rig
+        .extend("one", &item, &again.lease_id, Some(1_000_000))
+        .await
+        .unwrap();
+    assert_eq!(ends_at(&more.envelope), secs_after_start(120));
+    rig.pass(10).await; // 120 s: ended
+    assert_eq!(
+        rig.transitions().await.last().map(String::as_str),
+        Some("expired")
+    );
+}
+
+#[tokio::test]
+async fn a_restart_finds_a_lease_that_was_extended_and_then_ran_out_expired_once() {
+    let rig = Rig::new();
+    let item = rig.publish_item("job").await;
+    let claim = rig.pull_as("one", "worker").await.unwrap();
+    rig.pass(8).await;
+    rig.extend("one", &item, &claim.lease_id, None)
+        .await
+        .unwrap();
+
+    // Down past the original end but not the extended one: still held. The
+    // old id still works, as the fingerprint is the same.
+    let rig = rig.restart().await;
+    rig.pass(5).await; // 13 s
+    assert!(rig.pull("two").await.is_none());
+    rig.extend("one", &item, &claim.lease_id, None)
+        .await
+        .unwrap();
+
+    // Down past the extended end: expired on start, once.
+    let rig = rig.restart().await;
+    rig.pass(20).await;
+    rig.pass(2).await;
+    assert_eq!(
+        rig.transitions().await,
+        ["claimed", "extended", "extended", "expired", "retried"]
+    );
+}
+
+#[tokio::test]
+async fn an_extension_that_cannot_be_recorded_changes_nothing() {
+    let rig = Rig::new();
+    let item = rig.publish_item("job").await;
+    let claim = rig.pull_as("one", "worker").await.unwrap();
+    rig.pass(5).await;
+
+    rig.broker.refuse("mansio.work.extended");
+    let refused = rig.extend("one", &item, &claim.lease_id, None).await;
+    assert!(
+        matches!(refused, Err(ApiError::BadGateway(_))),
+        "{refused:?}"
+    );
+    rig.broker.fail("mansio.work.extended");
+    let refused = rig.extend("one", &item, &claim.lease_id, None).await;
+    assert!(
+        matches!(refused, Err(ApiError::Unavailable(_))),
+        "{refused:?}"
+    );
+    rig.broker.heal();
+    assert_eq!(rig.transitions().await, ["claimed"]);
+    // The sink is written first: it has both attempts, which the topic does
+    // not, as it does for every transition.
+    assert_eq!(rig.sink.topic("facts.work").len(), 3);
+
+    // The lease ends where it did.
+    rig.pass(5).await;
+    assert_eq!(rig.transitions().await, ["claimed", "expired"]);
+}
+
+#[tokio::test]
+async fn an_extension_that_was_stored_but_errored_still_extends_the_lease() {
+    let rig = Rig::new();
+    let item = rig.publish_item("job").await;
+    let claim = rig.pull_as("one", "worker").await.unwrap();
+    rig.pass(5).await;
+
+    rig.broker.lose_the_answer("mansio.work.extended");
+    let refused = rig.extend("one", &item, &claim.lease_id, None).await;
+    assert!(matches!(refused, Err(ApiError::Unavailable(_))));
+
+    // The state is rebuilt from the logs, which have the extension: the lease
+    // runs to 15 s, and the holder is still the holder.
+    rig.pass(7).await;
+    assert_eq!(rig.transitions().await, ["claimed", "extended"]);
+    assert!(rig.pull("two").await.is_none());
+    rig.ack("one", &item, &claim.lease_id).await.unwrap();
+}
+
+/// The longest lease is counted from the claim, and a restart finds the claim
+/// in the `claimed` fact. A clock that moves between two reads must not put
+/// the fact a millisecond after the moment the lease says it began.
+#[tokio::test]
+async fn a_fresh_claim_is_recorded_at_the_moment_its_lease_began_and_the_cap_survives_a_restart() {
+    let rig = Rig::over(
+        Arc::default(),
+        Arc::default(),
+        Arc::new(ManualClock::ticking(START)),
+    );
+    let item = rig.publish_item("job").await;
+    let claim = rig.pull_as("one", "worker").await.unwrap();
+    let claimed_at = claim.expires_at.unix_millis().unwrap() - 10_000;
+
+    let facts = rig.read(&Topic::facts_work()).await;
+    assert_eq!(
+        facts[0].time.as_ref().and_then(Timestamp::unix_millis),
+        Some(claimed_at),
+        "the claimed fact is timed at the claim"
+    );
+
+    let rig = rig.restart().await;
+    let capped = rig
+        .extend("one", &item, &claim.lease_id, Some(1_000_000))
+        .await
+        .unwrap();
+    assert_eq!(ends_at(&capped.envelope), claimed_at + 120_000);
+
+    // A lease read back and given a new id is recorded again, and the cap
+    // still counts from the first claim.
+    let rig = rig.restart().await;
+    let again = rig.pull_as("one", "worker").await.unwrap();
+    let capped = rig
+        .extend("one", &item, &again.lease_id, Some(1_000_000))
+        .await
+        .unwrap();
+    assert_eq!(ends_at(&capped.envelope), claimed_at + 120_000);
 }
