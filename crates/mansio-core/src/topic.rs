@@ -95,6 +95,33 @@ impl Topic {
         Topic::Facts(Segment::known("alert"))
     }
 
+    /// `facts.principal`: where mansio records every credential it issues
+    /// and revokes.
+    #[must_use]
+    pub fn facts_principal() -> Self {
+        Topic::Facts(Segment::known("principal"))
+    }
+
+    /// `work.approvals`: the queue of items a person approves.
+    #[must_use]
+    pub fn work_approvals() -> Self {
+        Topic::Work(Segment::known("approvals"))
+    }
+
+    /// Whether only mansio writes the topic: the transitions it records
+    /// (`facts.work`, `facts.alert`), the credentials it issues and revokes
+    /// (`facts.principal`), and the items it gives up on (`dead`). Nobody
+    /// publishes to these, whatever their scopes, and so no scope grants
+    /// `publish` on one. Work items are written through `work_publish`, which
+    /// sets what a caller may not, and so are not among them.
+    #[must_use]
+    pub fn is_written_by_mansio(&self) -> bool {
+        *self == Topic::Dead
+            || *self == Topic::facts_work()
+            || *self == Topic::facts_alert()
+            || *self == Topic::facts_principal()
+    }
+
     /// Whether what is published here is durable, and so goes through the
     /// sink first. Everything is, except `presence`.
     #[must_use]
@@ -232,6 +259,43 @@ mod tests {
             "facts.alert".parse::<Topic>().unwrap(),
             Topic::facts_alert()
         );
+    }
+
+    #[test]
+    fn the_credential_topics_are_facts_principal_and_work_approvals() {
+        assert_eq!(Topic::facts_principal().to_string(), "facts.principal");
+        assert_eq!(Topic::work_approvals().to_string(), "work.approvals");
+        assert_eq!(
+            "facts.principal".parse::<Topic>().unwrap(),
+            Topic::facts_principal()
+        );
+        assert_eq!(
+            "work.approvals".parse::<Topic>().unwrap(),
+            Topic::work_approvals()
+        );
+    }
+
+    #[test]
+    fn the_topics_only_mansio_writes_are_its_facts_and_dead() {
+        for name in ["facts.work", "facts.alert", "facts.principal", "dead"] {
+            assert!(
+                name.parse::<Topic>().unwrap().is_written_by_mansio(),
+                "{name}"
+            );
+        }
+        for name in [
+            "facts.build",
+            "facts.signal",
+            "work.builds",
+            "work.approvals",
+            "alerts",
+            "presence",
+        ] {
+            assert!(
+                !name.parse::<Topic>().unwrap().is_written_by_mansio(),
+                "{name}"
+            );
+        }
     }
 
     #[test]

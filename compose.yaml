@@ -2,26 +2,40 @@
 #
 #   docker compose up --build --wait
 #
+# mansio-server never acts as Iggy's root user. A one-shot service, iggy-admin,
+# signs in as root once and makes the Iggy user mansio-server acts as: it manages
+# users and streams and reads and writes topics, and nothing else. Only Iggy and
+# iggy-admin are given the root password.
+#
 # The credentials below are DEVELOPMENT DEFAULTS. They are fine on a machine
 # you trust and nowhere else. To use your own, set the variables in the
 # environment or in a .env file next to this one:
 #
-#   MANSIO_TOKEN         the bearer token clients present to mansio-server
-#   IGGY_ROOT_USERNAME   the Iggy admin user, shared by Iggy and mansio-server
+#   MANSIO_TOKEN         the admin bearer token clients present to mansio-server
+#   IGGY_ROOT_USERNAME   Iggy's root user, for Iggy and iggy-admin only
 #   IGGY_ROOT_PASSWORD   its password; Iggy sets it on first start only, so
 #                        change it before the first start or remove the
 #                        iggy-data volume
+#   MANSIO_IGGY_USERNAME the Iggy user mansio-server acts as
+#   MANSIO_IGGY_PASSWORD its password; set when iggy-admin makes the user, so
+#                        change it before the first start or remove the
+#                        iggy-data volume
 #
-# The work settings, and a few more that tests turn down, can be set the same
-# way. Empty means the default:
+# The work and credential settings, and a few more that tests turn down, can be
+# set the same way. Empty means the default:
 #
 #   MANSIO_LEASE_SECONDS, MANSIO_MAX_ATTEMPTS, MANSIO_BACKOFF_BASE_SECONDS,
 #   MANSIO_BACKOFF_CAP_SECONDS, MANSIO_ALERT_RESURFACE_SECONDS,
 #   MANSIO_TICK_MILLIS, MANSIO_POLL_DEFAULT_COUNT, MANSIO_POLL_MAX_COUNT,
-#   MANSIO_IGGY_SEGMENT_SIZE_BYTES, MANSIO_RETENTION_ALERTS_SECONDS
+#   MANSIO_IGGY_SEGMENT_SIZE_BYTES, MANSIO_RETENTION_ALERTS_SECONDS,
+#   MANSIO_AGENT_CREDENTIAL_TTL_SECONDS, MANSIO_CREDENTIAL_RECHECK_SECONDS,
+#   MANSIO_CREDENTIAL_SWEEP_SECONDS
 #
 # On start mansio-server replays the topics of every tenant before it answers
 # anything, /healthz included, so a big log keeps /healthz dark for a while.
+# If the registry of principals cannot be loaded (the broker could not be read,
+# or a record of it cannot) /healthz answers 503 "degraded", so the health
+# check fails and the stack is not healthy: the cause is in the server's log.
 # Docker ignores failed health checks during the start period of the check
 # (60s here), and the first one that passes ends it. For a log that takes
 # longer to replay than that, set MANSIO_HEALTH_START_PERIOD, for example 5m.
@@ -34,7 +48,9 @@
 # MANSIO_SINK_DIR to an absolute path the container's user (uid 10001) can
 # write to.
 #
-# Only mansio-server is published, and only on loopback.
+# mansio-server and Iggy's TCP port are published, and only on loopback. The
+# end-to-end tests ask Iggy itself what a credential may do, which needs the
+# port; set IGGY_PORT if 8090 is taken.
 
 name: mansio
 
@@ -60,6 +76,8 @@ services:
       IGGY_TCP_ADDRESS: 0.0.0.0:8090
       # The name other containers reach it by.
       IGGY_NODE_ADVERTISED_ADDRESS: iggy
+    ports:
+      - "127.0.0.1:${IGGY_PORT:-8090}:8090"
     volumes:
       - iggy-data:/app/local_data
     healthcheck:
@@ -69,21 +87,40 @@ services:
       retries: 30
       start_period: 2s
 
-  mansio-server:
-    build:
+  # Runs once and stops: makes the Iggy user mansio-server acts as, or sets its
+  # permissions again if it exists.
+  iggy-admin:
+    build: &mansio-build
       context: .
       dockerfile: Dockerfile
+    image: mansio-server:dev
+    command: ["provision-admin"]
+    restart: "no"
+    depends_on:
+      iggy:
+        condition: service_healthy
+    environment:
+      MANSIO_IGGY_ADDRESS: iggy:8090
+      IGGY_ROOT_USERNAME: ${IGGY_ROOT_USERNAME:-iggy}
+      IGGY_ROOT_PASSWORD: ${IGGY_ROOT_PASSWORD:-iggy}
+      MANSIO_IGGY_USERNAME: ${MANSIO_IGGY_USERNAME:-mansio}
+      MANSIO_IGGY_PASSWORD: ${MANSIO_IGGY_PASSWORD:-mansio-dev-admin}
+
+  mansio-server:
+    build: *mansio-build
     image: mansio-server:dev
     restart: unless-stopped
     depends_on:
       iggy:
         condition: service_healthy
+      iggy-admin:
+        condition: service_completed_successfully
     environment:
       MANSIO_BROKER: iggy
       MANSIO_TOKEN: ${MANSIO_TOKEN:-mansio-dev-token}
       MANSIO_IGGY_ADDRESS: iggy:8090
-      MANSIO_IGGY_USERNAME: ${IGGY_ROOT_USERNAME:-iggy}
-      MANSIO_IGGY_PASSWORD: ${IGGY_ROOT_PASSWORD:-iggy}
+      MANSIO_IGGY_USERNAME: ${MANSIO_IGGY_USERNAME:-mansio}
+      MANSIO_IGGY_PASSWORD: ${MANSIO_IGGY_PASSWORD:-mansio-dev-admin}
       MANSIO_LEASE_SECONDS: ${MANSIO_LEASE_SECONDS:-}
       MANSIO_MAX_ATTEMPTS: ${MANSIO_MAX_ATTEMPTS:-}
       MANSIO_BACKOFF_BASE_SECONDS: ${MANSIO_BACKOFF_BASE_SECONDS:-}
@@ -94,6 +131,9 @@ services:
       MANSIO_POLL_MAX_COUNT: ${MANSIO_POLL_MAX_COUNT:-}
       MANSIO_IGGY_SEGMENT_SIZE_BYTES: ${MANSIO_IGGY_SEGMENT_SIZE_BYTES:-}
       MANSIO_RETENTION_ALERTS_SECONDS: ${MANSIO_RETENTION_ALERTS_SECONDS:-}
+      MANSIO_AGENT_CREDENTIAL_TTL_SECONDS: ${MANSIO_AGENT_CREDENTIAL_TTL_SECONDS:-}
+      MANSIO_CREDENTIAL_RECHECK_SECONDS: ${MANSIO_CREDENTIAL_RECHECK_SECONDS:-}
+      MANSIO_CREDENTIAL_SWEEP_SECONDS: ${MANSIO_CREDENTIAL_SWEEP_SECONDS:-}
     ports:
       - "127.0.0.1:7070:7070"
     volumes:

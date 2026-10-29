@@ -1,6 +1,7 @@
 //! End-to-end tests: publish and poll through the HTTP API, and through the
 //! CLI binary; work items with claim, lease, ack, fail, retry and a dead
-//! topic; alerts; and the order of the sink.
+//! topic; alerts; the order of the sink; and credentials, which the broker
+//! holds to their scopes.
 //!
 //! With `MANSIO_E2E_URL` unset, each test starts a server in this process on
 //! a `MemoryBroker`. With it set, the tests use that server (CI runs them
@@ -8,6 +9,7 @@
 //! it accepts. See `e2e/harness.rs`.
 
 mod alerts;
+mod credentials;
 mod harness;
 mod ordering;
 mod passes;
@@ -155,9 +157,8 @@ async fn a_body_carrying_a_server_set_attribute_is_refused() -> anyhow::Result<(
         assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {response}");
         assert_eq!(response["error"]["code"], "bad_request");
     }
-    // Nothing was stored.
-    let polled = target.poll("facts.build", "offset=0").await?;
-    assert!(polled.messages.is_empty());
+    // Nothing was stored, and so there is no topic.
+    assert!(target.read("facts.build").await?.is_empty());
     Ok(())
 }
 

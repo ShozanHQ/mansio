@@ -9,26 +9,37 @@
 //! with claim, lease, acknowledgement, retry with backoff and a dead topic,
 //! and alerts with acknowledgement. Every transition is recorded in the sink
 //! and published to `facts.work` or `facts.alert`.
+//!
+//! [`Credentials`] issue and withdraw the credentials of principals, each a
+//! user of the broker with permissions on its tenant's stream and the topics its
+//! scopes cover, and say who a bearer token is. The admin API for them is in
+//! the routes of [`Server`].
 
 mod app;
 mod auth;
 mod clock;
+mod credentials;
 mod engine;
 mod error;
 mod facts;
+mod principals_api;
 mod recover;
+mod registry;
 mod settings;
 mod sink;
 mod state;
+#[cfg(test)]
+mod testing;
 mod work_api;
 
-pub use app::{AppState, Server};
-pub use auth::{Auth, Authenticated};
+pub use app::{AppState, Parts, Server};
+pub use auth::{Actor, Auth, Authenticated};
 pub use clock::{Clock, SystemClock};
-pub use engine::Engine;
+pub use credentials::Credentials;
+pub use engine::{Engine, Holder};
 pub use error::ApiError;
 pub use settings::{
-    Backend, DEFAULT_LISTEN, DEFAULT_SINK_PATH, DEFAULT_TOKEN_PRINCIPAL, Limits, Settings,
-    SettingsError, WorkSettings,
+    Backend, CredentialSettings, DEFAULT_LISTEN, DEFAULT_SINK_PATH, DEFAULT_TOKEN_PRINCIPAL,
+    Limits, Settings, SettingsError, WorkSettings,
 };
 pub use sink::FileSink;

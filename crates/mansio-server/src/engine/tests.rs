@@ -102,7 +102,11 @@ impl Broker for FlakyBroker {
         self.inner.ensure_topic(tenant, topic).await
     }
 
-    async fn publish(&self, envelope: &Envelope) -> Result<Option<u64>, BrokerError> {
+    async fn publish(
+        &self,
+        caller: &Caller<'_>,
+        envelope: &Envelope,
+    ) -> Result<Option<u64>, BrokerError> {
         let refused = {
             let failing = self.failing.lock().unwrap();
             failing.contains(&envelope.topic.to_string())
@@ -119,7 +123,7 @@ impl Broker for FlakyBroker {
         if rejected {
             return Err(BrokerError::Rejected("refused".to_owned()));
         }
-        let stored = self.inner.publish(envelope).await;
+        let stored = self.inner.publish(caller, envelope).await;
         let lost = {
             let mut lost = self.lost.lock().unwrap();
             lost.remove(&envelope.topic.to_string()) || lost.remove(envelope.event_type.as_str())
@@ -134,6 +138,7 @@ impl Broker for FlakyBroker {
 
     async fn poll(
         &self,
+        caller: &Caller<'_>,
         tenant: &TenantId,
         topic: &Topic,
         offset: u64,
@@ -147,7 +152,7 @@ impl Broker for FlakyBroker {
                 "offset {at} of {topic} in {tenant}: injected"
             )));
         }
-        self.inner.poll(tenant, topic, offset, max).await
+        self.inner.poll(caller, tenant, topic, offset, max).await
     }
 }
 
@@ -157,6 +162,7 @@ impl Broker for FlakyBroker {
 #[derive(Debug, Default)]
 struct LogSink {
     seen: StdMutex<Vec<(String, EventId)>>,
+    envelopes: StdMutex<Vec<Envelope>>,
     calls: AtomicU64,
     slow_start: bool,
 }
@@ -169,6 +175,7 @@ impl Sink for LogSink {
             .lock()
             .unwrap()
             .push((envelope.topic.to_string(), envelope.id));
+        self.envelopes.lock().unwrap().push(envelope.clone());
         if self.slow_start {
             // The record is made; the answer is slow. Without a lock, a later
             // publish overtakes an earlier one on its way to the broker.
@@ -191,6 +198,10 @@ impl LogSink {
 
     fn all(&self) -> Vec<(String, EventId)> {
         self.seen.lock().unwrap().clone()
+    }
+
+    fn all_envelopes(&self) -> Vec<Envelope> {
+        self.envelopes.lock().unwrap().clone()
     }
 }
 
@@ -264,18 +275,41 @@ impl Rig {
 
     async fn ack(&self, who: &str, item: &ItemId, lease: &LeaseId) -> Result<Published, ApiError> {
         self.engine
-            .work_ack(&tenant(), &queue(), item, &agent(who), lease)
+            .work_ack(
+                &tenant(),
+                &queue(),
+                item,
+                Holder {
+                    principal: &agent(who),
+                    consumer: &consumer("w1"),
+                    lease_id: lease,
+                },
+            )
             .await
     }
 
     async fn fail(&self, who: &str, item: &ItemId, lease: &LeaseId) -> Result<Published, ApiError> {
         self.engine
-            .work_fail(&tenant(), &queue(), item, &agent(who), lease, "it broke")
+            .work_fail(
+                &tenant(),
+                &queue(),
+                item,
+                Holder {
+                    principal: &agent(who),
+                    consumer: &consumer("w1"),
+                    lease_id: lease,
+                },
+                "it broke",
+            )
             .await
     }
 
     async fn read(&self, topic: &Topic) -> Vec<Envelope> {
-        match self.broker.poll(&tenant(), topic, 0, 1000).await {
+        match self
+            .broker
+            .poll(&Caller::Admin, &tenant(), topic, 0, 1000)
+            .await
+        {
             Ok(stored) => stored.into_iter().map(|s| s.envelope).collect(),
             Err(BrokerError::NotFound(_)) => Vec::new(),
             Err(error) => panic!("{error}"),
@@ -339,7 +373,8 @@ async fn a_claim_hands_out_the_oldest_item_and_hides_it_from_everyone_else() {
     assert_eq!(claimed["holder"], "agent:one");
     assert_eq!(claimed["consumer"], "w1");
     assert_eq!(claimed["attempt"], 1);
-    assert_eq!(claimed["lease_id"], one.lease_id.to_string());
+    assert_eq!(claimed["lease"], one.lease_id.fingerprint().to_string());
+    assert!(claimed.get("lease_id").is_none(), "the id is not recorded");
     assert_eq!(claimed["message_id"], one.item.id.to_string());
     assert_eq!(facts[0].principal, agent("one"));
 }
@@ -436,7 +471,10 @@ async fn an_unacked_claim_expires_and_the_item_comes_back_one_attempt_on_after_t
     assert_eq!(rig.transitions().await, ["claimed", "expired"]);
     let facts = rig.read(&Topic::facts_work()).await;
     assert_eq!(facts[1].principal.to_string(), "service:mansio-engine");
-    assert_eq!(data(&facts[1])["lease_id"], first.lease_id.to_string());
+    assert_eq!(
+        data(&facts[1])["lease"],
+        first.lease_id.fingerprint().to_string()
+    );
     assert_eq!(data(&facts[1])["holder"], "agent:one");
     assert_eq!(data(&facts[1])["next"], "retry");
     assert_eq!(
@@ -1419,19 +1457,24 @@ impl Broker for Counting {
         self.inner.ensure_topic(tenant, topic).await
     }
 
-    async fn publish(&self, envelope: &Envelope) -> Result<Option<u64>, BrokerError> {
-        self.inner.publish(envelope).await
+    async fn publish(
+        &self,
+        caller: &Caller<'_>,
+        envelope: &Envelope,
+    ) -> Result<Option<u64>, BrokerError> {
+        self.inner.publish(caller, envelope).await
     }
 
     async fn poll(
         &self,
+        caller: &Caller<'_>,
         tenant: &TenantId,
         topic: &Topic,
         offset: u64,
         max: u32,
     ) -> Result<Vec<Stored>, BrokerError> {
         self.polls.fetch_add(1, Ordering::SeqCst);
-        self.inner.poll(tenant, topic, offset, max).await
+        self.inner.poll(caller, tenant, topic, offset, max).await
     }
 }
 
@@ -1519,8 +1562,11 @@ async fn a_refusal_rebuilds_nothing_and_a_lost_answer_at_most_once_per_tick() {
                 &tenant(),
                 &queue(),
                 &poison.to_string().parse().unwrap(),
-                &agent("a"),
-                &claim.lease_id,
+                Holder {
+                    principal: &agent("a"),
+                    consumer: &consumer("w"),
+                    lease_id: &claim.lease_id,
+                },
                 "x",
             )
             .await
@@ -1617,4 +1663,81 @@ async fn an_alert_keeps_the_time_it_was_accepted_when_the_state_is_rebuilt() {
     assert!(alert_facts(&rig).await.is_empty());
     rig.pass(1).await;
     assert_eq!(alert_facts(&rig).await, ["resurfaced"]);
+}
+
+/// The lease id is the holder's proof, and `facts.work` is readable by anyone
+/// who may subscribe to `facts.*`: neither it nor the sink holds an id.
+#[tokio::test]
+async fn no_fact_and_no_sink_record_holds_a_lease_id() {
+    let rig = Rig::new();
+    let item = rig.publish_item("job").await;
+    let first = rig.pull("one").await.unwrap();
+    rig.fail("one", &item, &first.lease_id).await.unwrap();
+    rig.pass(100).await;
+    let second = rig.pull("one").await.unwrap();
+    rig.pass(100).await; // the second lease expires unanswered
+    rig.pass(10).await; // and its backoff passes
+    let third = rig.pull("one").await.unwrap();
+    rig.ack("one", &item, &third.lease_id).await.unwrap();
+
+    let facts = rig.read(&Topic::facts_work()).await;
+    let transitions = rig.transitions().await;
+    for kind in ["claimed", "failed", "expired", "acked"] {
+        assert!(
+            transitions.iter().any(|t| t == kind),
+            "{kind} in {transitions:?}"
+        );
+    }
+    for claim in [&first, &second, &third] {
+        let id = claim.lease_id.to_string();
+        let bare = id.replace('-', "");
+        let seen = serde_json::to_string(&facts).unwrap();
+        assert!(
+            !seen.contains(&id) && !seen.contains(&bare),
+            "a fact holds {id}"
+        );
+        let recorded = serde_json::to_string(&rig.sink.all_envelopes()).unwrap();
+        assert!(
+            !recorded.contains(&id) && !recorded.contains(&bare),
+            "the sink holds {id}"
+        );
+    }
+    // The facts do say which lease each is about.
+    let leased: Vec<String> = facts
+        .iter()
+        .filter_map(|fact| data(fact)["lease"].as_str().map(str::to_owned))
+        .collect();
+    assert!(leased.contains(&first.lease_id.fingerprint().to_string()));
+    assert!(leased.contains(&third.lease_id.fingerprint().to_string()));
+}
+
+/// A lease is held by a principal consuming under a name: another consumer of
+/// the same principal, with the right lease id, cannot ack or fail it.
+#[tokio::test]
+async fn another_consumer_of_the_same_principal_cannot_ack_or_fail_the_lease() {
+    let rig = Rig::new();
+    let item = rig.publish_item("job").await;
+    let claim = rig.pull("one").await.unwrap();
+    let before = rig.sink.all().len();
+    let principal = agent("one");
+    let holder = |consumer| Holder {
+        principal: &principal,
+        consumer,
+        lease_id: &claim.lease_id,
+    };
+    let others = [consumer("w2"), consumer("W1"), consumer("w")];
+    for other in &others {
+        let refused = rig
+            .engine
+            .work_ack(&tenant(), &queue(), &item, holder(other))
+            .await;
+        assert!(matches!(refused, Err(ApiError::Forbidden(_))), "{other}");
+        let refused = rig
+            .engine
+            .work_fail(&tenant(), &queue(), &item, holder(other), "x")
+            .await;
+        assert!(matches!(refused, Err(ApiError::Forbidden(_))), "{other}");
+    }
+    assert_eq!(rig.sink.all().len(), before, "a refusal records nothing");
+    rig.ack("one", &item, &claim.lease_id).await.unwrap();
 }

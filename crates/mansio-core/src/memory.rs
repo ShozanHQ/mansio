@@ -1,11 +1,20 @@
 //! An in-memory broker, for tests, development and `MANSIO_BROKER=memory`.
+//!
+//! It holds users, scopes and expiring credentials the way the Iggy backend
+//! does, so that what a credential may do is enforced by the broker in every
+//! test and not only against Iggy: a credential belongs to one tenant, reads
+//! only the topics its scopes cover, writes nothing, and stops working when it
+//! expires or its user is deleted.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
-use crate::broker::{Broker, Stored};
+use crate::access::{Action, Grant, allows};
+use crate::broker::{Broker, BrokerUser, BrokerUserInfo, Caller, Minted, Stored, SystemRecord};
+use crate::credential::{Credential, CredentialDigest};
 use crate::envelope::Envelope;
 use crate::error::BrokerError;
 use crate::id::TenantId;
@@ -13,10 +22,54 @@ use crate::topic::Topic;
 
 type Topics = HashMap<Topic, Vec<Envelope>>;
 
+/// A user the broker made, and what it may reach.
+#[derive(Debug, Clone)]
+struct User {
+    name: String,
+    tenant: TenantId,
+    grants: Vec<Grant>,
+}
+
+/// A credential: whose it is, and until when.
+#[derive(Debug)]
+struct Token {
+    user: BrokerUser,
+    expires: Option<Instant>,
+}
+
+#[derive(Debug, Default)]
+struct Users {
+    last: u32,
+    by_id: HashMap<BrokerUser, User>,
+    tokens: HashMap<CredentialDigest, Token>,
+}
+
+impl Users {
+    /// The user a credential signs in as, if it is known and has not expired.
+    fn resolve(&self, credential: &Credential) -> Result<(BrokerUser, &User), BrokerError> {
+        let invalid = || BrokerError::Unauthenticated("unknown, expired or revoked".to_owned());
+        let token = self.tokens.get(&credential.digest()).ok_or_else(invalid)?;
+        if token
+            .expires
+            .is_some_and(|expires| expires <= Instant::now())
+        {
+            return Err(invalid());
+        }
+        let user = self.by_id.get(&token.user).ok_or_else(invalid)?;
+        Ok((token.user, user))
+    }
+}
+
+/// What a credential's user may reach, for the checks of one request. `None`
+/// is the admin identity, which may reach everything.
+type Granted = Option<User>;
+
 /// A [`Broker`] that keeps everything in memory and forgets it on drop.
 #[derive(Debug, Default)]
 pub struct MemoryBroker {
     tenants: Mutex<HashMap<TenantId, Topics>>,
+    system: Mutex<Vec<Vec<u8>>>,
+    users: Mutex<Users>,
 }
 
 impl MemoryBroker {
@@ -29,10 +82,50 @@ impl MemoryBroker {
     fn lock(&self) -> MutexGuard<'_, HashMap<TenantId, Topics>> {
         self.tenants.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    fn users(&self) -> MutexGuard<'_, Users> {
+        self.users.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Who the caller is, for the checks of one request.
+    fn granted(&self, caller: &Caller<'_>) -> Result<Granted, BrokerError> {
+        match caller {
+            Caller::Admin => Ok(None),
+            Caller::Credential(credential) => {
+                let users = self.users();
+                let (_, user) = users.resolve(credential)?;
+                Ok(Some(user.clone()))
+            }
+        }
+    }
 }
 
 fn missing_topic(tenant: &TenantId, topic: &Topic) -> BrokerError {
     BrokerError::NotFound(format!("topic {topic} in tenant {tenant}"))
+}
+
+/// Whether the caller may read the topic. The broker looks the topic up
+/// first, as Iggy does, so that is checked before this.
+fn permit_read(granted: &Granted, tenant: &TenantId, topic: &Topic) -> Result<(), BrokerError> {
+    let Some(user) = granted else { return Ok(()) };
+    if user.tenant == *tenant && allows(&user.grants, Action::Poll, topic) {
+        Ok(())
+    } else {
+        Err(BrokerError::Forbidden(format!(
+            "the credential may not read {topic} in {tenant}"
+        )))
+    }
+}
+
+/// A credential writes nothing at the broker, as its Iggy user has no send
+/// permission: writes go through the server, which writes as the admin.
+fn permit_write(granted: &Granted, topic: &Topic, tenant: &TenantId) -> Result<(), BrokerError> {
+    if granted.is_some() {
+        return Err(BrokerError::Forbidden(format!(
+            "a credential may not write {topic} in {tenant}: it reads, and the server writes"
+        )));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -62,29 +155,38 @@ impl Broker for MemoryBroker {
         Ok(())
     }
 
-    async fn publish(&self, envelope: &Envelope) -> Result<Option<u64>, BrokerError> {
+    async fn publish(
+        &self,
+        caller: &Caller<'_>,
+        envelope: &Envelope,
+    ) -> Result<Option<u64>, BrokerError> {
         envelope.validate()?;
+        let granted = self.granted(caller)?;
         let mut tenants = self.lock();
         let log = tenants
             .get_mut(&envelope.tenant)
             .and_then(|topics| topics.get_mut(&envelope.topic))
             .ok_or_else(|| missing_topic(&envelope.tenant, &envelope.topic))?;
+        permit_write(&granted, &envelope.topic, &envelope.tenant)?;
         log.push(envelope.clone());
         Ok(Some(u64::try_from(log.len() - 1).unwrap_or(u64::MAX)))
     }
 
     async fn poll(
         &self,
+        caller: &Caller<'_>,
         tenant: &TenantId,
         topic: &Topic,
         offset: u64,
         max: u32,
     ) -> Result<Vec<Stored>, BrokerError> {
+        let granted = self.granted(caller)?;
         let tenants = self.lock();
         let log = tenants
             .get(tenant)
             .and_then(|topics| topics.get(topic))
             .ok_or_else(|| missing_topic(tenant, topic))?;
+        permit_read(&granted, tenant, topic)?;
         let start = usize::try_from(offset).unwrap_or(usize::MAX);
         let stored = log
             .iter()
@@ -97,6 +199,105 @@ impl Broker for MemoryBroker {
             })
             .collect();
         Ok(stored)
+    }
+
+    async fn system_append(&self, record: &[u8]) -> Result<(), BrokerError> {
+        self.system
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(record.to_vec());
+        Ok(())
+    }
+
+    async fn system_read(&self, offset: u64, max: u32) -> Result<Vec<SystemRecord>, BrokerError> {
+        let system = self.system.lock().unwrap_or_else(PoisonError::into_inner);
+        Ok(system
+            .iter()
+            .enumerate()
+            .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+            .take(usize::try_from(max).unwrap_or(usize::MAX))
+            .map(|(index, payload)| SystemRecord {
+                offset: u64::try_from(index).unwrap_or(u64::MAX),
+                payload: payload.clone(),
+            })
+            .collect())
+    }
+
+    async fn create_user(
+        &self,
+        tenant: &TenantId,
+        name: &str,
+        grants: &[Grant],
+        ttl: Option<Duration>,
+    ) -> Result<Minted, BrokerError> {
+        if !self.lock().contains_key(tenant) {
+            return Err(BrokerError::NotFound(format!("tenant {tenant}")));
+        }
+        let expires = ttl
+            .map(|ttl| {
+                Instant::now()
+                    .checked_add(ttl)
+                    .ok_or_else(|| BrokerError::Rejected("the expiry is too far off".to_owned()))
+            })
+            .transpose()?;
+        let credential = Credential::random();
+        let mut users = self.users();
+        users.last += 1;
+        let user = BrokerUser(users.last);
+        users.by_id.insert(
+            user,
+            User {
+                name: name.to_owned(),
+                tenant: tenant.clone(),
+                grants: grants.to_vec(),
+            },
+        );
+        users
+            .tokens
+            .insert(credential.digest(), Token { user, expires });
+        Ok(Minted { user, credential })
+    }
+
+    async fn set_grants(
+        &self,
+        user: BrokerUser,
+        tenant: &TenantId,
+        grants: &[Grant],
+    ) -> Result<(), BrokerError> {
+        if !self.lock().contains_key(tenant) {
+            return Err(BrokerError::NotFound(format!("tenant {tenant}")));
+        }
+        let mut users = self.users();
+        let known = users
+            .by_id
+            .get_mut(&user)
+            .ok_or_else(|| BrokerError::NotFound(format!("user {user}")))?;
+        known.tenant = tenant.clone();
+        known.grants = grants.to_vec();
+        Ok(())
+    }
+
+    async fn delete_user(&self, user: BrokerUser) -> Result<(), BrokerError> {
+        let mut users = self.users();
+        users.by_id.remove(&user);
+        users.tokens.retain(|_, token| token.user != user);
+        Ok(())
+    }
+
+    async fn list_users(&self) -> Result<Vec<BrokerUserInfo>, BrokerError> {
+        Ok(self
+            .users()
+            .by_id
+            .iter()
+            .map(|(user, known)| BrokerUserInfo {
+                user: *user,
+                name: known.name.clone(),
+            })
+            .collect())
+    }
+
+    async fn identify(&self, credential: &Credential) -> Result<BrokerUser, BrokerError> {
+        self.users().resolve(credential).map(|(user, _)| user)
     }
 }
 
@@ -133,12 +334,15 @@ mod tests {
     async fn publish_then_poll_returns_the_same_envelope() {
         let broker = broker_with("acme", "facts.build").await;
         let sent = envelope("acme", "facts.build", "build.finished");
-        let offset = broker.publish(&sent).await.unwrap();
+        let offset = broker.publish(&Caller::Admin, &sent).await.unwrap();
         assert_eq!(offset, Some(0));
 
         let tenant: TenantId = "acme".parse().unwrap();
         let topic: Topic = "facts.build".parse().unwrap();
-        let got = broker.poll(&tenant, &topic, 0, 10).await.unwrap();
+        let got = broker
+            .poll(&Caller::Admin, &tenant, &topic, 0, 10)
+            .await
+            .unwrap();
         assert_eq!(
             got,
             vec![Stored {
@@ -153,34 +357,40 @@ mod tests {
         let broker = broker_with("acme", "alerts").await;
         for n in 0..5 {
             let offset = broker
-                .publish(&envelope("acme", "alerts", &format!("t{n}")))
+                .publish(
+                    &Caller::Admin,
+                    &envelope("acme", "alerts", &format!("t{n}")),
+                )
                 .await
                 .unwrap();
             assert_eq!(offset, Some(n));
         }
         let tenant: TenantId = "acme".parse().unwrap();
-        let page = broker.poll(&tenant, &Topic::Alerts, 1, 2).await.unwrap();
+        let page = broker
+            .poll(&Caller::Admin, &tenant, &Topic::Alerts, 1, 2)
+            .await
+            .unwrap();
         let offsets: Vec<u64> = page.iter().map(|s| s.offset).collect();
         assert_eq!(offsets, [1, 2]);
         assert_eq!(page[0].envelope.event_type.as_str(), "t1");
 
         assert!(
             broker
-                .poll(&tenant, &Topic::Alerts, 5, 10)
+                .poll(&Caller::Admin, &tenant, &Topic::Alerts, 5, 10)
                 .await
                 .unwrap()
                 .is_empty()
         );
         assert!(
             broker
-                .poll(&tenant, &Topic::Alerts, u64::MAX, 10)
+                .poll(&Caller::Admin, &tenant, &Topic::Alerts, u64::MAX, 10)
                 .await
                 .unwrap()
                 .is_empty()
         );
         assert!(
             broker
-                .poll(&tenant, &Topic::Alerts, 0, 0)
+                .poll(&Caller::Admin, &tenant, &Topic::Alerts, 0, 0)
                 .await
                 .unwrap()
                 .is_empty()
@@ -199,14 +409,14 @@ mod tests {
             .await
             .unwrap();
         broker
-            .publish(&envelope("acme", "alerts", "t"))
+            .publish(&Caller::Admin, &envelope("acme", "alerts", "t"))
             .await
             .unwrap();
 
         let other: TenantId = "other".parse().unwrap();
         assert!(
             broker
-                .poll(&other, &Topic::Alerts, 0, 10)
+                .poll(&Caller::Admin, &other, &Topic::Alerts, 0, 10)
                 .await
                 .unwrap()
                 .is_empty()
@@ -224,15 +434,21 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, BrokerError::NotFound(_)));
         let error = broker
-            .publish(&envelope("acme", "dead", "t"))
+            .publish(&Caller::Admin, &envelope("acme", "dead", "t"))
             .await
             .unwrap_err();
         assert!(matches!(error, BrokerError::NotFound(_)));
-        let error = broker.poll(&tenant, &Topic::Dead, 0, 1).await.unwrap_err();
+        let error = broker
+            .poll(&Caller::Admin, &tenant, &Topic::Dead, 0, 1)
+            .await
+            .unwrap_err();
         assert!(matches!(error, BrokerError::NotFound(_)));
 
         broker.ensure_tenant(&tenant).await.unwrap();
-        let error = broker.poll(&tenant, &Topic::Dead, 0, 1).await.unwrap_err();
+        let error = broker
+            .poll(&Caller::Admin, &tenant, &Topic::Dead, 0, 1)
+            .await
+            .unwrap_err();
         assert!(matches!(error, BrokerError::NotFound(_)));
     }
 
@@ -277,7 +493,7 @@ mod tests {
     async fn ensure_is_idempotent_and_keeps_messages() {
         let broker = broker_with("acme", "presence").await;
         broker
-            .publish(&envelope("acme", "presence", "t"))
+            .publish(&Caller::Admin, &envelope("acme", "presence", "t"))
             .await
             .unwrap();
         let tenant: TenantId = "acme".parse().unwrap();
@@ -288,11 +504,404 @@ mod tests {
             .unwrap();
         assert_eq!(
             broker
-                .poll(&tenant, &Topic::Presence, 0, 10)
+                .poll(&Caller::Admin, &tenant, &Topic::Presence, 0, 10)
                 .await
                 .unwrap()
                 .len(),
             1
         );
+    }
+
+    fn grant(pattern: &str, verbs: &[crate::Verb]) -> Grant {
+        Grant::new(pattern.parse().unwrap(), verbs.iter().copied()).unwrap()
+    }
+
+    /// A broker with the tenants `acme` and `other`, each holding `alerts`,
+    /// `facts.build` and `work.builds`.
+    async fn two_tenants() -> MemoryBroker {
+        let broker = MemoryBroker::new();
+        for tenant in ["acme", "other"] {
+            let tenant: TenantId = tenant.parse().unwrap();
+            broker.ensure_tenant(&tenant).await.unwrap();
+            for topic in ["alerts", "facts.build", "work.builds"] {
+                broker
+                    .ensure_topic(&tenant, &topic.parse().unwrap())
+                    .await
+                    .unwrap();
+            }
+        }
+        broker
+    }
+
+    async fn user(
+        broker: &MemoryBroker,
+        tenant: &str,
+        grants: &[Grant],
+        ttl: Option<Duration>,
+    ) -> Minted {
+        broker
+            .create_user(&tenant.parse().unwrap(), "test", grants, ttl)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_credential_reads_only_what_its_scopes_cover_in_its_tenant_and_writes_nothing() {
+        use crate::Verb;
+        let broker = two_tenants().await;
+        let minted = user(
+            &broker,
+            "acme",
+            &[
+                grant("facts.build", &[Verb::Publish, Verb::Subscribe]),
+                grant("work.builds", &[Verb::Claim]),
+            ],
+            None,
+        )
+        .await;
+        let caller = Caller::Credential(&minted.credential);
+        let acme: TenantId = "acme".parse().unwrap();
+
+        // What it was given: to read.
+        for name in ["facts.build", "work.builds"] {
+            broker
+                .poll(&caller, &acme, &name.parse().unwrap(), 0, 1)
+                .await
+                .unwrap();
+        }
+
+        // Nothing else: a topic it lacks, another tenant's topics, and every
+        // write, to a topic it may read and to one it may publish through the
+        // server.
+        let refused = |result: Result<_, BrokerError>| {
+            assert!(
+                matches!(result, Err(BrokerError::Forbidden(_))),
+                "{result:?}"
+            );
+        };
+        refused(
+            broker
+                .poll(&caller, &acme, &Topic::Alerts, 0, 1)
+                .await
+                .map(|_| ()),
+        );
+        refused(
+            broker
+                .poll(&caller, &"other".parse().unwrap(), &Topic::Alerts, 0, 0)
+                .await
+                .map(|_| ()),
+        );
+        refused(
+            broker
+                .poll(
+                    &caller,
+                    &"other".parse().unwrap(),
+                    &"facts.build".parse().unwrap(),
+                    0,
+                    1,
+                )
+                .await
+                .map(|_| ()),
+        );
+        for (tenant, name) in [
+            ("acme", "facts.build"),
+            ("acme", "work.builds"),
+            ("acme", "alerts"),
+            ("other", "facts.build"),
+        ] {
+            refused(
+                broker
+                    .publish(&caller, &envelope(tenant, name, "t"))
+                    .await
+                    .map(|_| ()),
+            );
+        }
+        // Nothing was written by the refusals.
+        for tenant in ["acme", "other"] {
+            assert!(
+                broker
+                    .poll(
+                        &Caller::Admin,
+                        &tenant.parse().unwrap(),
+                        &"facts.build".parse().unwrap(),
+                        0,
+                        10
+                    )
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_topic_is_not_found_before_it_is_forbidden() {
+        let broker = two_tenants().await;
+        let minted = user(&broker, "acme", &[], None).await;
+        let caller = Caller::Credential(&minted.credential);
+        let error = broker
+            .poll(&caller, &"acme".parse().unwrap(), &Topic::Dead, 0, 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, BrokerError::NotFound(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_zero_count_poll_checks_the_topic_and_the_permission_and_reads_nothing() {
+        use crate::Verb;
+        let broker = two_tenants().await;
+        let acme: TenantId = "acme".parse().unwrap();
+        let reader = user(
+            &broker,
+            "acme",
+            &[grant("alerts", &[Verb::Subscribe])],
+            None,
+        )
+        .await;
+        let writer = user(&broker, "acme", &[grant("alerts", &[Verb::Publish])], None).await;
+        broker
+            .publish(&Caller::Admin, &envelope("acme", "alerts", "t"))
+            .await
+            .unwrap();
+        let read = broker
+            .poll(
+                &Caller::Credential(&reader.credential),
+                &acme,
+                &Topic::Alerts,
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+        assert!(read.is_empty());
+        let error = broker
+            .poll(
+                &Caller::Credential(&writer.credential),
+                &acme,
+                &Topic::Alerts,
+                0,
+                0,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, BrokerError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn a_pattern_reaches_topics_made_after_the_user_for_reading() {
+        use crate::Verb;
+        let broker = two_tenants().await;
+        let minted = user(
+            &broker,
+            "acme",
+            &[grant("facts.*", &[Verb::Subscribe])],
+            None,
+        )
+        .await;
+        let caller = Caller::Credential(&minted.credential);
+        let later = "facts.later";
+        broker
+            .ensure_topic(&"acme".parse().unwrap(), &later.parse().unwrap())
+            .await
+            .unwrap();
+        broker
+            .publish(&Caller::Admin, &envelope("acme", later, "t"))
+            .await
+            .unwrap();
+        let read = broker
+            .poll(
+                &caller,
+                &"acme".parse().unwrap(),
+                &later.parse().unwrap(),
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_credential_is_not_authenticated() {
+        let broker = two_tenants().await;
+        let stranger = Credential::new("not-a-credential");
+        assert!(matches!(
+            broker.identify(&stranger).await,
+            Err(BrokerError::Unauthenticated(_))
+        ));
+        assert!(matches!(
+            broker
+                .poll(
+                    &Caller::Credential(&stranger),
+                    &"acme".parse().unwrap(),
+                    &Topic::Alerts,
+                    0,
+                    1
+                )
+                .await,
+            Err(BrokerError::Unauthenticated(_))
+        ));
+        assert!(matches!(
+            broker
+                .publish(
+                    &Caller::Credential(&stranger),
+                    &envelope("acme", "alerts", "t")
+                )
+                .await,
+            Err(BrokerError::Unauthenticated(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_credential_stops_working_when_it_expires() {
+        use crate::Verb;
+        let broker = two_tenants().await;
+        let minted = user(
+            &broker,
+            "acme",
+            &[grant("alerts", &[Verb::Subscribe])],
+            Some(Duration::from_millis(150)),
+        )
+        .await;
+        let caller = Caller::Credential(&minted.credential);
+        let acme: TenantId = "acme".parse().unwrap();
+        assert_eq!(
+            broker.identify(&minted.credential).await.unwrap(),
+            minted.user
+        );
+        broker
+            .poll(&caller, &acme, &Topic::Alerts, 0, 1)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(matches!(
+            broker.identify(&minted.credential).await,
+            Err(BrokerError::Unauthenticated(_))
+        ));
+        assert!(matches!(
+            broker.poll(&caller, &acme, &Topic::Alerts, 0, 1).await,
+            Err(BrokerError::Unauthenticated(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_user_ends_its_credential_and_is_not_an_error_twice() {
+        use crate::Verb;
+        let broker = two_tenants().await;
+        let minted = user(
+            &broker,
+            "acme",
+            &[grant("alerts", &[Verb::Subscribe])],
+            None,
+        )
+        .await;
+        let other = user(
+            &broker,
+            "acme",
+            &[grant("alerts", &[Verb::Subscribe])],
+            None,
+        )
+        .await;
+        broker.delete_user(minted.user).await.unwrap();
+        broker.delete_user(minted.user).await.unwrap();
+        assert!(matches!(
+            broker.identify(&minted.credential).await,
+            Err(BrokerError::Unauthenticated(_))
+        ));
+        assert_eq!(
+            broker.identify(&other.credential).await.unwrap(),
+            other.user
+        );
+    }
+
+    #[tokio::test]
+    async fn users_need_a_tenant_and_have_distinct_numbers_and_credentials() {
+        let broker = MemoryBroker::new();
+        let missing: TenantId = "nope".parse().unwrap();
+        assert!(matches!(
+            broker.create_user(&missing, "x", &[], None).await,
+            Err(BrokerError::NotFound(_))
+        ));
+        broker.ensure_tenant(&missing).await.unwrap();
+        let a = broker.create_user(&missing, "a", &[], None).await.unwrap();
+        let b = broker.create_user(&missing, "b", &[], None).await.unwrap();
+        assert_ne!(a.user, b.user);
+        assert_ne!(a.credential.expose(), b.credential.expose());
+        assert!(a.credential.expose().len() >= 64);
+    }
+
+    #[tokio::test]
+    async fn set_grants_replaces_what_a_user_may_do() {
+        use crate::Verb;
+        let broker = two_tenants().await;
+        let acme: TenantId = "acme".parse().unwrap();
+        let minted = user(&broker, "acme", &[], None).await;
+        let caller = Caller::Credential(&minted.credential);
+        assert!(matches!(
+            broker.poll(&caller, &acme, &Topic::Alerts, 0, 1).await,
+            Err(BrokerError::Forbidden(_))
+        ));
+        broker
+            .set_grants(minted.user, &acme, &[grant("alerts", &[Verb::Subscribe])])
+            .await
+            .unwrap();
+        broker
+            .poll(&caller, &acme, &Topic::Alerts, 0, 1)
+            .await
+            .unwrap();
+        assert!(matches!(
+            broker.set_grants(BrokerUser(999), &acme, &[]).await,
+            Err(BrokerError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_system_log_keeps_order_and_pages() {
+        let broker = MemoryBroker::new();
+        assert!(broker.system_read(0, 10).await.unwrap().is_empty());
+        for n in 0..4u8 {
+            broker.system_append(&[n]).await.unwrap();
+        }
+        let page = broker.system_read(1, 2).await.unwrap();
+        let seen: Vec<(u64, Vec<u8>)> = page.into_iter().map(|r| (r.offset, r.payload)).collect();
+        assert_eq!(seen, [(1, vec![1]), (2, vec![2])]);
+        assert!(broker.system_read(4, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_credential_writes_nothing_at_the_broker_whatever_its_scopes() {
+        use crate::Verb;
+        let broker = two_tenants().await;
+        let minted = user(
+            &broker,
+            "acme",
+            &[grant("facts.*", &[Verb::Publish, Verb::Subscribe])],
+            None,
+        )
+        .await;
+        let caller = Caller::Credential(&minted.credential);
+        let acme: TenantId = "acme".parse().unwrap();
+        for name in [
+            "facts.work",
+            "facts.alert",
+            "facts.principal",
+            "facts.build",
+        ] {
+            broker
+                .ensure_topic(&acme, &name.parse().unwrap())
+                .await
+                .unwrap();
+            let result = broker.publish(&caller, &envelope("acme", name, "t")).await;
+            assert!(
+                matches!(result, Err(BrokerError::Forbidden(_))),
+                "{name}: {result:?}"
+            );
+            // And it reads them.
+            broker
+                .poll(&caller, &acme, &name.parse().unwrap(), 0, 1)
+                .await
+                .unwrap();
+        }
     }
 }

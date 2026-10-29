@@ -5,7 +5,8 @@ use std::str::FromStr;
 
 use mansio_core::{
     AlertEvent, AlertFact, CausationId, DataContentType, Envelope, EventId, EventType, ItemId,
-    Principal, Segment, Source, Subject, TenantId, Timestamp, Topic, WorkEvent, WorkFact,
+    Principal, PrincipalEvent, PrincipalFact, Segment, Source, Subject, TenantId, Timestamp, Topic,
+    WorkEvent, WorkFact,
 };
 use tracing::error;
 
@@ -174,6 +175,32 @@ impl Facts {
         Ok(envelope)
     }
 
+    /// A change to a principal, on `facts.principal`, with the principal id
+    /// as its subject. The data names no secret: the credential is not part of
+    /// a principal.
+    pub(crate) fn principal(
+        &self,
+        event: PrincipalEvent,
+        by: &Principal,
+        at: i64,
+        data: &PrincipalFact,
+    ) -> Result<Envelope, ApiError> {
+        let value = serde_json::to_value(data).map_err(|reason| {
+            error!(%reason, "a principal fact did not serialize");
+            ApiError::Internal
+        })?;
+        let mut envelope = self.envelope(
+            &data.principal.tenant,
+            Topic::facts_principal(),
+            event.event_type(),
+            by,
+            at,
+            &data.principal.id.to_string(),
+        )?;
+        envelope.data = Some(value);
+        Ok(envelope)
+    }
+
     /// The next attempt of an item: the same message with a new id, one more
     /// attempt and the old message as its cause, published by the engine.
     pub(crate) fn retry_message(&self, current: &Envelope, at: i64) -> Result<Envelope, ApiError> {
@@ -266,6 +293,38 @@ mod tests {
             current.id.to_string()
         );
         assert!(dead.to_json_vec().is_ok());
+    }
+
+    #[test]
+    fn a_principal_fact_names_the_principal_and_who_made_the_change() {
+        let facts = Facts::new();
+        let info = mansio_core::PrincipalInfo {
+            id: mansio_core::PrincipalId::generate(),
+            kind: "agent".parse().unwrap(),
+            name: "builder-1".parse().unwrap(),
+            tenant: "acme".parse().unwrap(),
+            scopes: vec![
+                mansio_core::Grant::new("work.builds".parse().unwrap(), [mansio_core::Verb::Claim])
+                    .unwrap(),
+            ],
+            created_at: "2026-10-26T12:00:00Z".parse().unwrap(),
+            expires_at: None,
+        };
+        let by: Principal = "service:mansio".parse().unwrap();
+        let data = PrincipalFact {
+            principal: info.clone(),
+            reason: None,
+        };
+        let fact = facts
+            .principal(PrincipalEvent::Created, &by, 0, &data)
+            .unwrap();
+        assert_eq!(fact.topic.to_string(), "facts.principal");
+        assert_eq!(fact.tenant, info.tenant);
+        assert_eq!(fact.event_type.as_str(), "mansio.principal.created");
+        assert_eq!(fact.subject.as_ref().unwrap().as_str(), info.id.to_string());
+        assert_eq!(fact.principal, by);
+        let back: PrincipalFact = serde_json::from_value(fact.data.unwrap()).unwrap();
+        assert_eq!(back, data);
     }
 
     #[test]

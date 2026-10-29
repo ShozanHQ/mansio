@@ -7,7 +7,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
-use mansio_core::{ConsumerName, Envelope, EventId, ItemId, LeaseId, Next, Principal, Segment};
+use mansio_core::{
+    ConsumerName, Envelope, EventId, ItemId, LeaseFingerprint, LeaseId, Next, Principal, Segment,
+};
 use subtle::ConstantTimeEq;
 
 use crate::error::ApiError;
@@ -15,7 +17,9 @@ use crate::error::ApiError;
 /// The right to work on an item until `expires_at`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Lease {
-    pub(crate) id: LeaseId,
+    /// Of the lease id, which only the holder has: the facts say which lease
+    /// this is and nothing more.
+    pub(crate) fingerprint: LeaseFingerprint,
     pub(crate) holder: Principal,
     pub(crate) consumer: ConsumerName,
     /// Milliseconds since the Unix epoch.
@@ -221,16 +225,27 @@ pub(crate) fn backoff(attempt: u32, base: Duration, cap: Duration) -> Duration {
         .map_or(cap, |wait| wait.min(cap))
 }
 
-/// Whether `presented` may act on `item` for `principal` at `now`, and the
-/// lease it holds if so.
+/// Who says they hold a lease: the principal behind the credential, the
+/// consumer name it consumes under, and the lease id it was given. The three
+/// together are the holder.
+#[derive(Debug, Clone, Copy)]
+pub struct Holder<'a> {
+    /// The principal behind the credential.
+    pub principal: &'a Principal,
+    /// The consumer name the lease was taken under.
+    pub consumer: &'a ConsumerName,
+    /// The lease id the holder was given.
+    pub lease_id: &'a LeaseId,
+}
+
+/// Whether `holder` may act on `item`, and the lease it holds if so.
 ///
 /// A lease that someone else holds, or that is not the one presented, is a
 /// 403; an item with no live lease for the caller is a 409. Neither changes
 /// anything.
 pub(crate) fn held_lease<'a>(
     item: &'a Item,
-    principal: &Principal,
-    presented: &LeaseId,
+    holder: Holder<'_>,
     now: i64,
 ) -> Result<&'a Lease, ApiError> {
     let Phase::Leased(lease) = &item.phase else {
@@ -238,10 +253,16 @@ pub(crate) fn held_lease<'a>(
             "the item is not claimed: its lease has ended or it was never claimed".to_owned(),
         ));
     };
-    // The lease id is a secret the holder was given: compare it so that the
-    // time taken does not say how much of a guess was right.
-    let same_lease = bool::from(lease.id.as_u128().ct_eq(&presented.as_u128()));
-    if !same_lease || lease.holder != *principal {
+    // The lease id is a secret the holder was given: what is kept is a
+    // fingerprint of it, and the fingerprint of what is presented is compared
+    // so that the time taken does not say how much of a guess was right.
+    let same_lease = bool::from(
+        lease
+            .fingerprint
+            .as_bytes()
+            .ct_eq(holder.lease_id.fingerprint().as_bytes()),
+    );
+    if !same_lease || lease.holder != *holder.principal || lease.consumer != *holder.consumer {
         return Err(ApiError::Forbidden(
             "the item is claimed under a lease that is not yours".to_owned(),
         ));
@@ -316,7 +337,7 @@ mod tests {
         assert_eq!(queue.oldest_ready(), Some(&a));
 
         let lease = Lease {
-            id: LeaseId::generate(),
+            fingerprint: LeaseId::generate().fingerprint(),
             holder: "service:test".parse().unwrap(),
             consumer: "w".parse().unwrap(),
             expires_at: 10,
@@ -393,32 +414,47 @@ mod tests {
     #[test]
     fn only_the_holder_of_a_live_lease_may_act() {
         let holder: Principal = "agent:one".parse().unwrap();
+        let consumer: ConsumerName = "w".parse().unwrap();
+        let id = LeaseId::generate();
         let lease = Lease {
-            id: LeaseId::generate(),
+            fingerprint: id.fingerprint(),
             holder: holder.clone(),
-            consumer: "w".parse().unwrap(),
+            consumer: consumer.clone(),
             expires_at: 1000,
         };
-        let leased = item(Phase::Leased(lease.clone()));
-        assert!(held_lease(&leased, &holder, &lease.id, 999).is_ok());
+        let leased = item(Phase::Leased(lease));
+        let who = |principal, consumer, lease_id| Holder {
+            principal,
+            consumer,
+            lease_id,
+        };
+        assert!(held_lease(&leased, who(&holder, &consumer, &id), 999).is_ok());
 
         let other: Principal = "agent:two".parse().unwrap();
         assert!(matches!(
-            held_lease(&leased, &other, &lease.id, 999),
+            held_lease(&leased, who(&other, &consumer, &id), 999),
+            Err(ApiError::Forbidden(_))
+        ));
+        let stranger = LeaseId::generate();
+        assert!(matches!(
+            held_lease(&leased, who(&holder, &consumer, &stranger), 999),
+            Err(ApiError::Forbidden(_))
+        ));
+        // Another consumer of the same principal, with the right lease id, is
+        // not the holder either.
+        let other_consumer: ConsumerName = "w2".parse().unwrap();
+        assert!(matches!(
+            held_lease(&leased, who(&holder, &other_consumer, &id), 999),
             Err(ApiError::Forbidden(_))
         ));
         assert!(matches!(
-            held_lease(&leased, &holder, &LeaseId::generate(), 999),
-            Err(ApiError::Forbidden(_))
-        ));
-        assert!(matches!(
-            held_lease(&leased, &holder, &lease.id, 1000),
+            held_lease(&leased, who(&holder, &consumer, &id), 1000),
             Err(ApiError::Conflict(_))
         ));
 
         let ready = item(Phase::Ready);
         assert!(matches!(
-            held_lease(&ready, &holder, &lease.id, 0),
+            held_lease(&ready, who(&holder, &consumer, &id), 0),
             Err(ApiError::Conflict(_))
         ));
     }

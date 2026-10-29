@@ -15,8 +15,8 @@
 use std::collections::HashMap;
 
 use mansio_core::{
-    AlertEvent, AlertFact, Broker, BrokerError, Envelope, EventId, ItemId, Next, Segment, Stored,
-    TenantId, Timestamp, Topic, WorkEvent, WorkFact,
+    AlertEvent, AlertFact, Broker, BrokerError, Caller, Envelope, EventId, ItemId, Next, Segment,
+    Stored, TenantId, Timestamp, Topic, WorkEvent, WorkFact,
 };
 use std::collections::HashSet;
 use tracing::warn;
@@ -84,7 +84,10 @@ async fn read_all(
     let mut one_by_one_until = 0_u64;
     loop {
         let width = if offset < one_by_one_until { 1 } else { page };
-        let batch = match broker.poll(tenant, topic, offset, width).await {
+        let batch = match broker
+            .poll(&Caller::Admin, tenant, topic, offset, width)
+            .await
+        {
             Ok(batch) => batch,
             Err(BrokerError::NotFound(_)) => break,
             // A page with a message in it that is not an envelope fails as a
@@ -178,7 +181,7 @@ fn newest_versions(messages: &[Stored]) -> Vec<(ItemId, &Stored)> {
 
 fn lease_of(data: &WorkFact, now: i64) -> Option<Lease> {
     Some(Lease {
-        id: data.lease_id?,
+        fingerprint: data.lease?,
         holder: data.holder.clone()?,
         consumer: data.consumer.clone()?,
         expires_at: data
