@@ -172,6 +172,129 @@ impl CredentialSettings {
     }
 }
 
+/// How event streams and webhooks follow a topic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamSettings {
+    /// How often a stream or a webhook looks for new messages once it has
+    /// caught up (`MANSIO_STREAM_POLL_MILLIS`).
+    pub poll: Duration,
+    /// How often an event stream that has nothing to send sends a comment,
+    /// so that the connection is not taken for dead
+    /// (`MANSIO_SSE_KEEPALIVE_SECONDS`).
+    pub sse_keepalive: Duration,
+    /// How long a shutdown waits, once it has ended every event stream, for
+    /// the requests still being served to finish before the server stops
+    /// anyway (`MANSIO_SHUTDOWN_GRACE_SECONDS`).
+    pub shutdown_grace: Duration,
+}
+
+impl Default for StreamSettings {
+    fn default() -> Self {
+        Self {
+            poll: Duration::from_millis(500),
+            sse_keepalive: Duration::from_secs(15),
+            shutdown_grace: Duration::from_secs(10),
+        }
+    }
+}
+
+impl StreamSettings {
+    /// Check the settings are usable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the variable that is out of range.
+    pub fn validate(&self) -> Result<(), SettingsError> {
+        let invalid = |name: &'static str| SettingsError::Invalid {
+            name,
+            reason: "must be at least 1".to_owned(),
+        };
+        if self.poll.is_zero() {
+            return Err(invalid("MANSIO_STREAM_POLL_MILLIS"));
+        }
+        if self.sse_keepalive < Duration::from_secs(1) {
+            return Err(invalid("MANSIO_SSE_KEEPALIVE_SECONDS"));
+        }
+        if self.shutdown_grace < Duration::from_secs(1) {
+            return Err(invalid("MANSIO_SHUTDOWN_GRACE_SECONDS"));
+        }
+        Ok(())
+    }
+}
+
+/// How webhooks deliver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebhookSettings {
+    /// The wait after the first failed attempt at a delivery; it doubles with
+    /// each attempt (`MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS`).
+    pub backoff_base: Duration,
+    /// The longest wait (`MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS`).
+    pub backoff_cap: Duration,
+    /// Attempts at one delivery before it is recorded as failed and the
+    /// webhook moves on (`MANSIO_WEBHOOK_MAX_ATTEMPTS`).
+    pub max_attempts: u32,
+    /// How long one attempt may take (`MANSIO_WEBHOOK_TIMEOUT_SECONDS`).
+    pub timeout: Duration,
+    /// The longest address a webhook may have, in bytes
+    /// (`MANSIO_WEBHOOK_URL_MAX_BYTES`).
+    pub url_max_bytes: usize,
+}
+
+impl Default for WebhookSettings {
+    fn default() -> Self {
+        Self {
+            backoff_base: Duration::from_secs(5),
+            backoff_cap: Duration::from_secs(300),
+            max_attempts: 8,
+            timeout: Duration::from_secs(10),
+            url_max_bytes: 2048,
+        }
+    }
+}
+
+impl WebhookSettings {
+    /// Check the settings fit together.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the variable that is out of range.
+    pub fn validate(&self) -> Result<(), SettingsError> {
+        let invalid = |name: &'static str, reason: &str| SettingsError::Invalid {
+            name,
+            reason: reason.to_owned(),
+        };
+        let one = Duration::from_secs(1);
+        if self.backoff_base < one {
+            return Err(invalid(
+                "MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS",
+                "must be at least 1",
+            ));
+        }
+        if self.backoff_cap < self.backoff_base {
+            return Err(invalid(
+                "MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS",
+                "must be at least MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS",
+            ));
+        }
+        if self.max_attempts == 0 {
+            return Err(invalid("MANSIO_WEBHOOK_MAX_ATTEMPTS", "must be at least 1"));
+        }
+        if self.timeout < one {
+            return Err(invalid(
+                "MANSIO_WEBHOOK_TIMEOUT_SECONDS",
+                "must be at least 1",
+            ));
+        }
+        if self.url_max_bytes == 0 {
+            return Err(invalid(
+                "MANSIO_WEBHOOK_URL_MAX_BYTES",
+                "must be at least 1",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Which broker to run on (`MANSIO_BROKER`), with what it needs.
 #[derive(Debug)]
 pub enum Backend {
@@ -231,6 +354,10 @@ pub struct Settings {
     pub work: WorkSettings,
     /// Credentials.
     pub credentials: CredentialSettings,
+    /// Event streams.
+    pub stream: StreamSettings,
+    /// Webhook delivery.
+    pub webhooks: WebhookSettings,
 }
 
 impl Settings {
@@ -297,6 +424,43 @@ impl Settings {
         };
         credentials.validate()?;
 
+        let stream_defaults = StreamSettings::default();
+        let stream = StreamSettings {
+            poll: Duration::from_millis(env.parse(
+                "MANSIO_STREAM_POLL_MILLIS",
+                u64::try_from(stream_defaults.poll.as_millis()).unwrap_or(u64::MAX),
+            )?),
+            sse_keepalive: env.seconds(
+                "MANSIO_SSE_KEEPALIVE_SECONDS",
+                stream_defaults.sse_keepalive,
+            )?,
+            shutdown_grace: env.seconds(
+                "MANSIO_SHUTDOWN_GRACE_SECONDS",
+                stream_defaults.shutdown_grace,
+            )?,
+        };
+        stream.validate()?;
+
+        let webhook_defaults = WebhookSettings::default();
+        let webhooks = WebhookSettings {
+            backoff_base: env.seconds(
+                "MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS",
+                webhook_defaults.backoff_base,
+            )?,
+            backoff_cap: env.seconds(
+                "MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS",
+                webhook_defaults.backoff_cap,
+            )?,
+            max_attempts: env
+                .parse("MANSIO_WEBHOOK_MAX_ATTEMPTS", webhook_defaults.max_attempts)?,
+            timeout: env.seconds("MANSIO_WEBHOOK_TIMEOUT_SECONDS", webhook_defaults.timeout)?,
+            url_max_bytes: env.parse(
+                "MANSIO_WEBHOOK_URL_MAX_BYTES",
+                webhook_defaults.url_max_bytes,
+            )?,
+        };
+        webhooks.validate()?;
+
         let broker = match env.string("MANSIO_BROKER", "iggy").as_str() {
             "iggy" => Backend::Iggy(Self::iggy_config(&env)?),
             "memory" => Backend::Memory,
@@ -321,6 +485,8 @@ impl Settings {
             limits,
             work,
             credentials,
+            stream,
+            webhooks,
         })
     }
 
@@ -465,6 +631,8 @@ mod tests {
         assert_eq!(settings.limits, Limits::default());
         assert_eq!(settings.work, WorkSettings::default());
         assert_eq!(settings.credentials, CredentialSettings::default());
+        assert_eq!(settings.stream, StreamSettings::default());
+        assert_eq!(settings.webhooks, WebhookSettings::default());
         let Backend::Iggy(iggy) = settings.broker else {
             panic!("expected the Iggy broker");
         };
@@ -661,6 +829,99 @@ mod tests {
                 "{name}={value}: {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_defaults_for_streams_and_webhooks_are_the_documented_ones() {
+        let stream = StreamSettings::default();
+        assert_eq!(stream.poll, Duration::from_millis(500));
+        assert_eq!(stream.sse_keepalive, Duration::from_secs(15));
+        assert_eq!(stream.shutdown_grace, Duration::from_secs(10));
+        assert_eq!(stream.validate(), Ok(()));
+        let webhooks = WebhookSettings::default();
+        assert_eq!(webhooks.backoff_base, Duration::from_secs(5));
+        assert_eq!(webhooks.backoff_cap, Duration::from_secs(300));
+        assert_eq!(webhooks.max_attempts, 8);
+        assert_eq!(webhooks.timeout, Duration::from_secs(10));
+        assert_eq!(webhooks.url_max_bytes, 2048);
+        assert_eq!(webhooks.validate(), Ok(()));
+    }
+
+    #[test]
+    fn stream_and_webhook_settings_are_read_from_the_environment() {
+        let settings = settings(&[
+            ("MANSIO_TOKEN", "t"),
+            ("MANSIO_BROKER", "memory"),
+            ("MANSIO_STREAM_POLL_MILLIS", "50"),
+            ("MANSIO_SSE_KEEPALIVE_SECONDS", "3"),
+            ("MANSIO_SHUTDOWN_GRACE_SECONDS", "4"),
+            ("MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS", "1"),
+            ("MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS", "4"),
+            ("MANSIO_WEBHOOK_MAX_ATTEMPTS", "5"),
+            ("MANSIO_WEBHOOK_TIMEOUT_SECONDS", "2"),
+            ("MANSIO_WEBHOOK_URL_MAX_BYTES", "512"),
+        ])
+        .unwrap();
+        assert_eq!(
+            settings.stream,
+            StreamSettings {
+                poll: Duration::from_millis(50),
+                sse_keepalive: Duration::from_secs(3),
+                shutdown_grace: Duration::from_secs(4),
+            }
+        );
+        assert_eq!(
+            settings.webhooks,
+            WebhookSettings {
+                backoff_base: Duration::from_secs(1),
+                backoff_cap: Duration::from_secs(4),
+                max_attempts: 5,
+                timeout: Duration::from_secs(2),
+                url_max_bytes: 512,
+            }
+        );
+    }
+
+    #[test]
+    fn stream_and_webhook_settings_that_cannot_work_are_refused_by_name() {
+        for (name, value) in [
+            ("MANSIO_STREAM_POLL_MILLIS", "0"),
+            ("MANSIO_STREAM_POLL_MILLIS", "often"),
+            ("MANSIO_SSE_KEEPALIVE_SECONDS", "0"),
+            ("MANSIO_SHUTDOWN_GRACE_SECONDS", "0"),
+            ("MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS", "0"),
+            ("MANSIO_WEBHOOK_MAX_ATTEMPTS", "0"),
+            ("MANSIO_WEBHOOK_TIMEOUT_SECONDS", "0"),
+            ("MANSIO_WEBHOOK_TIMEOUT_SECONDS", "-1"),
+            ("MANSIO_WEBHOOK_URL_MAX_BYTES", "0"),
+            ("MANSIO_WEBHOOK_URL_MAX_BYTES", "long"),
+        ] {
+            let error = settings(&[
+                ("MANSIO_TOKEN", "t"),
+                ("MANSIO_BROKER", "memory"),
+                (name, value),
+            ])
+            .unwrap_err();
+            assert!(
+                matches!(&error, SettingsError::Invalid { name: reported, .. } if *reported == name),
+                "{name}={value}: {error:?}"
+            );
+        }
+        // The cap may not be below the base.
+        let error = settings(&[
+            ("MANSIO_TOKEN", "t"),
+            ("MANSIO_BROKER", "memory"),
+            ("MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS", "10"),
+            ("MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS", "5"),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SettingsError::Invalid {
+                name: "MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS",
+                ..
+            }
+        ));
     }
 
     #[test]

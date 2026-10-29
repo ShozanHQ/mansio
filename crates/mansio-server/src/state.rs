@@ -14,12 +14,28 @@ use subtle::ConstantTimeEq;
 
 use crate::error::ApiError;
 
+/// A lease id the server still has, in memory only. It shows in no log, no
+/// fact and no `Debug` output.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Remembered(pub(crate) LeaseId);
+
+impl std::fmt::Debug for Remembered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Remembered(..)")
+    }
+}
+
 /// The right to work on an item until `expires_at`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Lease {
     /// Of the lease id, which only the holder has: the facts say which lease
     /// this is and nothing more.
     pub(crate) fingerprint: LeaseFingerprint,
+    /// The lease id itself, while this process has been up since the lease was
+    /// given. A consumer that asks again for the lease it holds is told it
+    /// again. A lease read back from the facts has none, as the facts do not
+    /// say it.
+    pub(crate) id: Option<Remembered>,
     pub(crate) holder: Principal,
     pub(crate) consumer: ConsumerName,
     /// Milliseconds since the Unix epoch.
@@ -134,6 +150,31 @@ impl Queue {
     /// The claimable item that was published first.
     pub(crate) fn oldest_ready(&self) -> Option<&ItemId> {
         self.ready.first().map(|(_, id)| id)
+    }
+
+    /// The item `holder` holds under the consumer name `consumer`, if its
+    /// lease is still live at `now`, with that lease. If there are several,
+    /// the one whose lease ends first. This looks through the open items, which
+    /// costs no more than the broker write that a claim makes.
+    pub(crate) fn held_by(
+        &self,
+        holder: &Principal,
+        consumer: &ConsumerName,
+        now: i64,
+    ) -> Option<(&ItemId, &Item, &Lease)> {
+        self.items
+            .iter()
+            .filter_map(|(id, item)| match &item.phase {
+                Phase::Leased(lease)
+                    if lease.holder == *holder
+                        && lease.consumer == *consumer
+                        && lease.expires_at > now =>
+                {
+                    Some((id, item, lease))
+                }
+                _ => None,
+            })
+            .min_by(|a, b| (a.2.expires_at, a.0).cmp(&(b.2.expires_at, b.0)))
     }
 
     fn take_order(&mut self) -> u64 {
@@ -338,6 +379,7 @@ mod tests {
 
         let lease = Lease {
             fingerprint: LeaseId::generate().fingerprint(),
+            id: None,
             holder: "service:test".parse().unwrap(),
             consumer: "w".parse().unwrap(),
             expires_at: 10,
@@ -418,6 +460,7 @@ mod tests {
         let id = LeaseId::generate();
         let lease = Lease {
             fingerprint: id.fingerprint(),
+            id: None,
             holder: holder.clone(),
             consumer: consumer.clone(),
             expires_at: 1000,

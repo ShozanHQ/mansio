@@ -8,6 +8,8 @@ use crate::credential::Credential;
 use crate::envelope::{Envelope, Timestamp};
 use crate::id::{ConsumerName, LeaseId, PrincipalKind, PrincipalName, TenantId};
 use crate::principal::PrincipalInfo;
+use crate::topic::Topic;
+use crate::webhook::{WebhookInfo, WebhookSecret};
 
 /// The answer to a publish: the envelope as stored, and where it landed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -129,6 +131,70 @@ pub struct Principals {
     pub principals: Vec<PrincipalInfo>,
 }
 
+/// Where a named consumer stands on a topic: the answer to `consumers_get`
+/// and `consumers_commit`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsumerState {
+    /// The consumer's name.
+    pub consumer: ConsumerName,
+    /// The offset of the last message it committed. Absent if it has
+    /// committed none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+    /// The offset it reads next: one past `offset`, or 0.
+    pub next: u64,
+}
+
+impl ConsumerState {
+    /// The state of a consumer whose last committed offset is `committed`.
+    #[must_use]
+    pub fn new(consumer: ConsumerName, committed: Option<u64>) -> Self {
+        Self {
+            consumer,
+            offset: committed,
+            next: committed.map_or(0, |offset| offset.saturating_add(1)),
+        }
+    }
+}
+
+/// The body of `consumers_commit`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommitRequest {
+    /// The offset of the last message the consumer has handled. Its next read
+    /// starts one after it.
+    pub offset: u64,
+}
+
+/// The body of `webhooks_create`: which topic is delivered where.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateWebhook {
+    /// The tenant whose topic is delivered.
+    pub tenant: TenantId,
+    /// The topic delivered.
+    pub topic: Topic,
+    /// The `http` or `https` address each envelope is POSTed to.
+    pub url: String,
+}
+
+/// The answer to `webhooks_create`: the webhook, and the secret its
+/// deliveries are signed with. The secret is shown this once.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookCreated {
+    /// The webhook as registered.
+    pub webhook: WebhookInfo,
+    /// The signing secret.
+    pub secret: WebhookSecret,
+}
+
+/// The answer to `webhooks_list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Webhooks {
+    /// The webhooks, oldest first, with how each is getting on. No secrets.
+    pub webhooks: Vec<WebhookInfo>,
+}
+
 /// The answer to `GET /v1/settings`: the settings the server runs with, none
 /// of them secret. Durations are whole seconds, except the tick.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +227,27 @@ pub struct EffectiveSettings {
     /// `MANSIO_CREDENTIAL_SWEEP_SECONDS`: how often expired principals are
     /// removed.
     pub credential_sweep_seconds: u64,
+    /// `MANSIO_STREAM_POLL_MILLIS`: how often a stream or a webhook looks
+    /// for new messages.
+    pub stream_poll_millis: u64,
+    /// `MANSIO_SSE_KEEPALIVE_SECONDS`: how often an event stream sends a
+    /// comment to keep the connection open.
+    pub sse_keepalive_seconds: u64,
+    /// `MANSIO_SHUTDOWN_GRACE_SECONDS`: how long a shutdown waits for the
+    /// requests still being served once the event streams are ended.
+    pub shutdown_grace_seconds: u64,
+    /// `MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS`: the wait after a delivery's
+    /// first failed attempt.
+    pub webhook_backoff_base_seconds: u64,
+    /// `MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS`: the longest wait.
+    pub webhook_backoff_cap_seconds: u64,
+    /// `MANSIO_WEBHOOK_MAX_ATTEMPTS`: attempts at one delivery before it is
+    /// recorded as failed and the webhook moves on.
+    pub webhook_max_attempts: u32,
+    /// `MANSIO_WEBHOOK_TIMEOUT_SECONDS`: how long one attempt may take.
+    pub webhook_timeout_seconds: u64,
+    /// `MANSIO_WEBHOOK_URL_MAX_BYTES`: the longest address a webhook may have.
+    pub webhook_url_max_bytes: u64,
 }
 
 #[cfg(test)]
@@ -177,6 +264,30 @@ mod tests {
             "alerts".parse().unwrap(),
             "service:test".parse::<Principal>().unwrap(),
         )
+    }
+
+    #[test]
+    fn a_consumer_reads_next_from_one_past_what_it_committed() {
+        let name: ConsumerName = "watcher".parse().unwrap();
+        let fresh = ConsumerState::new(name.clone(), None);
+        assert_eq!((fresh.offset, fresh.next), (None, 0));
+        assert!(
+            serde_json::to_value(&fresh)
+                .unwrap()
+                .get("offset")
+                .is_none()
+        );
+        let first = ConsumerState::new(name.clone(), Some(0));
+        assert_eq!((first.offset, first.next), (Some(0), 1));
+        let json = serde_json::to_value(&first).unwrap();
+        assert_eq!(json["offset"], 0);
+        assert_eq!(json["next"], 1);
+        assert_eq!(
+            serde_json::from_value::<ConsumerState>(json).unwrap(),
+            first
+        );
+        // The last offset there can be does not wrap round to 0.
+        assert_eq!(ConsumerState::new(name, Some(u64::MAX)).next, u64::MAX);
     }
 
     #[test]

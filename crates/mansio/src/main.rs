@@ -1,138 +1,50 @@
-//! The mansio command line: publish to a topic and poll it, against the
-//! HTTP API.
+//! The mansio command line and MCP server.
+//!
+//! Every operation of the bus is a command (`mansio work pull`) and a tool
+//! (`work_pull`) with the same name and the same parameters, and both are
+//! clients of the HTTP API. `mansio mcp` serves the tools on stdio.
 
+mod cli;
 mod client;
+mod mcp;
+mod ops;
+mod watch;
 
 use std::process::ExitCode;
 
-use clap::{Args, Parser, Subcommand};
+use anyhow::Context;
+use cli::Chosen;
 use client::Client;
-use mansio_core::{
-    CausationId, CorrelationId, EventType, IdempotencyKey, Source, Subject, TenantId, Topic,
-};
-use serde_json::{Map, Value};
 
-#[derive(Debug, Parser)]
-#[command(name = "mansio", version, about = "Publish to and poll the mansio bus")]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Debug, Subcommand)]
-enum Command {
-    /// Publish an envelope to a topic and print it as stored.
-    Publish(PublishArgs),
-    /// Print the envelopes in a topic, one JSON object per line.
-    Poll(PollArgs),
-}
-
-#[derive(Debug, Args)]
-struct PublishArgs {
-    /// The tenant to publish to.
-    #[arg(long)]
-    tenant: TenantId,
-    /// The topic: `facts.<kind>`, `work.<queue>`, `alerts`, `presence` or `dead`.
-    #[arg(long)]
-    topic: Topic,
-    /// What happened (CloudEvents type).
-    #[arg(long = "type")]
-    event_type: EventType,
-    /// Where it happened (CloudEvents source).
-    #[arg(long)]
-    source: Source,
-    /// The subject within the source.
-    #[arg(long)]
-    subject: Option<Subject>,
-    /// The payload, as JSON.
-    #[arg(long, value_parser = parse_json)]
-    data: Option<Value>,
-    /// The chain of work this belongs to.
-    #[arg(long)]
-    correlation_id: Option<CorrelationId>,
-    /// The event that caused this one.
-    #[arg(long)]
-    causation_id: Option<CausationId>,
-    /// A key consumers can deduplicate on.
-    #[arg(long)]
-    idempotency_key: Option<IdempotencyKey>,
-}
-
-#[derive(Debug, Args)]
-struct PollArgs {
-    /// The tenant to read from.
-    #[arg(long)]
-    tenant: TenantId,
-    /// The topic to read.
-    #[arg(long)]
-    topic: Topic,
-    /// Where to start; the first message is offset 0.
-    #[arg(long, default_value_t = 0)]
-    offset: u64,
-    /// How many to read at most. The server decides if not given.
-    #[arg(long)]
-    count: Option<u32>,
-}
-
-fn parse_json(text: &str) -> Result<Value, String> {
-    serde_json::from_str(text).map_err(|e| format!("not valid JSON: {e}"))
-}
-
-/// The envelope attributes to send. The server fills in the rest.
-fn publish_body(args: &PublishArgs) -> Map<String, Value> {
-    let mut body = Map::new();
-    let mut put = |name: &str, value: Option<String>| {
-        if let Some(value) = value {
-            body.insert(name.to_owned(), Value::String(value));
-        }
-    };
-    put("source", Some(args.source.to_string()));
-    put("type", Some(args.event_type.to_string()));
-    put("subject", args.subject.as_ref().map(ToString::to_string));
-    put(
-        "correlationid",
-        args.correlation_id.as_ref().map(ToString::to_string),
-    );
-    put(
-        "causationid",
-        args.causation_id.as_ref().map(ToString::to_string),
-    );
-    put(
-        "idempotencykey",
-        args.idempotency_key.as_ref().map(ToString::to_string),
-    );
-    if let Some(data) = &args.data {
-        put("datacontenttype", Some("application/json".to_owned()));
-        body.insert("data".to_owned(), data.clone());
+#[expect(clippy::print_stdout, reason = "the CLI prints its results to stdout")]
+fn print(lines: &[serde_json::Value]) {
+    for line in lines {
+        println!("{line}");
     }
-    body
 }
 
-#[expect(clippy::print_stdout, reason = "the CLI prints envelopes to stdout")]
-async fn run(cli: Cli) -> anyhow::Result<()> {
-    let client = Client::from_lookup(|name| std::env::var(name).ok())?;
-    match cli.command {
-        Command::Publish(args) => {
-            let published = client
-                .publish(&args.tenant, &args.topic, &publish_body(&args))
-                .await?;
-            println!("{}", serde_json::to_string(&published.envelope)?);
+async fn run() -> anyhow::Result<()> {
+    let matches = cli::command().get_matches();
+    let chosen = cli::chosen(&matches)?;
+    // Nothing is sent without a token, and a command that has none says so
+    // before it does anything.
+    let client = Client::from_lookup(cli::connection(&matches), |name| std::env::var(name).ok())?;
+    match chosen {
+        Chosen::Mcp => mcp::serve(client).await.context("serving MCP"),
+        Chosen::Op(ops::Op::Watch, args) => {
+            let watched = ops::Args::check(ops::Op::Watch, &args)?.watch()?;
+            watch::watch(&client, watched).await
         }
-        Command::Poll(args) => {
-            let polled = client
-                .poll(&args.tenant, &args.topic, args.offset, args.count)
-                .await?;
-            for stored in polled.messages {
-                println!("{}", serde_json::to_string(&stored.envelope)?);
-            }
+        Chosen::Op(op, args) => {
+            print(&ops::run(&client, op, &args).await?);
+            Ok(())
         }
     }
-    Ok(())
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    match run(Cli::parse()).await {
+    match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("mansio: {error:#}");
@@ -142,79 +54,158 @@ async fn main() -> ExitCode {
 }
 
 #[cfg(test)]
-mod tests {
-    use serde_json::json;
+mod parity {
+    //! The command line and the MCP server offer the same operations.
+    //!
+    //! The two are built from one description of the operations, and this
+    //! reads them back from what each actually offers, so that a change to
+    //! either that drops an operation or a parameter fails here. The
+    //! exemptions are named: `watch` streams, which a tool call cannot, and
+    //! `mcp` is what serves the tools.
+
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use serde_json::Value;
 
     use super::*;
 
-    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
-        Cli::try_parse_from(std::iter::once("mansio").chain(args.iter().copied()))
+    /// Commands that are not tools.
+    const COMMAND_ONLY: [&str; 2] = ["watch", "mcp"];
+
+    /// What a command offers: its flags, and which of them are required.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Offer {
+        parameters: BTreeSet<String>,
+        required: BTreeSet<String>,
     }
 
-    #[test]
-    fn publish_sends_only_what_was_given() {
-        let cli = parse(&[
-            "publish",
-            "--tenant",
-            "acme",
-            "--topic",
-            "facts.build",
-            "--type",
-            "build.done",
-            "--source",
-            "ci",
-            "--data",
-            r#"{"ok":true}"#,
-            "--correlation-id",
-            "c1",
-        ])
-        .unwrap();
-        let Command::Publish(args) = cli.command else {
-            panic!("not publish");
+    /// The commands of the CLI by operation name, found by walking the tree.
+    fn commands(
+        command: &clap::Command,
+        path: &mut Vec<String>,
+        found: &mut BTreeMap<String, Offer>,
+    ) {
+        let mut any = false;
+        for sub in command.get_subcommands() {
+            any = true;
+            path.push(sub.get_name().to_owned());
+            commands(sub, path, found);
+            path.pop();
+        }
+        if any || path.is_empty() {
+            return;
+        }
+        let own = |arg: &&clap::Arg| {
+            !arg.is_global_set()
+                && arg.get_long().is_some()
+                && arg.get_id() != "help"
+                && arg.get_id() != "version"
         };
-        assert_eq!(
-            Value::Object(publish_body(&args)),
-            json!({
-                "source": "ci",
-                "type": "build.done",
-                "correlationid": "c1",
-                "datacontenttype": "application/json",
-                "data": {"ok": true}
-            })
+        let flags: Vec<&clap::Arg> = command.get_arguments().filter(own).collect();
+        found.insert(
+            path.join("_"),
+            Offer {
+                parameters: flags
+                    .iter()
+                    .filter_map(|arg| arg.get_long())
+                    .map(|long| long.replace('-', "_"))
+                    .collect(),
+                required: flags
+                    .iter()
+                    .filter(|arg| arg.is_required_set())
+                    .filter_map(|arg| arg.get_long())
+                    .map(|long| long.replace('-', "_"))
+                    .collect(),
+            },
         );
     }
 
-    #[test]
-    fn bad_arguments_are_refused_before_any_request() {
-        for args in [
-            &[
-                "publish", "--tenant", "Acme", "--topic", "alerts", "--type", "t", "--source", "s",
-            ][..],
-            &[
-                "publish", "--tenant", "acme", "--topic", "nope", "--type", "t", "--source", "s",
-            ][..],
-            &[
-                "publish", "--tenant", "acme", "--topic", "alerts", "--type", "t", "--source", "s",
-                "--data", "{",
-            ][..],
-            &[
-                "publish", "--tenant", "acme", "--topic", "alerts", "--source", "s",
-            ][..],
-            &["poll", "--tenant", "acme"][..],
-            &[
-                "poll", "--tenant", "acme", "--topic", "alerts", "--offset", "-1",
-            ][..],
-        ] {
-            assert!(parse(args).is_err(), "{args:?}");
-        }
+    fn tool_offers() -> BTreeMap<String, Offer> {
+        let names = |value: &Value| -> BTreeSet<String> {
+            value
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        mcp::tools()
+            .iter()
+            .map(|tool| {
+                let schema = &tool["inputSchema"];
+                (
+                    tool["name"].as_str().unwrap_or_default().to_owned(),
+                    Offer {
+                        parameters: schema["properties"]
+                            .as_object()
+                            .map(|properties| properties.keys().cloned().collect())
+                            .unwrap_or_default(),
+                        required: names(&schema["required"]),
+                    },
+                )
+            })
+            .collect()
     }
 
     #[test]
-    fn poll_defaults_to_the_start() {
-        let cli = parse(&["poll", "--tenant", "acme", "--topic", "alerts"]).unwrap();
-        let Command::Poll(args) = cli.command else {
-            panic!("not poll");
-        };
-        assert_eq!((args.offset, args.count), (0, None));
+    fn the_command_line_and_the_mcp_tools_offer_the_same_operations() {
+        let mut cli = BTreeMap::new();
+        commands(&cli::command(), &mut Vec::new(), &mut cli);
+        let tools = tool_offers();
+
+        let only_commands: BTreeSet<&str> = cli
+            .keys()
+            .map(String::as_str)
+            .filter(|name| !tools.contains_key(*name))
+            .collect();
+        assert_eq!(
+            only_commands,
+            BTreeSet::from(COMMAND_ONLY),
+            "the commands that are not tools"
+        );
+        let only_tools: Vec<&String> = tools
+            .keys()
+            .filter(|name| !cli.contains_key(*name))
+            .collect();
+        assert!(
+            only_tools.is_empty(),
+            "tools with no command: {only_tools:?}"
+        );
+        for (name, tool) in &tools {
+            assert_eq!(
+                Some(tool),
+                cli.get(name),
+                "{name}: the flags and the properties differ"
+            );
+        }
+        assert!(tools.len() >= 15, "{} tools", tools.len());
+    }
+
+    #[test]
+    fn the_tools_have_the_names_the_ticket_lists() {
+        let tools = tool_offers();
+        for name in [
+            "publish",
+            "poll",
+            "work_publish",
+            "work_pull",
+            "work_ack",
+            "work_fail",
+            "alerts_publish",
+            "alerts_ack",
+            "principals_create",
+            "principals_list",
+            "principals_revoke",
+            "webhooks_create",
+            "webhooks_list",
+            "webhooks_delete",
+            "consumers_get",
+            "consumers_commit",
+        ] {
+            assert!(tools.contains_key(name), "{name}");
+        }
     }
 }

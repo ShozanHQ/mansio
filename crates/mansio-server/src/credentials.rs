@@ -23,7 +23,7 @@ use std::time::Duration;
 use mansio_core::api::{CreatePrincipal, Issued};
 use mansio_core::{
     Broker, BrokerError, BrokerUser, Credential, Principal, PrincipalEvent, PrincipalFact,
-    PrincipalId, PrincipalInfo, PrincipalKind, RevokeReason, TenantId, Timestamp,
+    PrincipalId, PrincipalInfo, PrincipalKind, RevokeReason, SystemLog, TenantId, Timestamp,
 };
 use tokio::sync::{Mutex, OnceCell};
 use tokio::time::MissedTickBehavior;
@@ -226,7 +226,10 @@ impl Credentials {
         self.registry.clear();
         let mut offset = 0;
         loop {
-            let batch = self.broker.system_read(offset, self.page).await?;
+            let batch = self
+                .broker
+                .system_read(SystemLog::Principals, offset, self.page)
+                .await?;
             let Some(last) = batch.last() else { break };
             let next = last.offset.saturating_add(1);
             for record in &batch {
@@ -469,7 +472,11 @@ impl Credentials {
             user: minted.user,
             digest,
         };
-        if let Err(error) = self.broker.system_append(&entry.encode()?).await {
+        if let Err(error) = self
+            .broker
+            .system_append(SystemLog::Principals, &entry.encode()?)
+            .await
+        {
             if let Err(cleanup) = self.broker.delete_user(minted.user).await {
                 warn!(principal = %info.id, error = %cleanup, "a user without a record could not be deleted");
             }
@@ -551,7 +558,7 @@ impl Credentials {
                 .map_err(|_| ApiError::Internal)?;
             let bytes = Entry::Revoked { id, at }.encode()?;
             self.broker
-                .system_append(&bytes)
+                .system_append(SystemLog::Principals, &bytes)
                 .await
                 .map_err(ApiError::from)
         }
@@ -702,15 +709,16 @@ mod tests {
             self.inner.poll(caller, tenant, topic, offset, max).await
         }
 
-        async fn system_append(&self, record: &[u8]) -> Result<(), BrokerError> {
+        async fn system_append(&self, log: SystemLog, record: &[u8]) -> Result<(), BrokerError> {
             if self.fail_system_append.load(Ordering::SeqCst) {
                 return Err(down());
             }
-            self.inner.system_append(record).await
+            self.inner.system_append(log, record).await
         }
 
         async fn system_read(
             &self,
+            log: SystemLog,
             offset: u64,
             max: u32,
         ) -> Result<Vec<SystemRecord>, BrokerError> {
@@ -718,7 +726,7 @@ mod tests {
             if self.fail_system_read.load(Ordering::SeqCst) {
                 return Err(down());
             }
-            self.inner.system_read(offset, max).await
+            self.inner.system_read(log, offset, max).await
         }
 
         async fn create_user(
@@ -1236,7 +1244,10 @@ mod tests {
             .await
             .unwrap();
         rig.broker
-            .system_append(&unreadable_record_of(unreadable.user))
+            .system_append(
+                SystemLog::Principals,
+                &unreadable_record_of(unreadable.user),
+            )
             .await
             .unwrap();
         let facts = rig.facts().await;
@@ -1330,6 +1341,7 @@ mod tests {
         // `facts.work`). Written when it was valid.
         rig.broker
             .system_append(
+                SystemLog::Principals,
                 &serde_json::to_vec(&json!({
                     "op": "created",
                     "principal": {
@@ -1385,7 +1397,10 @@ mod tests {
         let rig = Rig::new();
         rig.issue("person", "kept", None).await.unwrap();
         rig.broker
-            .system_append(br#"{"op":"revoked","v":2,"id":"x","at":"y"}"#)
+            .system_append(
+                SystemLog::Principals,
+                br#"{"op":"revoked","v":2,"id":"x","at":"y"}"#,
+            )
             .await
             .unwrap();
         let restarted = rig.restart().await;

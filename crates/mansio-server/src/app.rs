@@ -1,7 +1,7 @@
 //! The HTTP application: routes, handlers, and the `Server` builder a host
 //! application uses to run it in-process.
 
-use std::future::Future;
+use std::future::{Future, IntoFuture};
 use std::io;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -20,18 +20,26 @@ use mansio_core::{
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::net::TcpListener;
+use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::auth::{Auth, Authenticated};
 use crate::clock::{Clock, SystemClock};
+use crate::consumers_api;
 use crate::credentials::Credentials;
+use crate::cursors::Cursors;
 use crate::engine::Engine;
 use crate::error::ApiError;
+use crate::events_api;
 use crate::principals_api;
-use crate::settings::{CredentialSettings, Limits, SettingsError, WorkSettings};
+use crate::settings::{
+    CredentialSettings, Limits, SettingsError, StreamSettings, WebhookSettings, WorkSettings,
+};
+use crate::webhooks::Webhooks;
+use crate::webhooks_api;
 use crate::work_api;
 
 /// Attributes the server sets itself, from the path and the credential. A
@@ -47,12 +55,32 @@ pub struct AppState {
     pub(crate) broker: Arc<dyn Broker>,
     pub(crate) engine: Arc<Engine>,
     pub(crate) credentials: Arc<Credentials>,
+    pub(crate) webhooks: Arc<Webhooks>,
+    pub(crate) cursors: Arc<Cursors>,
     pub(crate) auth: Auth,
     pub(crate) limits: Limits,
+    pub(crate) streams: StreamSettings,
+    /// Becomes true when the server is shutting down, which ends every event
+    /// stream.
+    pub(crate) ending: watch::Receiver<bool>,
 }
 
-/// What [`Server::build`] makes: the routes, and the two things that have to
-/// be run alongside them.
+/// Ends every event stream of a server that is shutting down, so that a
+/// client that is connected to one does not hold the shutdown up.
+/// [`Server::serve`] does it when its shutdown signal comes; a host that
+/// mounts the routes itself calls [`Ender::end`] when it begins to stop.
+#[derive(Debug)]
+pub struct Ender(watch::Sender<bool>);
+
+impl Ender {
+    /// End every event stream.
+    pub fn end(&self) {
+        self.0.send_replace(true);
+    }
+}
+
+/// What [`Server::build`] makes: the routes, and the things that have to be
+/// run alongside them.
 pub struct Parts {
     /// The routes.
     pub router: Router,
@@ -60,16 +88,22 @@ pub struct Parts {
     pub engine: Arc<Engine>,
     /// Credentials. Run [`Credentials::run`] alongside the routes.
     pub credentials: Arc<Credentials>,
+    /// Webhooks. Run [`Webhooks::run`] alongside the routes.
+    pub webhooks: Arc<Webhooks>,
+    /// Ends the event streams. Call [`Ender::end`] before the host stops
+    /// serving, or its graceful shutdown waits for them for ever.
+    pub ender: Ender,
 }
 
 /// The mansio HTTP server, ready to run.
 ///
 /// A host application builds one with its own [`Broker`] and [`Sink`] and
 /// calls [`Server::serve`], which also runs the timer that expires leases,
-/// republishes items and surfaces alerts again, and the sweep that revokes
-/// expired credentials. A host that mounts the [`Router`] itself takes it from
-/// [`Server::build`] together with the [`Engine`] and [`Credentials`], and
-/// runs [`Engine::run`] and [`Credentials::run`] alongside.
+/// republishes items and surfaces alerts again, the sweep that revokes
+/// expired credentials, and the tasks that deliver webhooks. A host that
+/// mounts the [`Router`] itself takes it from [`Server::build`] together with
+/// the [`Engine`], [`Credentials`] and [`Webhooks`], and runs
+/// [`Engine::run`], [`Credentials::run`] and [`Webhooks::run`] alongside.
 pub struct Server {
     broker: Arc<dyn Broker>,
     sink: Arc<dyn Sink>,
@@ -78,32 +112,43 @@ pub struct Server {
     limits: Limits,
     work: WorkSettings,
     credentials: CredentialSettings,
+    streams: StreamSettings,
+    webhooks: WebhookSettings,
 }
 
-/// The server's timers, running as tasks: the engine's, and the credential
-/// sweep. Dropping it aborts them, so a server that is dropped does not leave
-/// them running; [`Timer::stop`] also waits until they are gone.
-struct Timer(Vec<JoinHandle<()>>);
+/// The server's timers, running as tasks: the engine's, the credential sweep
+/// and the webhooks'. Dropping it aborts them, so a server that is dropped
+/// does not leave them running; [`Timer::stop`] also waits until they are
+/// gone, the webhooks' delivery tasks too.
+struct Timer {
+    tasks: Vec<JoinHandle<()>>,
+    webhooks: Arc<Webhooks>,
+}
 
 impl Timer {
-    fn start(engine: Arc<Engine>, credentials: Arc<Credentials>) -> Self {
-        Self(vec![
-            tokio::spawn(engine.run()),
-            tokio::spawn(credentials.run()),
-        ])
+    fn start(engine: Arc<Engine>, credentials: Arc<Credentials>, webhooks: Arc<Webhooks>) -> Self {
+        Self {
+            tasks: vec![
+                tokio::spawn(engine.run()),
+                tokio::spawn(credentials.run()),
+                tokio::spawn(Arc::clone(&webhooks).run()),
+            ],
+            webhooks,
+        }
     }
 
     async fn stop(mut self) {
-        for mut task in self.0.drain(..) {
+        for mut task in self.tasks.drain(..) {
             task.abort();
             let _ = (&mut task).await;
         }
+        self.webhooks.shutdown().await;
     }
 }
 
 impl Drop for Timer {
     fn drop(&mut self) {
-        for task in &self.0 {
+        for task in &self.tasks {
             task.abort();
         }
     }
@@ -122,6 +167,8 @@ impl Server {
             limits: Limits::default(),
             work: WorkSettings::default(),
             credentials: CredentialSettings::default(),
+            streams: StreamSettings::default(),
+            webhooks: WebhookSettings::default(),
         }
     }
 
@@ -158,6 +205,33 @@ impl Server {
         self
     }
 
+    /// Use these event stream settings instead of the defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the setting if the settings cannot work, for
+    /// example a poll of zero.
+    pub fn with_stream_settings(mut self, streams: StreamSettings) -> Result<Self, SettingsError> {
+        streams.validate()?;
+        self.streams = streams;
+        Ok(self)
+    }
+
+    /// Use these webhook settings instead of the defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the setting if the settings do not fit
+    /// together, for example a cap below the base.
+    pub fn with_webhook_settings(
+        mut self,
+        webhooks: WebhookSettings,
+    ) -> Result<Self, SettingsError> {
+        webhooks.validate()?;
+        self.webhooks = webhooks;
+        Ok(self)
+    }
+
     /// Read time from `clock` instead of the system clock.
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
@@ -165,9 +239,10 @@ impl Server {
         self
     }
 
-    /// The routes, and the engine and credentials behind them. Nothing drives
-    /// the engine's timer or the credential sweep until [`Engine::run`] and
-    /// [`Credentials::run`] are, or [`Engine::tick`] and [`Credentials::sweep`]
+    /// The routes, and the engine, credentials and webhooks behind them.
+    /// Nothing drives the engine's timer, the credential sweep or the
+    /// delivery of webhooks until [`Engine::run`], [`Credentials::run`] and
+    /// [`Webhooks::run`] are, or [`Engine::tick`] and [`Credentials::sweep`]
     /// are called.
     pub fn build(self) -> Parts {
         let max_body = self.limits.max_body_bytes;
@@ -181,17 +256,35 @@ impl Server {
         let credentials = Arc::new(Credentials::new(
             Arc::clone(&self.broker),
             Arc::clone(&engine),
-            self.clock,
+            Arc::clone(&self.clock),
             self.credentials,
             self.auth.principal().clone(),
             self.limits.poll_max_count,
+        ));
+        let cursors = Arc::new(Cursors::new(
+            Arc::clone(&self.broker),
+            self.limits.poll_max_count,
+        ));
+        let (ender, ending) = watch::channel(false);
+        let webhooks = Arc::new(Webhooks::new(
+            Arc::clone(&self.broker),
+            Arc::clone(&engine),
+            Arc::clone(&cursors),
+            self.clock,
+            self.webhooks,
+            self.streams,
+            self.limits.poll_default_count,
         ));
         let state = AppState {
             broker: self.broker,
             engine: Arc::clone(&engine),
             credentials: Arc::clone(&credentials),
+            webhooks: Arc::clone(&webhooks),
+            cursors,
             auth: self.auth,
             limits: self.limits,
+            streams: self.streams,
+            ending,
         };
         let router = Router::new()
             .route("/healthz", get(healthz))
@@ -200,6 +293,15 @@ impl Server {
                 "/v1/tenants/{tenant}/topics/{topic}/messages",
                 get(poll).post(publish),
             )
+            .route(
+                "/v1/tenants/{tenant}/topics/{topic}/consumers/{consumer}",
+                get(consumers_api::consumers_get),
+            )
+            .route(
+                "/v1/tenants/{tenant}/topics/{topic}/consumers/{consumer}/commit",
+                post(consumers_api::consumers_commit),
+            )
+            .route("/v1/events", get(events_api::events_stream))
             .route(
                 "/v1/tenants/{tenant}/work/{queue}/items",
                 post(work_api::work_publish),
@@ -232,6 +334,11 @@ impl Server {
                 "/v1/principals/{id}",
                 delete(principals_api::principals_revoke),
             )
+            .route(
+                "/v1/webhooks",
+                post(webhooks_api::webhooks_create).get(webhooks_api::webhooks_list),
+            )
+            .route("/v1/webhooks/{id}", delete(webhooks_api::webhooks_delete))
             .fallback(not_found)
             .layer(DefaultBodyLimit::max(max_body))
             .with_state(Arc::new(state));
@@ -239,6 +346,8 @@ impl Server {
             router,
             engine,
             credentials,
+            webhooks,
+            ender: Ender(ender),
         }
     }
 
@@ -248,11 +357,14 @@ impl Server {
         self.build().router
     }
 
-    /// Serve on `listener` until `shutdown` completes. Before it accepts a
-    /// request the engine takes up what the broker holds and the registry of
-    /// principals is loaded, and while it runs the timer drives expiries,
-    /// republishes and alerts, and the sweep revokes expired credentials.
-    /// Dropping the future stops both.
+    /// Serve on `listener` until `shutdown` completes, then end the event
+    /// streams and wait up to `MANSIO_SHUTDOWN_GRACE_SECONDS` for the requests
+    /// still being served. Before it accepts a
+    /// request the engine takes up what the broker holds and the registries of
+    /// principals and webhooks are loaded, and while it runs the timer drives
+    /// expiries, republishes and alerts, the sweep revokes expired
+    /// credentials, and each webhook is delivered. Dropping the future stops
+    /// all of them.
     ///
     /// # Errors
     ///
@@ -262,10 +374,13 @@ impl Server {
         listener: TcpListener,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> io::Result<()> {
+        let grace = self.streams.shutdown_grace;
         let Parts {
             router,
             engine,
             credentials,
+            webhooks,
+            ender,
         } = self.build();
         if let Err(error) = engine.recover().await {
             warn!(
@@ -276,32 +391,74 @@ impl Server {
         // If this fails it has logged why at error. Credentials are refused and
         // `/healthz` says so until a later attempt succeeds.
         credentials.load().await.ok();
-        let timer = Timer::start(engine, credentials);
+        if let Err(error) = webhooks.load().await {
+            warn!(
+                ?error,
+                "the registry of webhooks could not be loaded; the next request will try again"
+            );
+        }
+        let timer = Timer::start(engine, credentials, webhooks);
+        // The signal ends the event streams, which would otherwise never let
+        // the graceful shutdown finish, and starts the clock on what is left.
+        let stopping = Arc::new(Notify::new());
+        let signal = {
+            let stopping = Arc::clone(&stopping);
+            async move {
+                shutdown.await;
+                ender.end();
+                stopping.notify_one();
+            }
+        };
         let served = axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown)
-            .await;
+            .with_graceful_shutdown(signal)
+            .into_future();
+        let out_of_time = async {
+            stopping.notified().await;
+            tokio::time::sleep(grace).await;
+        };
+        let served = tokio::select! {
+            served = served => served,
+            () = out_of_time => {
+                warn!(
+                    grace_seconds = grace.as_secs(),
+                    "requests were still being served when the grace for shutdown ran out; stopping anyway"
+                );
+                Ok(())
+            }
+        };
         timer.stop().await;
         served
     }
 }
 
-/// `200 {"status":"ok"}`, or `503 {"status":"degraded","credentials":"unavailable",..}`
-/// while the registry of principals is not loaded: the server is up, and no
-/// credential is accepted. Asking for it tries the load again when its time
-/// is up, which is what a health check that keeps asking wants.
+/// `200 {"status":"ok"}`, or `503 {"status":"degraded",..}` with
+/// `"credentials":"unavailable"` while the registry of principals is not
+/// loaded, and `"webhooks":"unavailable"` while the registry of webhooks is
+/// not: the server is up, and in the first case no credential is accepted, in
+/// the second no webhook is delivered. Asking for it tries each load again
+/// when its time is up, which is what a health check that keeps asking wants.
 async fn healthz(State(state): State<Arc<AppState>>) -> Response {
-    match state.credentials.load().await {
-        Ok(()) => Json(json!({ "status": "ok" })).into_response(),
-        Err(_) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "status": "degraded",
-                "credentials": "unavailable",
-                "message": "the registry of principals is not loaded, so no credential is accepted; see the server log",
-            })),
-        )
-            .into_response(),
+    let credentials = state.credentials.load().await.is_err();
+    let webhooks = state.webhooks.load().await.is_err();
+    if !credentials && !webhooks {
+        return Json(json!({ "status": "ok" })).into_response();
     }
+    let mut body = Map::new();
+    body.insert("status".to_owned(), json!("degraded"));
+    let mut messages = Vec::new();
+    if credentials {
+        body.insert("credentials".to_owned(), json!("unavailable"));
+        messages.push("the registry of principals is not loaded, so no credential is accepted");
+    }
+    if webhooks {
+        body.insert("webhooks".to_owned(), json!("unavailable"));
+        messages.push("the registry of webhooks is not loaded, so no webhook is delivered");
+    }
+    body.insert(
+        "message".to_owned(),
+        json!(format!("{}; see the server log", messages.join("; "))),
+    );
+    (StatusCode::SERVICE_UNAVAILABLE, Json(Value::Object(body))).into_response()
 }
 
 async fn settings(
@@ -310,6 +467,7 @@ async fn settings(
 ) -> Json<EffectiveSettings> {
     let work = state.engine.settings();
     let credentials = state.credentials.settings();
+    let webhooks = state.webhooks.settings();
     let limits = &state.limits;
     let seconds = |d: std::time::Duration| d.as_secs();
     Json(EffectiveSettings {
@@ -325,6 +483,14 @@ async fn settings(
         agent_credential_ttl_seconds: seconds(credentials.agent_ttl),
         credential_recheck_seconds: seconds(credentials.recheck),
         credential_sweep_seconds: seconds(credentials.sweep),
+        stream_poll_millis: u64::try_from(state.streams.poll.as_millis()).unwrap_or(u64::MAX),
+        sse_keepalive_seconds: seconds(state.streams.sse_keepalive),
+        shutdown_grace_seconds: seconds(state.streams.shutdown_grace),
+        webhook_backoff_base_seconds: seconds(webhooks.backoff_base),
+        webhook_backoff_cap_seconds: seconds(webhooks.backoff_cap),
+        webhook_max_attempts: webhooks.max_attempts,
+        webhook_timeout_seconds: seconds(webhooks.timeout),
+        webhook_url_max_bytes: u64::try_from(webhooks.url_max_bytes).unwrap_or(u64::MAX),
     })
 }
 
@@ -514,13 +680,13 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request, header};
     use http_body_util::BodyExt;
-    use mansio_core::MemoryBroker;
     use mansio_core::api::ErrorBody;
+    use mansio_core::{MemoryBroker, SystemLog};
     use secrecy::SecretString;
     use tower::ServiceExt;
 
     use super::*;
-    use crate::testing::serial;
+    use crate::testing::{Logs, serial};
 
     const TOKEN: &str = "test-token";
 
@@ -749,6 +915,18 @@ mod tests {
                 Method::POST,
                 "/v1/tenants/acme/alerts/0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3/ack",
             ),
+            (Method::GET, "/v1/events?tenant=acme&topic=alerts"),
+            (Method::GET, "/v1/tenants/acme/topics/alerts/consumers/dash"),
+            (
+                Method::POST,
+                "/v1/tenants/acme/topics/alerts/consumers/dash/commit",
+            ),
+            (Method::POST, "/v1/webhooks"),
+            (Method::GET, "/v1/webhooks"),
+            (
+                Method::DELETE,
+                "/v1/webhooks/0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3",
+            ),
         ];
         for (method, uri) in routes {
             let (status, body) = send(&router, method.clone(), uri, None, "{}").await;
@@ -913,6 +1091,56 @@ mod tests {
         assert_eq!(settings.max_body_bytes, 2048);
         assert_eq!(settings.poll_default_count, 3);
         assert_eq!(settings.poll_max_count, 5);
+        assert_eq!(settings.stream_poll_millis, 500);
+        assert_eq!(settings.sse_keepalive_seconds, 15);
+        assert_eq!(settings.webhook_backoff_base_seconds, 5);
+        assert_eq!(settings.webhook_backoff_cap_seconds, 300);
+        assert_eq!(settings.webhook_max_attempts, 8);
+        assert_eq!(settings.webhook_timeout_seconds, 10);
+        assert_eq!(settings.webhook_url_max_bytes, 2048);
+    }
+
+    #[tokio::test]
+    async fn stream_and_webhook_settings_that_cannot_work_are_refused() {
+        let _serial = serial().await;
+        let auth = || {
+            Auth::new(
+                SecretString::from(TOKEN.to_owned()),
+                "service:mansio".parse().unwrap(),
+            )
+        };
+        let refused = Server::new(Arc::new(MemoryBroker::new()), auth())
+            .with_stream_settings(StreamSettings {
+                poll: std::time::Duration::ZERO,
+                ..StreamSettings::default()
+            })
+            .err();
+        assert!(matches!(
+            refused,
+            Some(SettingsError::Invalid {
+                name: "MANSIO_STREAM_POLL_MILLIS",
+                ..
+            })
+        ));
+        let refused = Server::new(Arc::new(MemoryBroker::new()), auth())
+            .with_webhook_settings(WebhookSettings {
+                max_attempts: 0,
+                ..WebhookSettings::default()
+            })
+            .err();
+        assert!(matches!(
+            refused,
+            Some(SettingsError::Invalid {
+                name: "MANSIO_WEBHOOK_MAX_ATTEMPTS",
+                ..
+            })
+        ));
+        assert!(
+            Server::new(Arc::new(MemoryBroker::new()), auth())
+                .with_stream_settings(StreamSettings::default())
+                .and_then(|server| server.with_webhook_settings(WebhookSettings::default()))
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -1105,51 +1333,6 @@ mod tests {
         Server::new(Arc::new(broker), auth).router()
     }
 
-    /// What the tracing events emitted while it is in scope say.
-    #[derive(Clone, Default)]
-    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Logs {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// Ends the capture when dropped, then releases the lock. Fields drop in
-    /// declaration order, so the subscriber is gone before the next test runs.
-    struct CaptureGuard {
-        _subscriber: tracing::subscriber::DefaultGuard,
-        _lock: tokio::sync::MutexGuard<'static, ()>,
-    }
-
-    impl Logs {
-        async fn capture() -> (Self, CaptureGuard) {
-            let lock = serial().await;
-            let logs = Self::default();
-            let writer = logs.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .with_ansi(false)
-                .with_writer(move || writer.clone())
-                .finish();
-            let subscriber = tracing::subscriber::set_default(subscriber);
-            tracing::callsite::rebuild_interest_cache();
-            let guard = CaptureGuard {
-                _subscriber: subscriber,
-                _lock: lock,
-            };
-            (logs, guard)
-        }
-
-        fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-        }
-    }
-
     #[tokio::test]
     async fn a_stored_message_without_an_offset_is_still_a_201() {
         let _serial = serial().await;
@@ -1242,7 +1425,10 @@ mod tests {
     async fn a_registry_that_cannot_be_loaded_is_logged_with_its_cause_and_healthz_says_so() {
         let (logs, _guard) = Logs::capture().await;
         let broker = Arc::new(MemoryBroker::new());
-        broker.system_append(b"not a record").await.unwrap();
+        broker
+            .system_append(SystemLog::Principals, b"not a record")
+            .await
+            .unwrap();
         let clock = Arc::new(crate::clock::manual::ManualClock::new(1_792_000_000_000));
         let router = Server::new(
             broker,
@@ -1290,6 +1476,98 @@ mod tests {
         let (status, _) = send(&router, Method::GET, "/healthz", None, "").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(lines(&logs.text()), 2, "{}", logs.text());
+    }
+
+    #[tokio::test]
+    async fn a_registry_of_webhooks_that_cannot_be_loaded_is_logged_once_and_healthz_says_so() {
+        let (logs, _guard) = Logs::capture().await;
+        let broker = Arc::new(MemoryBroker::new());
+        // A deletion written by a newer version: skipping it would revive the
+        // webhook it deleted.
+        broker
+            .system_append(
+                SystemLog::Webhooks,
+                br#"{"op":"deleted","v":2,"id":"0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3","at":"2026-10-26T12:00:00Z"}"#,
+            )
+            .await
+            .unwrap();
+        let clock = Arc::new(crate::clock::manual::ManualClock::new(1_792_000_000_000));
+        let router = Server::new(
+            broker,
+            Auth::new(
+                SecretString::from(TOKEN.to_owned()),
+                "service:mansio".parse().unwrap(),
+            ),
+        )
+        .with_clock(clock.clone())
+        .router();
+
+        // Up, and not well, and only the webhooks are not: the principals
+        // loaded, and a credential that is not one is a plain 401.
+        let (status, body) = send(&router, Method::GET, "/healthz", None, "").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(body["webhooks"], "unavailable");
+        assert!(body.get("credentials").is_none(), "{body}");
+        assert!(!body.to_string().contains("offset"), "{body}");
+        let (status, _) = send(&router, Method::GET, URI, Some("a-credential"), "").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // The admin API of webhooks says 503, whatever is asked, and the rest
+        // of the server goes on.
+        let hooks = [
+            (Method::GET, "/v1/webhooks"),
+            (Method::POST, "/v1/webhooks"),
+            (
+                Method::DELETE,
+                "/v1/webhooks/0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3",
+            ),
+        ];
+        let create = r#"{"tenant":"acme","topic":"facts.build","url":"https://example.com/hook"}"#;
+        for (method, uri) in hooks {
+            let (status, body) = send(&router, method.clone(), uri, Some(TOKEN), create).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{method} {uri}");
+            assert_eq!(error_code(&body), "unavailable");
+        }
+        let (status, _) = send(&router, Method::POST, URI, Some(TOKEN), MINIMAL).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // One line at error, with the cause, for all of that.
+        let logged = logs.text();
+        assert_eq!(
+            logged.matches("webhooks could not be loaded").count(),
+            1,
+            "{logged}"
+        );
+        for expected in ["ERROR", "offset 0", "version 2"] {
+            assert!(logged.contains(expected), "{expected} is not in {logged}");
+        }
+    }
+
+    #[tokio::test]
+    async fn healthz_names_every_registry_that_is_not_loaded() {
+        let _serial = serial().await;
+        let broker = Arc::new(MemoryBroker::new());
+        broker
+            .system_append(SystemLog::Principals, b"not a record")
+            .await
+            .unwrap();
+        broker
+            .system_append(SystemLog::Webhooks, b"not a record")
+            .await
+            .unwrap();
+        let router = Server::new(
+            broker,
+            Auth::new(
+                SecretString::from(TOKEN.to_owned()),
+                "service:mansio".parse().unwrap(),
+            ),
+        )
+        .router();
+        let (status, body) = send(&router, Method::GET, "/healthz", None, "").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["credentials"], "unavailable");
+        assert_eq!(body["webhooks"], "unavailable");
     }
 
     #[tokio::test]

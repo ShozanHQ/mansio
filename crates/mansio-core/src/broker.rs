@@ -58,6 +58,39 @@ pub struct Minted {
     pub credential: Credential,
 }
 
+/// One of the logs the server keeps in the broker where no credential can
+/// reach it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SystemLog {
+    /// The registry of principals and their credentials' digests.
+    Principals,
+    /// The registry of webhooks, which holds their signing secrets.
+    Webhooks,
+    /// Where every named consumer and every webhook has got to. A consumer's
+    /// position is kept here and not in the broker's own consumer offsets,
+    /// which any credential that may read a topic could move.
+    Cursors,
+}
+
+impl SystemLog {
+    /// Every log.
+    pub const ALL: [SystemLog; 3] = [
+        SystemLog::Principals,
+        SystemLog::Webhooks,
+        SystemLog::Cursors,
+    ];
+
+    /// The name of the log: the topic it lives in.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SystemLog::Principals => "principals",
+            SystemLog::Webhooks => "webhooks",
+            SystemLog::Cursors => "cursors",
+        }
+    }
+}
+
 /// A user of the broker, by number and name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrokerUserInfo {
@@ -175,24 +208,30 @@ pub trait Broker: Send + Sync {
         max: u32,
     ) -> Result<Vec<Stored>, BrokerError>;
 
-    /// Append a record to the server's own log, which no credential can read
-    /// or write: the registry of principals lives there.
+    /// Append a record to one of the server's own logs, which no credential
+    /// can read or write: the registries of principals and of webhooks live
+    /// there.
     ///
     /// # Errors
     ///
     /// Returns an error if the broker cannot be reached, refuses, or has no
     /// such log.
-    async fn system_append(&self, _record: &[u8]) -> Result<(), BrokerError> {
+    async fn system_append(&self, _log: SystemLog, _record: &[u8]) -> Result<(), BrokerError> {
         Err(unsupported("system records"))
     }
 
-    /// Up to `max` records of the server's own log from `offset` on, in
-    /// order.
+    /// Up to `max` records of one of the server's own logs from `offset` on,
+    /// in order.
     ///
     /// # Errors
     ///
     /// As [`Broker::system_append`].
-    async fn system_read(&self, _offset: u64, _max: u32) -> Result<Vec<SystemRecord>, BrokerError> {
+    async fn system_read(
+        &self,
+        _log: SystemLog,
+        _offset: u64,
+        _max: u32,
+    ) -> Result<Vec<SystemRecord>, BrokerError> {
         Err(unsupported("system records"))
     }
 

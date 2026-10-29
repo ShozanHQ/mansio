@@ -427,7 +427,12 @@ mod tests {
     #[test]
     fn facts_star_publish_does_not_reach_the_topics_only_mansio_writes() {
         let grants = [grant("facts.*", &[Verb::Publish, Verb::Subscribe])];
-        for name in ["facts.work", "facts.alert", "facts.principal"] {
+        for name in [
+            "facts.work",
+            "facts.alert",
+            "facts.principal",
+            "facts.webhook",
+        ] {
             assert!(!allows(&grants, Action::Send, &topic(name)), "{name}");
             assert!(
                 allows(&grants, Action::Poll, &topic(name)),
@@ -439,7 +444,13 @@ mod tests {
 
     #[test]
     fn a_publish_scope_naming_a_topic_only_mansio_writes_is_refused() {
-        for name in ["facts.work", "facts.alert", "facts.principal", "dead"] {
+        for name in [
+            "facts.work",
+            "facts.alert",
+            "facts.principal",
+            "facts.webhook",
+            "dead",
+        ] {
             let pattern: TopicPattern = name.parse().unwrap();
             assert!(
                 Grant::new(pattern.clone(), [Verb::Publish]).is_err(),

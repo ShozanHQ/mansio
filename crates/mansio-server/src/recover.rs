@@ -13,6 +13,7 @@
 //! is, so that one bad message does not stop a tenant.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use mansio_core::{
     AlertEvent, AlertFact, Broker, BrokerError, Caller, Envelope, EventId, ItemId, Next, Segment,
@@ -24,6 +25,7 @@ use tracing::warn;
 use crate::error::ApiError;
 use crate::facts::Facts;
 use crate::state::{Lease, Phase, Queue, Then};
+use crate::tail::Tail;
 
 /// Everything the engine reads from a tenant's topics, each in publish order.
 #[derive(Debug, Default)]
@@ -47,7 +49,7 @@ pub(crate) struct Rebuilt {
 
 /// Read, in pages of `page`, every topic the engine replays.
 pub(crate) async fn read_logs(
-    broker: &dyn Broker,
+    broker: &Arc<dyn Broker>,
     tenant: &TenantId,
     topics: &[Topic],
     page: u32,
@@ -71,46 +73,27 @@ pub(crate) async fn read_logs(
     Ok(logs)
 }
 
+/// Every message of the topic, in order, read page by page by the reader the
+/// event streams and webhooks use, which steps over a message that cannot be
+/// read.
 async fn read_all(
-    broker: &dyn Broker,
+    broker: &Arc<dyn Broker>,
     tenant: &TenantId,
     topic: &Topic,
     page: u32,
 ) -> Result<Vec<Stored>, BrokerError> {
+    let mut tail = Tail::new(Arc::clone(broker), tenant.clone(), topic.clone(), 0, page);
     let mut all = Vec::new();
-    let mut offset = 0;
-    // Messages before this offset are read one at a time: the page that
-    // failed has a message in it that cannot be read.
-    let mut one_by_one_until = 0_u64;
     loop {
-        let width = if offset < one_by_one_until { 1 } else { page };
-        let batch = match broker
-            .poll(&Caller::Admin, tenant, topic, offset, width)
-            .await
-        {
+        let before = tail.next();
+        let batch = match tail.read(&Caller::Admin).await {
             Ok(batch) => batch,
             Err(BrokerError::NotFound(_)) => break,
-            // A page with a message in it that is not an envelope fails as a
-            // whole. Read it again one message at a time to find which, and
-            // step over that one. The rest of the page is read the same way,
-            // and the next page whole.
-            Err(BrokerError::Corrupt(_)) if width > 1 => {
-                one_by_one_until = offset.saturating_add(u64::from(page));
-                continue;
-            }
-            Err(BrokerError::Corrupt(why)) => {
-                warn!(%tenant, %topic, offset, %why, "a message that cannot be read is skipped");
-                offset = offset.saturating_add(1);
-                continue;
-            }
             Err(error) => return Err(error),
         };
-        let Some(last) = batch.last() else { break };
-        let next = last.offset.saturating_add(1);
-        if next <= offset {
+        if batch.is_empty() || tail.next() <= before {
             break;
         }
-        offset = next;
         all.extend(batch);
     }
     Ok(all)
@@ -182,6 +165,7 @@ fn newest_versions(messages: &[Stored]) -> Vec<(ItemId, &Stored)> {
 fn lease_of(data: &WorkFact, now: i64) -> Option<Lease> {
     Some(Lease {
         fingerprint: data.lease?,
+        id: None,
         holder: data.holder.clone()?,
         consumer: data.consumer.clone()?,
         expires_at: data

@@ -23,15 +23,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail, ensure};
+use async_trait::async_trait;
 use iggy::prelude::{
     Client, IggyClientBuilder, IggyError, IggyMessage, MessageClient, Partitioning,
     PersonalAccessTokenClient,
 };
 use mansio_core::api::{Claimed, EffectiveSettings, Polled, Published};
 use mansio_core::{
-    Broker, BrokerError, Caller, Credential, Envelope, EventId, MemoryBroker, Timestamp,
+    Broker, BrokerError, BrokerUser, BrokerUserInfo, Caller, Credential, Envelope, EventId, Grant,
+    MemoryBroker, Minted, Stored, SystemLog, SystemRecord, TenantId, Timestamp, Topic,
 };
-use mansio_server::{Auth, CredentialSettings, FileSink, Limits, Server, WorkSettings};
+use mansio_server::{
+    Auth, CredentialSettings, FileSink, Limits, Server, StreamSettings, WebhookSettings,
+    WorkSettings,
+};
 use reqwest::{Method, StatusCode};
 use secrecy::SecretString;
 use serde_json::{Value, json};
@@ -46,7 +51,7 @@ pub const PRINCIPAL: &str = "service:mansio";
 /// How often a test looks again while it waits for something.
 const LOOK_AGAIN: Duration = Duration::from_millis(50);
 /// How long a server may take to shut down before it is aborted.
-const STOP_TIME: Duration = Duration::from_secs(5);
+pub const STOP_TIME: Duration = Duration::from_secs(5);
 /// What a wait may take beyond what the settings call for, for a slow runner.
 pub const SLACK: Duration = Duration::from_secs(15);
 
@@ -73,13 +78,38 @@ fn local_credential_settings() -> CredentialSettings {
     }
 }
 
-/// What the in-process server runs with: the API limits, the work settings
-/// and the credential settings.
+/// The stream settings of the in-process server: a quick look for new
+/// messages, a comment every second on a quiet event stream, and two seconds
+/// of grace for a shutdown.
+fn local_stream_settings() -> StreamSettings {
+    StreamSettings {
+        poll: Duration::from_millis(50),
+        sse_keepalive: Duration::from_secs(1),
+        shutdown_grace: Duration::from_secs(2),
+    }
+}
+
+/// The webhook settings of the in-process server: seconds-scale, so that a
+/// retry, a timeout and giving up take seconds.
+fn local_webhook_settings() -> WebhookSettings {
+    WebhookSettings {
+        backoff_base: Duration::from_secs(1),
+        backoff_cap: Duration::from_secs(4),
+        max_attempts: 3,
+        timeout: Duration::from_secs(2),
+        url_max_bytes: 2048,
+    }
+}
+
+/// What the in-process server runs with: the API limits, the work settings,
+/// the credential settings, and how streams and webhooks behave.
 #[derive(Debug, Clone, Copy)]
 pub struct LocalSettings {
     pub limits: Limits,
     pub work: WorkSettings,
     pub credentials: CredentialSettings,
+    pub streams: StreamSettings,
+    pub webhooks: WebhookSettings,
 }
 
 impl Default for LocalSettings {
@@ -88,7 +118,111 @@ impl Default for LocalSettings {
             limits: Limits::default(),
             work: local_work_settings(),
             credentials: local_credential_settings(),
+            streams: local_stream_settings(),
+            webhooks: local_webhook_settings(),
         }
+    }
+}
+
+/// The memory broker, except that every call gives way to the other tasks of
+/// the runtime before it is answered, as a call over the network does. A
+/// server over it starts its tasks interleaved the way they are against Iggy:
+/// one that begins reading a log is not done when the next one begins. The
+/// memory broker alone answers at once and hides that.
+struct Yielding(Arc<MemoryBroker>);
+
+#[async_trait]
+impl Broker for Yielding {
+    async fn tenants(&self) -> Result<Vec<TenantId>, BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.tenants().await
+    }
+
+    async fn topics(&self, tenant: &TenantId) -> Result<Vec<Topic>, BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.topics(tenant).await
+    }
+
+    async fn ensure_tenant(&self, tenant: &TenantId) -> Result<(), BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.ensure_tenant(tenant).await
+    }
+
+    async fn ensure_topic(&self, tenant: &TenantId, topic: &Topic) -> Result<(), BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.ensure_topic(tenant, topic).await
+    }
+
+    async fn publish(
+        &self,
+        caller: &Caller<'_>,
+        envelope: &Envelope,
+    ) -> Result<Option<u64>, BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.publish(caller, envelope).await
+    }
+
+    async fn poll(
+        &self,
+        caller: &Caller<'_>,
+        tenant: &TenantId,
+        topic: &Topic,
+        offset: u64,
+        max: u32,
+    ) -> Result<Vec<Stored>, BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.poll(caller, tenant, topic, offset, max).await
+    }
+
+    async fn system_append(&self, log: SystemLog, record: &[u8]) -> Result<(), BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.system_append(log, record).await
+    }
+
+    async fn system_read(
+        &self,
+        log: SystemLog,
+        offset: u64,
+        max: u32,
+    ) -> Result<Vec<SystemRecord>, BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.system_read(log, offset, max).await
+    }
+
+    async fn create_user(
+        &self,
+        tenant: &TenantId,
+        name: &str,
+        grants: &[Grant],
+        ttl: Option<Duration>,
+    ) -> Result<Minted, BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.create_user(tenant, name, grants, ttl).await
+    }
+
+    async fn set_grants(
+        &self,
+        user: BrokerUser,
+        tenant: &TenantId,
+        grants: &[Grant],
+    ) -> Result<(), BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.set_grants(user, tenant, grants).await
+    }
+
+    async fn list_users(&self) -> Result<Vec<BrokerUserInfo>, BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.list_users().await
+    }
+
+    async fn delete_user(&self, user: BrokerUser) -> Result<(), BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.delete_user(user).await
+    }
+
+    async fn identify(&self, credential: &Credential) -> Result<BrokerUser, BrokerError> {
+        tokio::task::yield_now().await;
+        self.0.identify(credential).await
     }
 }
 
@@ -112,11 +246,13 @@ impl LocalServer {
             SecretString::from(LOCAL_TOKEN.to_owned()),
             PRINCIPAL.parse()?,
         );
-        let server = Server::new(broker.clone(), auth)
+        let server = Server::new(Arc::new(Yielding(broker.clone())), auth)
             .with_sink(Arc::new(FileSink::open(sink).await?))
             .with_limits(settings.limits)
             .with_work_settings(settings.work)?
-            .with_credential_settings(settings.credentials);
+            .with_credential_settings(settings.credentials)
+            .with_stream_settings(settings.streams)?
+            .with_webhook_settings(settings.webhooks)?;
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn(server.serve(listener, async move {
             let _ = stopped.await;
@@ -561,6 +697,88 @@ impl Target {
         Duration::from_millis(self.settings.tick_millis.saturating_mul(3) + 300)
     }
 
+    // ---- consumers, webhooks ------------------------------------------------
+
+    /// The address of a named consumer of a topic of this tenant.
+    pub fn consumer_uri(&self, topic: &str, consumer: &str) -> String {
+        format!(
+            "{}/v1/tenants/{}/topics/{topic}/consumers/{consumer}",
+            self.base, self.tenant
+        )
+    }
+
+    /// `webhooks_create` for a topic of this tenant, answering whatever the
+    /// server says.
+    pub async fn create_webhook(
+        &self,
+        topic: &str,
+        url: &str,
+    ) -> anyhow::Result<(StatusCode, Value)> {
+        let body = json!({"tenant": self.tenant, "topic": topic, "url": url});
+        self.authed(
+            Method::POST,
+            &format!("{}/v1/webhooks", self.base),
+            Some(&body),
+        )
+        .await
+    }
+
+    /// `webhooks_create`, which must be accepted: the answer with the
+    /// webhook and its secret.
+    pub async fn webhook(&self, topic: &str, url: &str) -> anyhow::Result<Value> {
+        let (status, response) = self.create_webhook(topic, url).await?;
+        ensure!(
+            status == StatusCode::CREATED,
+            "webhooks_create answered {status}: {response}"
+        );
+        Ok(response)
+    }
+
+    /// `webhooks_list` for this tenant.
+    pub async fn webhooks(&self) -> anyhow::Result<Vec<Value>> {
+        let uri = format!("{}/v1/webhooks?tenant={}", self.base, self.tenant);
+        let (status, response) = self.authed(Method::GET, &uri, None).await?;
+        ensure!(
+            status == StatusCode::OK,
+            "webhooks_list answered {status}: {response}"
+        );
+        Ok(response["webhooks"].as_array().context("a list")?.clone())
+    }
+
+    /// Delete every webhook of this tenant, so that a server that goes on after
+    /// the test does not go on delivering for it.
+    pub async fn delete_webhooks(&self) -> anyhow::Result<()> {
+        for webhook in self.webhooks().await? {
+            let id = webhook["id"].as_str().context("a webhook has an id")?;
+            let uri = format!("{}/v1/webhooks/{id}", self.base);
+            let (status, response) = self.authed(Method::DELETE, &uri, None).await?;
+            ensure!(
+                status == StatusCode::OK,
+                "webhooks_delete answered {status}: {response}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The wait after attempt `attempt` at a webhook delivery fails, from the
+    /// settings.
+    pub fn webhook_backoff(&self, attempt: u32) -> Duration {
+        let settings = &self.settings;
+        let doublings = attempt.saturating_sub(1).min(31);
+        Duration::from_secs(settings.webhook_backoff_base_seconds)
+            .saturating_mul(1 << doublings)
+            .min(Duration::from_secs(settings.webhook_backoff_cap_seconds))
+    }
+
+    /// How long a webhook takes to give up on one delivery: every attempt
+    /// that is made after waiting for the one before.
+    pub fn webhook_give_up(&self) -> Duration {
+        (1..self.settings.webhook_max_attempts)
+            .map(|attempt| self.webhook_backoff(attempt))
+            .sum::<Duration>()
+            + Duration::from_secs(self.settings.webhook_timeout_seconds)
+    }
+
     // ---- credentials ------------------------------------------------------
 
     /// `principals_create`, answering whatever the server says.
@@ -740,20 +958,29 @@ impl Target {
         Ok(outcome)
     }
 
-    /// Whether the broker lets the credential read the server's own records,
-    /// where the registry of principals is kept. Only Iggy can be asked: in
-    /// process the records have no reader but the server, and `None` comes
-    /// back.
+    /// Whether the broker lets the credential read the server's own record of
+    /// principals. See [`Target::broker_read_system`].
     pub async fn broker_read_registry(&self, token: &str) -> anyhow::Result<Option<Outcome>> {
+        self.broker_read_system(token, mansio_iggy::SYSTEM_TOPIC)
+            .await
+    }
+
+    /// Whether the broker lets the credential read a log of the server's own
+    /// records: `principals`, or `webhooks`, which holds signing secrets. Only
+    /// Iggy can be asked: in process the records have no reader but the
+    /// server, and `None` comes back.
+    pub async fn broker_read_system(
+        &self,
+        token: &str,
+        topic: &str,
+    ) -> anyhow::Result<Option<Outcome>> {
         if self.local.is_some() {
             return Ok(None);
         }
         let Some(session) = self.broker_session(token).await? else {
             return Ok(Some(Outcome::Unauthenticated));
         };
-        let outcome = session
-            .poll(mansio_iggy::SYSTEM_STREAM, mansio_iggy::SYSTEM_TOPIC)
-            .await?;
+        let outcome = session.poll(mansio_iggy::SYSTEM_STREAM, topic).await?;
         session.close().await;
         Ok(Some(outcome))
     }

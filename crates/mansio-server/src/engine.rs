@@ -43,7 +43,7 @@ use crate::facts::Facts;
 use crate::recover;
 use crate::settings::WorkSettings;
 pub use crate::state::Holder;
-use crate::state::{Item, Lease, Phase, TenantState, Then, backoff, held_lease};
+use crate::state::{Item, Lease, Phase, Remembered, TenantState, Then, backoff, held_lease};
 
 type Held = OwnedMutexGuard<TenantState>;
 
@@ -163,7 +163,7 @@ impl Engine {
             Err(BrokerError::NotFound(_)) => Vec::new(),
             Err(error) => return Err(error.into()),
         };
-        let logs = recover::read_logs(self.broker.as_ref(), tenant, &topics, self.page).await?;
+        let logs = recover::read_logs(&self.broker, tenant, &topics, self.page).await?;
         let rebuilt = recover::replay(tenant, &logs, &self.facts, self.clock.now_millis())?;
         let items: usize = rebuilt.queues.values().map(crate::state::Queue::len).sum();
         info!(%tenant, items, alerts = rebuilt.alerts.len(), "state rebuilt");
@@ -340,6 +340,16 @@ impl Engine {
     /// Claim the oldest claimable item of a queue for `principal`, under the
     /// name `consumer`. `None` if nothing can be claimed.
     ///
+    /// A consumer (the principal and the name together) that already holds a
+    /// live lease on the queue is given that lease again, not another item.
+    /// So a client whose answer was lost, and that asks again, does not leave
+    /// an item leased to nobody. The lease keeps its id and its expiry and
+    /// nothing is recorded. The one case that cannot be answered so is a
+    /// lease the server has only read back from its facts, which do not say
+    /// the id: it is given a new id on the same item with the same expiry, and
+    /// that is recorded as a `claimed` fact of the same attempt. To work on
+    /// several items at once, pull under several names.
+    ///
     /// # Errors
     ///
     /// Returns an error if the claim could not be recorded. The item is then
@@ -353,11 +363,22 @@ impl Engine {
     ) -> Result<Option<Claimed>, ApiError> {
         let mut held = self.lock(tenant).await?;
         let now = self.clock.now_millis();
-        let Some((id, message, attempt)) = held
+        let existing = held
+            .queues
+            .get(queue)
+            .and_then(|q| q.held_by(principal, consumer, now))
+            .map(|(id, item, lease)| (id.clone(), item.message.clone(), lease.clone()));
+        if let Some((id, message, lease)) = existing {
+            return self
+                .give_again(&mut held, tenant, queue, id, message, lease)
+                .await
+                .map(Some);
+        }
+        let Some((id, message)) = held
             .queues
             .get(queue)
             .and_then(|q| q.oldest_ready().and_then(|id| Some((id, q.get(id)?))))
-            .map(|(id, item)| (id.clone(), item.message.clone(), item.attempt()))
+            .map(|(id, item)| (id.clone(), item.message.clone()))
         else {
             return Ok(None);
         };
@@ -365,20 +386,13 @@ impl Engine {
         let lease_id = LeaseId::generate();
         let lease = Lease {
             fingerprint: lease_id.fingerprint(),
+            id: Some(Remembered(lease_id)),
             holder: principal.clone(),
             consumer: consumer.clone(),
             expires_at: now.saturating_add(millis(self.settings.lease)),
         };
-        let mut data = WorkFact::new(queue.clone(), message.id, attempt);
-        data.lease = Some(lease.fingerprint);
-        data.holder = Some(lease.holder.clone());
-        data.consumer = Some(lease.consumer.clone());
-        data.expires_at = Some(timestamp(lease.expires_at)?);
-        let fact = self
-            .facts
-            .work(tenant, WorkEvent::Claimed, principal, now, &id, &data)?;
-        self.append(&mut held, fact).await?;
-
+        self.record_claim(&mut held, tenant, queue, &id, &message, &lease)
+            .await?;
         held.queue_mut(queue)
             .set_phase(&id, Phase::Leased(lease.clone()));
         Ok(Some(Claimed {
@@ -387,6 +401,68 @@ impl Engine {
             expires_at: timestamp(lease.expires_at)?,
             item: message,
         }))
+    }
+
+    /// Record that `lease` is held on the item, as a `claimed` fact.
+    async fn record_claim(
+        &self,
+        held: &mut TenantState,
+        tenant: &TenantId,
+        queue: &Segment,
+        item: &ItemId,
+        message: &Envelope,
+        lease: &Lease,
+    ) -> Result<(), ApiError> {
+        let now = self.clock.now_millis();
+        let mut data = WorkFact::new(queue.clone(), message.id, message.attempt.unwrap_or(1));
+        data.lease = Some(lease.fingerprint);
+        data.holder = Some(lease.holder.clone());
+        data.consumer = Some(lease.consumer.clone());
+        data.expires_at = Some(timestamp(lease.expires_at)?);
+        let fact = self
+            .facts
+            .work(tenant, WorkEvent::Claimed, &lease.holder, now, item, &data)?;
+        self.append(held, fact).await?;
+        Ok(())
+    }
+
+    /// The lease a consumer already holds, handed to it again.
+    async fn give_again(
+        &self,
+        held: &mut TenantState,
+        tenant: &TenantId,
+        queue: &Segment,
+        item: ItemId,
+        message: Envelope,
+        lease: Lease,
+    ) -> Result<Claimed, ApiError> {
+        let expires_at = timestamp(lease.expires_at)?;
+        if let Some(Remembered(lease_id)) = lease.id {
+            return Ok(Claimed {
+                lease_id,
+                consumer: lease.consumer,
+                expires_at,
+                item: message,
+            });
+        }
+        // Read back from the facts, which keep a fingerprint of the id and not
+        // the id: this is a new id for the same lease.
+        let lease_id = LeaseId::generate();
+        let renewed = Lease {
+            fingerprint: lease_id.fingerprint(),
+            id: Some(Remembered(lease_id)),
+            ..lease
+        };
+        self.record_claim(held, tenant, queue, &item, &message, &renewed)
+            .await?;
+        held.queue_mut(queue)
+            .set_phase(&item, Phase::Leased(renewed.clone()));
+        Ok(Claimed {
+            lease_id,
+            consumer: renewed.consumer,
+            expires_at,
+            item: message,
+        })
     }
 
     /// Complete an item. Only the holder, naming the consumer and presenting

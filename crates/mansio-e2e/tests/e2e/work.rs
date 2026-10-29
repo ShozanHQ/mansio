@@ -26,10 +26,17 @@ async fn a_claimed_item_is_invisible_to_other_consumers_until_its_lease_expires(
     assert_eq!(claim.item.id, item.id);
     assert_eq!(item_of(&claim)?, item.id.to_string());
 
-    // Nobody else sees it, however they ask.
-    for consumer in ["second", "third", "first"] {
+    // Nobody else sees it, however they ask. The consumer that holds the lease
+    // is given that lease again, and not another item.
+    for consumer in ["second", "third"] {
         assert!(target.pull(QUEUE, consumer).await?.is_none(), "{consumer}");
     }
+    let again = target.pull(QUEUE, "first").await?;
+    assert_eq!(
+        again.map(|claim| claim.lease_id),
+        Some(claim.lease_id),
+        "the holder is given its lease again"
+    );
 
     // It reappears only after the lease, and then as a new attempt.
     let wait = target.lease() + target.backoff(1) + SLACK;
@@ -65,8 +72,9 @@ async fn an_unacked_claim_expires_and_the_item_is_claimed_again_with_the_attempt
     assert_eq!(first.item.attempt, Some(1));
     let expires_at = millis(&first.expires_at)?;
 
+    // By another consumer: "worker" is given its lease again until it ends.
     let wait = target.lease() + target.backoff(1) + SLACK;
-    let second = target.claim(QUEUE, "worker", wait).await?;
+    let second = target.claim(QUEUE, "worker-2", wait).await?;
     assert_eq!(second.item.attempt, Some(2));
     assert_eq!(second.item.item_id, first.item.item_id);
     assert_ne!(second.item.id, first.item.id, "a retry is a new message");
@@ -311,11 +319,13 @@ async fn items_are_claimed_oldest_first_and_an_empty_queue_answers_204() -> anyh
     }
     // Another queue's items are not this queue's.
     target.work_publish("reviews", &job(9)).await?;
-    for expected in &published {
-        let claim = target.claim(QUEUE, "worker", SLACK).await?;
+    for (n, expected) in published.iter().enumerate() {
+        // A consumer of its own for each, so that none is given its lease
+        // again.
+        let claim = target.claim(QUEUE, &format!("worker-{n}"), SLACK).await?;
         assert_eq!(&claim.item.id, expected);
     }
-    assert!(target.pull(QUEUE, "worker").await?.is_none());
+    assert!(target.pull(QUEUE, "worker-last").await?.is_none());
 
     // A pull must say who is pulling.
     for body in [

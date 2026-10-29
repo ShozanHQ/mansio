@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 
 use crate::access::{Action, Grant, allows};
-use crate::broker::{Broker, BrokerUser, BrokerUserInfo, Caller, Minted, Stored, SystemRecord};
+use crate::broker::{
+    Broker, BrokerUser, BrokerUserInfo, Caller, Minted, Stored, SystemLog, SystemRecord,
+};
 use crate::credential::{Credential, CredentialDigest};
 use crate::envelope::Envelope;
 use crate::error::BrokerError;
@@ -68,7 +70,7 @@ type Granted = Option<User>;
 #[derive(Debug, Default)]
 pub struct MemoryBroker {
     tenants: Mutex<HashMap<TenantId, Topics>>,
-    system: Mutex<Vec<Vec<u8>>>,
+    system: Mutex<HashMap<SystemLog, Vec<Vec<u8>>>>,
     users: Mutex<Users>,
 }
 
@@ -201,17 +203,26 @@ impl Broker for MemoryBroker {
         Ok(stored)
     }
 
-    async fn system_append(&self, record: &[u8]) -> Result<(), BrokerError> {
+    async fn system_append(&self, log: SystemLog, record: &[u8]) -> Result<(), BrokerError> {
         self.system
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .entry(log)
+            .or_default()
             .push(record.to_vec());
         Ok(())
     }
 
-    async fn system_read(&self, offset: u64, max: u32) -> Result<Vec<SystemRecord>, BrokerError> {
+    async fn system_read(
+        &self,
+        log: SystemLog,
+        offset: u64,
+        max: u32,
+    ) -> Result<Vec<SystemRecord>, BrokerError> {
         let system = self.system.lock().unwrap_or_else(PoisonError::into_inner);
         Ok(system
+            .get(&log)
+            .map_or(&[][..], Vec::as_slice)
             .iter()
             .enumerate()
             .skip(usize::try_from(offset).unwrap_or(usize::MAX))
@@ -857,16 +868,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_system_log_keeps_order_and_pages() {
+    async fn the_system_logs_keep_order_and_pages_and_are_apart() {
         let broker = MemoryBroker::new();
-        assert!(broker.system_read(0, 10).await.unwrap().is_empty());
+        let principals = SystemLog::Principals;
+        assert!(
+            broker
+                .system_read(principals, 0, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         for n in 0..4u8 {
-            broker.system_append(&[n]).await.unwrap();
+            broker.system_append(principals, &[n]).await.unwrap();
         }
-        let page = broker.system_read(1, 2).await.unwrap();
+        let page = broker.system_read(principals, 1, 2).await.unwrap();
         let seen: Vec<(u64, Vec<u8>)> = page.into_iter().map(|r| (r.offset, r.payload)).collect();
         assert_eq!(seen, [(1, vec![1]), (2, vec![2])]);
-        assert!(broker.system_read(4, 10).await.unwrap().is_empty());
+        assert!(
+            broker
+                .system_read(principals, 4, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Another log has nothing of the first one's.
+        let webhooks = SystemLog::Webhooks;
+        assert!(
+            broker
+                .system_read(webhooks, 0, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        broker.system_append(webhooks, b"w").await.unwrap();
+        let read = broker.system_read(webhooks, 0, 10).await.unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].payload, b"w");
+        assert_eq!(
+            broker.system_read(principals, 0, 10).await.unwrap().len(),
+            4
+        );
     }
 
     #[tokio::test]

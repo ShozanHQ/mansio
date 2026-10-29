@@ -18,7 +18,7 @@ use iggy::prelude::{
 };
 use mansio_core::{
     Broker, BrokerError, BrokerUser, BrokerUserInfo, Caller, Credential, Envelope, EventId, Grant,
-    Minted, Stored, SystemRecord, TenantId, Topic,
+    Minted, Stored, SystemLog, SystemRecord, TenantId, Topic,
 };
 use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use tracing::{info, warn};
@@ -33,6 +33,12 @@ use crate::sessions::{Session, Sessions};
 pub const SYSTEM_STREAM: &str = "mansio.system";
 /// The topic of [`SYSTEM_STREAM`] that holds the registry of principals.
 pub const SYSTEM_TOPIC: &str = "principals";
+/// The topic of [`SYSTEM_STREAM`] that holds the registry of webhooks, and
+/// with it their signing secrets.
+pub const SYSTEM_WEBHOOKS_TOPIC: &str = "webhooks";
+/// The topic of [`SYSTEM_STREAM`] that holds where every named consumer and
+/// every webhook has got to.
+pub const SYSTEM_CURSORS_TOPIC: &str = "cursors";
 /// What the personal access token of every user mansio makes is called.
 const TOKEN_NAME: &str = "mansio";
 
@@ -524,13 +530,15 @@ impl IggyBroker {
 
     // ---- the server's own records -----------------------------------------
 
-    /// Make the stream and topic for the server's own records, once.
+    /// Make the stream and the topics for the server's own records, once.
     async fn ensure_system(&self) -> Result<(), BrokerError> {
         self.system_ready
             .get_or_try_init(|| async {
                 self.make_stream(SYSTEM_STREAM).await?;
-                self.make_topic(SYSTEM_STREAM, SYSTEM_TOPIC, &system_topic_options())
-                    .await?;
+                for log in SystemLog::ALL {
+                    self.make_topic(SYSTEM_STREAM, log.as_str(), &system_topic_options())
+                        .await?;
+                }
                 Ok::<(), BrokerError>(())
             })
             .await
@@ -862,7 +870,7 @@ impl Broker for IggyBroker {
         }
     }
 
-    async fn system_append(&self, record: &[u8]) -> Result<(), BrokerError> {
+    async fn system_append(&self, log: SystemLog, record: &[u8]) -> Result<(), BrokerError> {
         self.ensure_system().await?;
         let mut message = IggyMessage::builder()
             .payload(Bytes::copy_from_slice(record))
@@ -871,7 +879,7 @@ impl Broker for IggyBroker {
         self.client
             .send_messages(
                 &Identifier::named(SYSTEM_STREAM).map_err(map_iggy)?,
-                &Identifier::named(SYSTEM_TOPIC).map_err(map_iggy)?,
+                &Identifier::named(log.as_str()).map_err(map_iggy)?,
                 &Partitioning::partition_id(PARTITION),
                 std::slice::from_mut(&mut message),
             )
@@ -880,7 +888,12 @@ impl Broker for IggyBroker {
         Ok(())
     }
 
-    async fn system_read(&self, offset: u64, max: u32) -> Result<Vec<SystemRecord>, BrokerError> {
+    async fn system_read(
+        &self,
+        log: SystemLog,
+        offset: u64,
+        max: u32,
+    ) -> Result<Vec<SystemRecord>, BrokerError> {
         if max == 0 {
             return Ok(Vec::new());
         }
@@ -889,7 +902,7 @@ impl Broker for IggyBroker {
             .client
             .poll_messages(
                 &Identifier::named(SYSTEM_STREAM).map_err(map_iggy)?,
-                &Identifier::named(SYSTEM_TOPIC).map_err(map_iggy)?,
+                &Identifier::named(log.as_str()).map_err(map_iggy)?,
                 Some(PARTITION),
                 &Consumer::default(),
                 &PollingStrategy::offset(offset),
@@ -1244,6 +1257,11 @@ mod tests {
     fn the_stream_of_the_servers_own_records_cannot_be_a_tenant() {
         assert!(SYSTEM_STREAM.parse::<TenantId>().is_err());
         assert!(SYSTEM_TOPIC.parse::<Topic>().is_err());
+        assert!(SYSTEM_WEBHOOKS_TOPIC.parse::<Topic>().is_err());
+        assert_eq!(SystemLog::Principals.as_str(), SYSTEM_TOPIC);
+        assert_eq!(SystemLog::Webhooks.as_str(), SYSTEM_WEBHOOKS_TOPIC);
+        assert_eq!(SystemLog::Cursors.as_str(), SYSTEM_CURSORS_TOPIC);
+        assert!(SYSTEM_CURSORS_TOPIC.parse::<Topic>().is_err());
         assert!(user_id(BrokerUser(7)).is_ok());
     }
 
