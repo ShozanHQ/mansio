@@ -54,6 +54,8 @@ async fn main() -> anyhow::Result<()> {
     Server::new(broker, Auth::new(settings.token, settings.token_principal))
         .with_sink(sink)
         .with_limits(settings.limits)
+        .with_work_settings(settings.work)
+        .context("the work settings")?
         .serve(listener, shutdown_signal())
         .await
         .context("serving")?;

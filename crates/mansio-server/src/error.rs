@@ -16,11 +16,19 @@ pub enum ApiError {
     Unauthorized,
     /// 413: the body is larger than `MANSIO_MAX_BODY_BYTES`.
     PayloadTooLarge(String),
-    /// 404: no such route, tenant or topic.
+    /// 403: the caller does not hold what it presented, for example a lease.
+    Forbidden(String),
+    /// 404: no such route, tenant, topic, item or alert.
     NotFound(String),
-    /// 502: the broker refused.
+    /// 409: the request is well formed but the state it acts on does not
+    /// allow it, for example an alert already acknowledged.
+    Conflict(String),
+    /// 502: the broker named a refusal that it makes before it stores
+    /// anything. Nothing was stored.
     BadGateway(String),
-    /// 503: the broker or the sink is not available.
+    /// 503: the broker or the sink is not available, or the broker's answer
+    /// does not say whether it stored the request. A client sends it again
+    /// with the same id.
     Unavailable(String),
     /// 500: a fault in the server. The message is generic; the detail is
     /// logged.
@@ -33,7 +41,9 @@ impl ApiError {
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
             ApiError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
+            ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::BadGateway(_) => StatusCode::BAD_GATEWAY,
             ApiError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Internal => StatusCode::INTERNAL_SERVER_ERROR,
@@ -45,7 +55,9 @@ impl ApiError {
             ApiError::BadRequest(_) => "bad_request",
             ApiError::Unauthorized => "unauthorized",
             ApiError::PayloadTooLarge(_) => "payload_too_large",
+            ApiError::Forbidden(_) => "forbidden",
             ApiError::NotFound(_) => "not_found",
+            ApiError::Conflict(_) => "conflict",
             ApiError::BadGateway(_) => "broker_refused",
             ApiError::Unavailable(_) => "unavailable",
             ApiError::Internal => "internal",
@@ -72,7 +84,9 @@ impl ApiError {
         match self {
             ApiError::BadRequest(m)
             | ApiError::PayloadTooLarge(m)
+            | ApiError::Forbidden(m)
             | ApiError::NotFound(m)
+            | ApiError::Conflict(m)
             | ApiError::BadGateway(m)
             | ApiError::Unavailable(m) => m.clone(),
             ApiError::Unauthorized => "missing or invalid bearer token".to_owned(),

@@ -30,3 +30,46 @@ All notable changes to mansio are listed here. The format follows
   `persisted` or `replicated` for the durable topics and for `presence`.
 - The publish answer's `offset` is optional: left out when Iggy does not say
   where the message landed and it is not among the recent ones.
+- Work items over the HTTP API (`work_publish`, `work_pull`, `work_ack`,
+  `work_fail`): a claim is a lease, a fail or an expired lease republishes the
+  item one attempt on after a doubling backoff, and past the attempt cap it goes
+  to `dead` and nowhere else. Alerts (`alerts_publish`, `alerts_ack`) are
+  acknowledged once and surfaced again each interval until they are. Every
+  transition is an envelope on `facts.work` or `facts.alert`, recorded in the
+  sink first. A restarted server rebuilds its state from the topics.
+- `GET /v1/settings`, and the settings `MANSIO_LEASE_SECONDS`,
+  `MANSIO_MAX_ATTEMPTS`, `MANSIO_BACKOFF_BASE_SECONDS`,
+  `MANSIO_BACKOFF_CAP_SECONDS`, `MANSIO_ALERT_RESURFACE_SECONDS` and
+  `MANSIO_TICK_MILLIS`.
+- `Broker::tenants` and `Broker::topics`, so a server can find what to take up
+  again on start.
+- `MANSIO_IGGY_SEGMENT_SIZE_BYTES`, the segment size of the topics mansio
+  creates. Iggy applies retention to whole segments that have filled and
+  rolled.
+- Two-pass end-to-end tests that restart mansio-server between the passes, run
+  by the CI `e2e` job against Iggy: a queue longer than a page with a claimed
+  item, and an `alerts` topic that retention has trimmed.
+
+### Changed
+
+- A broker error is a 502 only when it is a refusal the broker named before it
+  stores anything (not found, unauthorized, an invalid identifier, a message
+  count or payload size it refuses). Every other Iggy error is a 503, because
+  the Iggy client writes a request before it reads the reply, and a reply it
+  cannot read says nothing about whether the write was applied. A 503 is
+  resent with the same id, and the engine rebuilds the tenant's state after
+  one.
+- Every durable publish holds a per-tenant lock across the sink record and the
+  broker publish, so the sink sees a tenant's messages in the order its topics
+  hold them.
+- The generic messages route refuses `work.<queue>`, `facts.work`,
+  `facts.alert` and `dead`.
+- An item id and an alert id are used once: resending one the queue or tenant
+  has had is a 409.
+- After a publish fails, which may still have stored the message, the engine
+  rebuilds the tenant's state from its topics.
+- `Server::with_work_settings` checks the settings and returns an error.
+- `compose.yaml` passes the work settings through, and keeps the sink file in
+  `MANSIO_SINK_DIR` when it is set. The health check of mansio-server has a
+  start period of `MANSIO_HEALTH_START_PERIOD` (60s), because a start replays
+  every tenant's topics before `/healthz` answers.

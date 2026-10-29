@@ -37,6 +37,17 @@ fn missing_topic(tenant: &TenantId, topic: &Topic) -> BrokerError {
 
 #[async_trait]
 impl Broker for MemoryBroker {
+    async fn tenants(&self) -> Result<Vec<TenantId>, BrokerError> {
+        Ok(self.lock().keys().cloned().collect())
+    }
+
+    async fn topics(&self, tenant: &TenantId) -> Result<Vec<Topic>, BrokerError> {
+        self.lock()
+            .get(tenant)
+            .map(|topics| topics.keys().cloned().collect())
+            .ok_or_else(|| BrokerError::NotFound(format!("tenant {tenant}")))
+    }
+
     async fn ensure_tenant(&self, tenant: &TenantId) -> Result<(), BrokerError> {
         self.lock().entry(tenant.clone()).or_default();
         Ok(())
@@ -223,6 +234,43 @@ mod tests {
         broker.ensure_tenant(&tenant).await.unwrap();
         let error = broker.poll(&tenant, &Topic::Dead, 0, 1).await.unwrap_err();
         assert!(matches!(error, BrokerError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn tenants_and_topics_can_be_listed() {
+        let broker = broker_with("acme", "alerts").await;
+        broker
+            .ensure_topic(&"acme".parse().unwrap(), &Topic::Dead)
+            .await
+            .unwrap();
+        broker
+            .ensure_tenant(&"other".parse().unwrap())
+            .await
+            .unwrap();
+
+        let mut tenants = broker.tenants().await.unwrap();
+        tenants.sort();
+        assert_eq!(tenants, ["acme".parse().unwrap(), "other".parse().unwrap()]);
+        let mut topics: Vec<String> = broker
+            .topics(&"acme".parse().unwrap())
+            .await
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        topics.sort();
+        assert_eq!(topics, ["alerts", "dead"]);
+        assert!(
+            broker
+                .topics(&"other".parse().unwrap())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            broker.topics(&"nope".parse().unwrap()).await,
+            Err(BrokerError::NotFound(_))
+        ));
     }
 
     #[tokio::test]

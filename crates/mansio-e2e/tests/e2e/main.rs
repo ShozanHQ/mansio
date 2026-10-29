@@ -1,127 +1,29 @@
 //! End-to-end tests: publish and poll through the HTTP API, and through the
-//! CLI binary.
+//! CLI binary; work items with claim, lease, ack, fail, retry and a dead
+//! topic; alerts; and the order of the sink.
 //!
 //! With `MANSIO_E2E_URL` unset, each test starts a server in this process on
 //! a `MemoryBroker`. With it set, the tests use that server (CI runs them
 //! against `docker compose` and Iggy), and `MANSIO_TOKEN` must be the token
-//! it accepts. Every test uses a tenant of its own, so they do not see each
-//! other's messages on a shared server.
+//! it accepts. See `e2e/harness.rs`.
+
+mod alerts;
+mod harness;
+mod ordering;
+mod passes;
+mod restart;
+mod work;
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use anyhow::{Context, anyhow, bail, ensure};
-use mansio_core::api::{Polled, Published};
-use mansio_core::{Envelope, EventId, MemoryBroker};
-use mansio_server::{Auth, Server};
+use harness::Target;
+use mansio_core::api::Published;
+use mansio_core::{Envelope, EventId};
 use reqwest::{Method, StatusCode};
-use secrecy::SecretString;
 use serde_json::{Value, json};
-use tokio::net::TcpListener;
-
-/// The token the in-process server accepts.
-const LOCAL_TOKEN: &str = "e2e-local-token";
-/// The principal the server's token stands for, by default.
-const PRINCIPAL: &str = "service:mansio";
-
-/// A server to test against, and the means to talk to it.
-struct Target {
-    base: String,
-    token: String,
-    http: reqwest::Client,
-    tenant: String,
-}
-
-impl Target {
-    async fn start() -> anyhow::Result<Self> {
-        let tenant = format!("e2e-{}", EventId::generate().to_string().replace('-', ""));
-        let (base, token) = match std::env::var("MANSIO_E2E_URL") {
-            Ok(url) if !url.is_empty() => {
-                let token = std::env::var("MANSIO_TOKEN")
-                    .context("MANSIO_TOKEN must be set when MANSIO_E2E_URL is")?;
-                (url.trim_end_matches('/').to_owned(), token)
-            }
-            _ => {
-                let listener = TcpListener::bind("127.0.0.1:0").await?;
-                let base = format!("http://{}", listener.local_addr()?);
-                let auth = Auth::new(
-                    SecretString::from(LOCAL_TOKEN.to_owned()),
-                    PRINCIPAL.parse()?,
-                );
-                let server = Server::new(Arc::new(MemoryBroker::new()), auth);
-                tokio::spawn(server.serve(listener, std::future::pending()));
-                (base, LOCAL_TOKEN.to_owned())
-            }
-        };
-        Ok(Self {
-            base,
-            token,
-            http: reqwest::Client::new(),
-            tenant,
-        })
-    }
-
-    fn messages_uri(&self, topic: &str) -> String {
-        format!(
-            "{}/v1/tenants/{}/topics/{topic}/messages",
-            self.base, self.tenant
-        )
-    }
-
-    /// Send a request, with the token unless `token` says otherwise, and
-    /// return the status and the JSON body.
-    async fn call(
-        &self,
-        method: Method,
-        uri: &str,
-        token: Option<&str>,
-        body: Option<&Value>,
-    ) -> anyhow::Result<(StatusCode, Value)> {
-        let mut request = self.http.request(method, uri);
-        if let Some(token) = token {
-            request = request.bearer_auth(token);
-        }
-        if let Some(body) = body {
-            request = request.json(body);
-        }
-        let response = request.send().await?;
-        let status = response.status();
-        let bytes = response.bytes().await?;
-        Ok((
-            status,
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-        ))
-    }
-
-    async fn publish(&self, topic: &str, body: &Value) -> anyhow::Result<Published> {
-        let (status, response) = self
-            .call(
-                Method::POST,
-                &self.messages_uri(topic),
-                Some(&self.token),
-                Some(body),
-            )
-            .await?;
-        ensure!(
-            status == StatusCode::CREATED,
-            "publish answered {status}: {response}"
-        );
-        Ok(serde_json::from_value(response)?)
-    }
-
-    async fn poll(&self, topic: &str, query: &str) -> anyhow::Result<Polled> {
-        let uri = format!("{}?{query}", self.messages_uri(topic));
-        let (status, response) = self
-            .call(Method::GET, &uri, Some(&self.token), None)
-            .await?;
-        ensure!(
-            status == StatusCode::OK,
-            "poll answered {status}: {response}"
-        );
-        Ok(serde_json::from_value(response)?)
-    }
-}
 
 /// Where the server said a message landed. These tests publish one message at
 /// a time and expect to be told.
@@ -162,19 +64,19 @@ async fn a_published_envelope_is_polled_back_with_every_field_intact() -> anyhow
     let id = EventId::generate().to_string();
     let sent = full_body(&id);
 
-    let published = target.publish("work.builds", &sent).await?;
+    let published = target.publish("facts.builds", &sent).await?;
 
     // What the server was told, plus what it sets from the path and the token.
     let mut expected = sent;
     expected["tenant"] = json!(target.tenant);
-    expected["topic"] = json!("work.builds");
+    expected["topic"] = json!("facts.builds");
     expected["principalkind"] = json!("service");
     expected["principalname"] = json!("mansio");
     assert_eq!(serde_json::to_value(&published.envelope)?, expected);
 
     let offset = offset_of(&published)?;
     let polled = target
-        .poll("work.builds", &format!("offset={offset}"))
+        .poll("facts.builds", &format!("offset={offset}"))
         .await?;
     ensure!(
         polled.messages.len() == 1,

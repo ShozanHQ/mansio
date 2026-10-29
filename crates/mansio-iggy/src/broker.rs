@@ -6,9 +6,10 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy::prelude::{
-    AutoLogin, Client, Consumer, Credentials, Durability as IggyDurability, Identifier, IggyClient,
-    IggyClientBuilder, IggyDuration, IggyError, IggyExpiry, IggyMessage, MaxTopicSize,
-    MessageClient, Partitioning, PollingStrategy, StreamClient, TopicClient, TopicCreateOptions,
+    AutoLogin, Client, Consumer, Credentials, Durability as IggyDurability, Identifier,
+    IggyByteSize, IggyClient, IggyClientBuilder, IggyDuration, IggyError, IggyExpiry, IggyMessage,
+    MaxTopicSize, MessageClient, Partitioning, PollingStrategy, StreamClient, TopicClient,
+    TopicCreateOptions,
 };
 use mansio_core::{Broker, BrokerError, Envelope, EventId, Stored, TenantId, Topic};
 use tracing::{info, warn};
@@ -78,6 +79,7 @@ pub struct IggyBroker {
     client: IggyClient,
     retention: Retention,
     durability: DurabilityPolicy,
+    segment_size_bytes: u64,
     locate_window: u32,
     ensured: Ensured,
 }
@@ -89,8 +91,7 @@ impl IggyBroker {
     /// # Errors
     ///
     /// Returns [`BrokerError::Unavailable`] if Iggy does not answer within
-    /// the connect timeout, and [`BrokerError::Rejected`] if it refuses the
-    /// credentials.
+    /// the connect timeout or the sign-in fails.
     pub async fn connect(config: IggyConfig) -> Result<Self, BrokerError> {
         let client = IggyClientBuilder::new()
             .with_tcp()
@@ -115,6 +116,7 @@ impl IggyBroker {
             client,
             retention: config.retention,
             durability: config.durability,
+            segment_size_bytes: config.segment_size_bytes,
             locate_window: config.locate_window,
             ensured: Ensured::default(),
         })
@@ -277,7 +279,12 @@ impl IggyBroker {
             Ok(None) | Err(IggyError::TopicIdNotFound(..) | IggyError::TopicNameNotFound(..)) => {}
             Err(error) => return Err(map_iggy(error)),
         }
-        let options = topic_options(&self.retention, &self.durability, topic);
+        let options = topic_options(
+            &self.retention,
+            &self.durability,
+            self.segment_size_bytes,
+            topic,
+        );
         match self
             .client
             .create_topic(&stream, &topic.to_string(), &options)
@@ -331,17 +338,20 @@ fn iggy_durability(durability: Durability) -> IggyDurability {
 }
 
 /// How a topic is created: one partition, the retention and durability of its
-/// kind, and no size cap when it keeps messages forever, so that a default
-/// cap on the server never trims it.
+/// kind, the configured segment size (none leaves it to Iggy), and no size cap
+/// when it keeps messages forever, so that a default cap on the server never
+/// trims it.
 fn topic_options(
     retention: &Retention,
     durability: &DurabilityPolicy,
+    segment_size_bytes: u64,
     topic: &Topic,
 ) -> TopicCreateOptions {
     let durability = iggy_durability(durability.for_kind(topic.kind()));
     TopicCreateOptions {
         partitions_count: Some(1),
         message_expiry: Some(expiry(retention, topic)),
+        segment_size: (segment_size_bytes > 0).then(|| IggyByteSize::new(segment_size_bytes)),
         max_topic_size: retention
             .for_kind(topic.kind())
             .is_none()
@@ -370,6 +380,16 @@ fn decode(tenant: &TenantId, topic: &Topic, message: &IggyMessage) -> Result<Sto
     Ok(Stored { offset, envelope })
 }
 
+/// Sort what the Iggy SDK reports into what the engine acts on.
+///
+/// `Rejected` says nothing was stored, so it is an allowlist: the statuses
+/// that Iggy, or the SDK before it sends, gives for a request it has refused
+/// outright. Every other error is `Unavailable`, the answer that has a client
+/// send again with the same id. The TCP client writes and flushes a request
+/// before it reads the reply, and a reply that cannot be read fails after the
+/// write: a frame of the wrong size or shape is `InvalidCommand`, an eviction
+/// whose reason is unreadable is `Unauthenticated`, a status code it does not
+/// know is `Error`. None of those says whether the write was applied.
 fn map_iggy(error: IggyError) -> BrokerError {
     let text = error.to_string();
     match error {
@@ -378,20 +398,40 @@ fn map_iggy(error: IggyError) -> BrokerError {
         | IggyError::TopicIdNotFound(..)
         | IggyError::TopicNameNotFound(..)
         | IggyError::ResourceNotFound(_) => BrokerError::NotFound(text),
-        IggyError::Disconnected
-        | IggyError::CannotEstablishConnection
-        | IggyError::ClientShutdown
-        | IggyError::StaleClient
-        | IggyError::TcpError
-        | IggyError::TransientNotCommitted
-        | IggyError::TransientNotAccepted
-        | IggyError::TaskTimeout => BrokerError::Unavailable(text),
-        _ => BrokerError::Rejected(text),
+        IggyError::Unauthorized
+        | IggyError::InvalidIdentifier
+        | IggyError::InvalidStreamName
+        | IggyError::InvalidStreamId
+        | IggyError::InvalidTopicName
+        | IggyError::InvalidTopicId
+        | IggyError::InvalidMessagesCount
+        | IggyError::TooBigMessagePayload => BrokerError::Rejected(text),
+        _ => BrokerError::Unavailable(text),
     }
 }
 
 #[async_trait]
 impl Broker for IggyBroker {
+    async fn tenants(&self) -> Result<Vec<TenantId>, BrokerError> {
+        let streams = self.client.get_streams().await.map_err(map_iggy)?;
+        Ok(streams
+            .iter()
+            .filter_map(|stream| stream.name.parse().ok())
+            .collect())
+    }
+
+    async fn topics(&self, tenant: &TenantId) -> Result<Vec<Topic>, BrokerError> {
+        let topics = self
+            .client
+            .get_topics(&stream_id(tenant)?)
+            .await
+            .map_err(map_iggy)?;
+        Ok(topics
+            .iter()
+            .filter_map(|topic| topic.name.parse().ok())
+            .collect())
+    }
+
     async fn ensure_tenant(&self, tenant: &TenantId) -> Result<(), BrokerError> {
         let result = self.find_or_create_stream(tenant).await;
         self.ensured.forget_if_missing(tenant, result)
@@ -510,14 +550,51 @@ mod tests {
             map_iggy(IggyError::CannotEstablishConnection),
             BrokerError::Unavailable(_)
         ));
-        assert!(matches!(
-            map_iggy(IggyError::Unauthorized),
-            BrokerError::Rejected(_)
-        ));
-        assert!(matches!(
-            map_iggy(IggyError::InvalidCredentials),
-            BrokerError::Rejected(_)
-        ));
+    }
+
+    #[test]
+    fn only_a_named_refusal_that_precedes_the_write_is_rejected() {
+        for refusal in [
+            IggyError::Unauthorized,
+            IggyError::InvalidIdentifier,
+            IggyError::InvalidStreamName,
+            IggyError::InvalidStreamId,
+            IggyError::InvalidTopicName,
+            IggyError::InvalidTopicId,
+            IggyError::InvalidMessagesCount,
+            IggyError::TooBigMessagePayload,
+        ] {
+            let text = refusal.to_string();
+            assert!(
+                matches!(map_iggy(refusal), BrokerError::Rejected(why) if why == text),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_error_that_can_follow_the_write_is_never_a_refusal() {
+        // What the TCP client raises once it has written a request and cannot
+        // make sense of the reply (a frame it cannot read, a status it does
+        // not know, an eviction whose reason it maps to a sign-in error): the
+        // outcome is not known, and a 502 would have the client believe
+        // nothing was stored.
+        for after_the_write in [
+            IggyError::InvalidCommand,
+            IggyError::Error,
+            IggyError::Unauthenticated,
+            IggyError::EmptyResponse,
+            IggyError::StaleClient,
+            IggyError::TransientNotCommitted,
+            IggyError::InvalidCredentials,
+            IggyError::CannotAppendMessage,
+        ] {
+            let text = after_the_write.to_string();
+            assert!(
+                matches!(map_iggy(after_the_write), BrokerError::Unavailable(why) if why == text),
+                "{text}"
+            );
+        }
     }
 
     #[test]
@@ -575,7 +652,7 @@ mod tests {
         let retention = Retention::default();
         let policy = DurabilityPolicy::default();
         for name in ["facts.build", "work.builds", "alerts", "dead"] {
-            let options = topic_options(&retention, &policy, &name.parse().unwrap());
+            let options = topic_options(&retention, &policy, 0, &name.parse().unwrap());
             assert_eq!(options.durability, IggyDurability::Persisted, "{name}");
             assert_eq!(
                 options.consumer_offset_durability,
@@ -583,7 +660,7 @@ mod tests {
                 "{name}"
             );
         }
-        let options = topic_options(&retention, &policy, &Topic::Presence);
+        let options = topic_options(&retention, &policy, 0, &Topic::Presence);
         assert_eq!(options.durability, IggyDurability::Replicated);
         assert_eq!(
             options.consumer_offset_durability,
@@ -597,9 +674,14 @@ mod tests {
             durable: Durability::Replicated,
             presence: Durability::Persisted,
         };
-        let facts = topic_options(&Retention::default(), &policy, &"facts.x".parse().unwrap());
+        let facts = topic_options(
+            &Retention::default(),
+            &policy,
+            0,
+            &"facts.x".parse().unwrap(),
+        );
         assert_eq!(facts.durability, IggyDurability::Replicated);
-        let presence = topic_options(&Retention::default(), &policy, &Topic::Presence);
+        let presence = topic_options(&Retention::default(), &policy, 0, &Topic::Presence);
         assert_eq!(presence.durability, IggyDurability::Persisted);
     }
 
@@ -611,12 +693,12 @@ mod tests {
         };
         let policy = DurabilityPolicy::default();
 
-        let kept = topic_options(&retention, &policy, &"work.builds".parse().unwrap());
+        let kept = topic_options(&retention, &policy, 0, &"work.builds".parse().unwrap());
         assert_eq!(kept.partitions_count, Some(1));
         assert_eq!(kept.message_expiry, Some(IggyExpiry::NeverExpire));
         assert_eq!(kept.max_topic_size, Some(MaxTopicSize::Unlimited));
 
-        let expiring = topic_options(&retention, &policy, &Topic::Presence);
+        let expiring = topic_options(&retention, &policy, 0, &Topic::Presence);
         assert_eq!(expiring.partitions_count, Some(1));
         assert_eq!(
             expiring.message_expiry,
@@ -625,6 +707,20 @@ mod tests {
             )))
         );
         assert_eq!(expiring.max_topic_size, None);
+    }
+
+    #[test]
+    fn the_segment_size_reaches_the_topic_and_zero_leaves_it_to_iggy() {
+        let (retention, policy) = (Retention::default(), DurabilityPolicy::default());
+        let topic: Topic = "alerts".parse().unwrap();
+        assert_eq!(
+            topic_options(&retention, &policy, 0, &topic).segment_size,
+            None
+        );
+        assert_eq!(
+            topic_options(&retention, &policy, 1024 * 1024, &topic).segment_size,
+            Some(IggyByteSize::new(1024 * 1024))
+        );
     }
 
     #[test]
