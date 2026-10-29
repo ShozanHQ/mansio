@@ -28,7 +28,6 @@
 //! log, so the next use reads the log again before it trusts them.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
 
 use mansio_core::{Broker, ConsumerName, Principal, SystemLog, TenantId, Topic, WebhookId};
@@ -111,15 +110,28 @@ impl Entry {
     }
 }
 
+/// What is known of the log, all of it changed together.
+#[derive(Debug, Default)]
+struct State {
+    positions: HashMap<Cursor, u64>,
+    /// Whether the positions are what the log says, as far as is known. It is
+    /// false until the log has been read, and nothing reads the positions while
+    /// it is.
+    fresh: bool,
+    /// How many commits have failed in a way that does not say whether their
+    /// record was stored. A read of the log that began before one of them may
+    /// not have the record, and so does not make the positions fresh.
+    unsure: u64,
+}
+
 /// The positions of every consumer and webhook.
 pub struct Cursors {
     broker: Arc<dyn Broker>,
     /// How many records to read at a time when loading.
     page: u32,
-    positions: StdMutex<HashMap<Cursor, u64>>,
-    /// Whether the positions are what the log says, as far as is known.
-    fresh: AtomicBool,
-    /// Held while the log is read, so that it is read by one at a time.
+    state: StdMutex<State>,
+    /// Held while the log is read, so that it is read by one at a time and
+    /// whoever else needs the positions waits for it.
     reading: Mutex<()>,
     /// Held from the write of a record to the change of the position it sets,
     /// so that the positions end as the log does when commits race.
@@ -138,44 +150,54 @@ impl Cursors {
         Self {
             broker,
             page: page.max(1),
-            positions: StdMutex::default(),
-            fresh: AtomicBool::new(false),
+            state: StdMutex::default(),
             reading: Mutex::new(()),
             writing: Mutex::new(()),
         }
     }
 
-    fn positions(&self) -> MutexGuard<'_, HashMap<Cursor, u64>> {
-        self.positions
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Read the log, if it has not been read or a commit may have left the
-    /// positions behind it. The next call tries again if this one failed.
+    /// positions behind it. Whoever calls while it is being read waits for it,
+    /// and never sees the positions as they were before. The next call tries
+    /// again if this one failed.
     ///
     /// # Errors
     ///
     /// Returns an error if the log cannot be read.
     pub async fn load(&self) -> Result<(), ApiError> {
-        if self.fresh.load(Ordering::Acquire) {
+        if self.state().fresh {
             return Ok(());
         }
         let _reading = self.reading.lock().await;
-        if self.fresh.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        // Marked fresh before the read, so that a commit that fails while the
-        // log is being read marks it stale again and is not forgotten.
-        self.fresh.store(true, Ordering::Release);
-        if let Err(error) = self.rebuild().await {
-            self.fresh.store(false, Ordering::Release);
-            return Err(error);
-        }
+        let unsure = {
+            let state = self.state();
+            if state.fresh {
+                return Ok(());
+            }
+            state.unsure
+        };
+        let positions = self.read_log().await?;
+        // Fresh only if no commit has failed unsure since the read began; if
+        // one has, the next use reads again.
+        let mut state = self.state();
+        state.positions = positions;
+        state.fresh = state.unsure == unsure;
         Ok(())
     }
 
-    async fn rebuild(&self) -> Result<(), ApiError> {
+    /// A commit failed in a way that does not say whether its record was
+    /// stored: the positions may be one record behind the log.
+    fn commit_was_unsure(&self) {
+        let mut state = self.state();
+        state.unsure = state.unsure.saturating_add(1);
+        state.fresh = false;
+    }
+
+    async fn read_log(&self) -> Result<HashMap<Cursor, u64>, ApiError> {
         let mut positions = HashMap::new();
         let mut offset = 0;
         loop {
@@ -204,8 +226,7 @@ impl Cursors {
             offset = next;
         }
         info!(positions = positions.len(), "positions loaded");
-        *self.positions() = positions;
-        Ok(())
+        Ok(positions)
     }
 
     /// The offset of the last message the cursor handled, or `None` if it has
@@ -216,13 +237,14 @@ impl Cursors {
     /// Returns an error if the log cannot be read.
     pub(crate) async fn get(&self, cursor: &Cursor) -> Result<Option<u64>, ApiError> {
         self.load().await?;
-        Ok(self.positions().get(cursor).copied())
+        Ok(self.state().positions.get(cursor).copied())
     }
 
-    /// Set where the cursor has got to. The record is written first, and the
-    /// position changes once it has been. If the write fails in a way that does
-    /// not say whether the record was stored, the positions are read from the
-    /// log again before they are used.
+    /// Set where the cursor has got to. It waits for a read of the log that is
+    /// in progress and compares with what that read found. The record is
+    /// written first, and the position changes once it has been. If the write
+    /// fails in a way that does not say whether the record was stored, the
+    /// positions are read from the log again before they are used.
     ///
     /// # Errors
     ///
@@ -232,23 +254,23 @@ impl Cursors {
         // After a commit that may or may not have been stored this reads the
         // log again, so that "the position is already this" is true of the log.
         self.load().await?;
-        if self.positions().get(&cursor) == Some(&offset) {
+        if self.state().positions.get(&cursor) == Some(&offset) {
             return Ok(());
         }
         let record = records::encode(&Entry::new(&cursor, offset))?;
         if let Err(error) = self.broker.system_append(SystemLog::Cursors, &record).await {
             // The record may be in the log all the same.
-            self.fresh.store(false, Ordering::Release);
+            self.commit_was_unsure();
             return Err(error.into());
         }
-        self.positions().insert(cursor, offset);
+        self.state().positions.insert(cursor, offset);
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use async_trait::async_trait;
     use mansio_core::{BrokerError, Caller, Envelope, MemoryBroker, Stored, SystemRecord};
@@ -263,6 +285,10 @@ mod tests {
         inner: MemoryBroker,
         store_then_fail: AtomicBool,
         fail_without_storing: AtomicBool,
+        /// How many times a read of the log gives way to the other tasks
+        /// before it answers, as a read over a network does. Every read counts.
+        yields: AtomicU32,
+        reads: AtomicU32,
     }
 
     #[async_trait]
@@ -319,6 +345,10 @@ mod tests {
             offset: u64,
             max: u32,
         ) -> Result<Vec<SystemRecord>, BrokerError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            for _ in 0..self.yields.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
             self.inner.system_read(log, offset, max).await
         }
     }
@@ -361,6 +391,82 @@ mod tests {
         let log = broker.system_read(SystemLog::Cursors, 0, 10).await.unwrap();
         assert_eq!(log.len(), 2, "3 and then 5");
         assert_eq!(Cursors::new(broker, 10).get(&one).await.unwrap(), Some(5));
+    }
+
+    /// A log with a position for each of the cursors, written by one server and
+    /// read by another over a broker whose reads give way to other tasks.
+    async fn a_log_of_positions(cursors: &[(&Cursor, u64)]) -> Arc<Unsure> {
+        let broker = Arc::new(Unsure::default());
+        let writer = Cursors::new(broker.clone(), 2);
+        for (cursor, offset) in cursors {
+            writer.set((*cursor).clone(), *offset).await.unwrap();
+        }
+        broker.yields.store(3, Ordering::SeqCst);
+        broker.reads.store(0, Ordering::SeqCst);
+        broker
+    }
+
+    #[tokio::test]
+    async fn nobody_reads_a_position_before_the_first_read_of_the_log_has_finished() {
+        let (one, two) = (
+            Cursor::Webhook(WebhookId::generate()),
+            Cursor::Webhook(WebhookId::generate()),
+        );
+        let broker = a_log_of_positions(&[(&one, 3), (&two, 7)]).await;
+        let cursors = Cursors::new(broker.clone(), 2);
+
+        // As a server that has just started with two webhooks: each task asks
+        // where it stopped while the first of them is still reading the log.
+        let (a, b, c) = tokio::join!(cursors.get(&one), cursors.get(&two), cursors.get(&one));
+        assert_eq!(a.unwrap(), Some(3), "the first, which reads");
+        assert_eq!(b.unwrap(), Some(7), "the second, which waits for it");
+        assert_eq!(c.unwrap(), Some(3), "and the third");
+        // And the log was read once for the three.
+        let reads_for_one_pass = broker.reads.load(Ordering::SeqCst);
+        assert!(reads_for_one_pass <= 3, "{reads_for_one_pass} reads");
+        let _ = cursors.get(&one).await.unwrap();
+        assert_eq!(broker.reads.load(Ordering::SeqCst), reads_for_one_pass);
+    }
+
+    #[tokio::test]
+    async fn a_commit_during_the_first_read_compares_with_what_the_read_found() {
+        let one = named("agent:one", "dash");
+        let other = named("agent:two", "dash");
+        let broker = a_log_of_positions(&[(&one, 4)]).await;
+        let cursors = Cursors::new(broker.clone(), 2);
+
+        // The commit arrives while the log is being read. The position is 4
+        // already, so nothing is written: not a record that says what the log
+        // does, which a read of the empty map would have written.
+        let (read, set) = tokio::join!(cursors.get(&other), cursors.set(one.clone(), 4));
+        assert_eq!(read.unwrap(), None);
+        set.unwrap();
+        let log = broker.system_read(SystemLog::Cursors, 0, 10).await.unwrap();
+        assert_eq!(log.len(), 1, "the one record that was there");
+
+        // A different position is written, after the read.
+        cursors.set(one.clone(), 5).await.unwrap();
+        assert_eq!(cursors.get(&one).await.unwrap(), Some(5));
+    }
+
+    #[tokio::test]
+    async fn a_commit_that_fails_unsure_while_the_log_is_read_makes_the_next_use_read_it_again() {
+        let one = named("agent:one", "dash");
+        let broker = a_log_of_positions(&[(&one, 4)]).await;
+        let cursors = Cursors::new(broker.clone(), 2);
+
+        // The read has begun when a commit fails without saying whether its
+        // record is stored: what the read found may be a record behind.
+        let (read, ()) = tokio::join!(cursors.load(), async {
+            tokio::task::yield_now().await;
+            cursors.commit_was_unsure();
+        });
+        read.unwrap();
+        assert!(!cursors.state().fresh, "the read does not make it fresh");
+        let before = broker.reads.load(Ordering::SeqCst);
+        assert_eq!(cursors.get(&one).await.unwrap(), Some(4));
+        assert!(broker.reads.load(Ordering::SeqCst) > before, "read again");
+        assert!(cursors.state().fresh);
     }
 
     #[tokio::test]

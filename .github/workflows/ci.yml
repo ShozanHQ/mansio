@@ -68,6 +68,49 @@ jobs:
       MANSIO_BACKOFF_CAP_SECONDS: "4"
       MANSIO_TICK_MILLIS: "200"
     steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Shellcheck the test and its consumer, if the runner has shellcheck
+        run: |
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck tests/offline/*.sh
+          else
+            echo "::warning::shellcheck is not on the runner, so tests/offline/*.sh were not checked"
+          fi
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2.9.3
+      - name: Build the mansio command line
+        run: cargo build -p mansio --locked
+      - name: Start Iggy, make mansio's Iggy user, and start mansio-server
+        run: docker compose up --build --wait
+      - name: Kill a consumer while idle, kill one holding a lease, and check every item is done once
+        env:
+          MANSIO_BIN: ${{ github.workspace }}/target/debug/mansio
+        run: tests/offline/run.sh
+      - name: Compose logs
+        if: failure()
+        run: docker compose logs --no-color
+      - name: Stop the stack
+        if: always()
+        run: docker compose down --volumes
+
+  hygiene:
+    name: hygiene
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # Development values for a throwaway stack on the runner.
+      MANSIO_TOKEN: ci-offline-token
+      MANSIO_URL: http://127.0.0.1:7070
+      # A lease and a backoff of seconds, so that scenario 2 takes about half a
+      # minute. The lease is long against a consumer's pull and ack, which take
+      # milliseconds. The test reads them from GET /v1/settings.
+      MANSIO_LEASE_SECONDS: "8"
+      MANSIO_MAX_ATTEMPTS: "3"
+      MANSIO_BACKOFF_BASE_SECONDS: "1"
+      MANSIO_BACKOFF_CAP_SECONDS: "4"
+      MANSIO_TICK_MILLIS: "200"
+    steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
