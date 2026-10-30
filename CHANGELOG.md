@@ -7,6 +7,12 @@ All notable changes to mansio are listed here. The format follows
 
 ### Added
 
+- `mansio-models`: a Stateright model of one work item (two consumers, claim,
+  extend, ack and fail by the holder, lease expiry, retry as a new message,
+  the attempt cap and `dead`, a restart that rebuilds from the topics, and a
+  publish that answers 503 having stored the message), whose rules run as
+  `cargo test` and fail with the shortest path to a break, and its chart in
+  `crates/mansio-models/charts/work-item.md`.
 - The Cargo workspace: `mansio-core`, `mansio-iggy`, `mansio-server`, `mansio`
   (the CLI) and `mansio-e2e`, on a pinned Rust 1.99.0 toolchain with
   `cargo-deny` and a lint profile that denies `unwrap`, `expect` and `panic`

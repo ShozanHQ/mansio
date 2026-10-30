@@ -944,6 +944,16 @@ process, against the in-process server, on every `cargo test`.
 The `offline` job runs `tests/offline/run.sh` against a compose stack of its own;
 see [The guarantee](#the-guarantee).
 
+`crates/mansio-models` checks the rules of the work engine on a model of it,
+over every state the model can reach: one item, two consumers, claims, leases
+that run out, retries up to the attempt cap, `dead`, a restart and a publish
+that answers 503 having stored the message. A rule that breaks fails
+`cargo test` with the shortest path to it, numbered, in plain words. The chart
+of the model is
+[`crates/mansio-models/charts/work-item.md`](crates/mansio-models/charts/work-item.md);
+a test fails when it is stale, and `UPDATE_CHARTS=1 cargo test -p
+mansio-models` redraws it.
+
 Every image in the `Dockerfile` and `compose.yaml` is pinned by digest, with its
 tag kept beside it to read, and so is every action in the workflows by commit.
 Dependabot moves each pin and its comment or tag together. A scheduled workflow
