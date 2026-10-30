@@ -81,4 +81,8 @@ comma, a colon or a new sentence. Cut rather than elaborate.
 - Changes to the rules (`.github/`, `deny.toml`, the toolchain and lint files,
   `Cargo.toml`, the Dockerfile and compose) and to the code that decides who may
   do what (credentials, access, sessions, provisioning and the registry) are
-  owned in `.github/CODEOWNERS` and wait for the owner's review.
+  owned in `.github/CODEOWNERS`: the owner is asked to look, and the merge does
+  not wait for them.
+- A pull request merges when the checks are green and every review thread is
+  resolved; it does not wait for an approval. A person reviews a versioned
+  release: the `release` environment waits for the owner's approval.
