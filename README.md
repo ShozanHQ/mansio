@@ -8,6 +8,8 @@ time. A producer publishes facts and work to a topic; a consumer that joins
 later picks up what is waiting. [Apache Iggy](https://iggy.apache.org) is the
 broker, and mansio is the contract around it. Open source under Apache-2.0.
 
+mansio is built with [Shozan](https://shozan.ai).
+
 This is an early build. Publishing and polling work, and so do work items
 (claim with a lease, acknowledge, fail, retry with backoff, a dead topic),
 alerts (acknowledge, surface again) and credentials (a principal gets a
