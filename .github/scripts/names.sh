@@ -44,7 +44,7 @@ case "${1:-}" in
     # -a reads a binary file as text: without it git grep only says that a
     # binary file matches, and nothing here would test it. The first pass
     # over-matches; strays() is the test.
-    contents=$({ git grep -a -i -n -E "${a}-[0-9]|${c}${d}\\.${e}" || [ $? -eq 1 ]; } | strays "")
+    contents=$({ git grep -a -i -n -E "${ID}|${c}${d}\\.${e}" || [ $? -eq 1 ]; } | strays "")
     paths=$(git ls-files | strays "path")
     stray=$(printf '%s\n%s\n' "$paths" "$contents" | sed '/^$/d')
     ;;
