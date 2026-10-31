@@ -1,0 +1,20 @@
+[package]
+name = "mansio-models"
+description = "State models of the mansio work engine, model-checked as cargo tests and drawn as Mermaid statecharts."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+# Exhaustive breadth-first model checking in Rust: every state a model can
+# reach is visited, and a broken rule comes with the shortest path to it, with
+# no toolchain other than cargo. Its Explorer web server (tiny_http, ascii,
+# chunked_transfer) comes with it, as stateright 0.31 has no feature that turns
+# it off; this crate never starts it.
+stateright = "0.31"
+
+[lints]
+workspace = true

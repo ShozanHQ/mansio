@@ -11,6 +11,7 @@ mansio is a message bus for agents, people and programs that are not connected a
 | `mansio-server` | lib and bin | The HTTP API, the work and alert engine, credentials, server-sent events, webhooks. A host application embeds it as a library with its own `Sink`; the binary runs it standalone with the file sink, and `mansio-server provision-admin` makes the Iggy user it acts as. |
 | `mansio` | bin | The CLI and the MCP server (`mansio mcp`, stdio). Both are clients of the HTTP API and use the same operation names. |
 | `mansio-e2e` | test | End-to-end tests. With `MANSIO_E2E_URL` unset they start an in-process server on `MemoryBroker`; with it set they run against a live server and Iggy (CI, through compose). |
+| `mansio-models` | test | State models of the work engine, checked with Stateright on every `cargo test`: every reachable state is visited, each rule cites the section it comes from, and a broken rule fails with the numbered shortest path to it. Each model is drawn as a Mermaid statechart under `crates/mansio-models/charts/`, which a test keeps current. The first is one work item's life (`charts/work-item.md`). Not published. |
 
 `tests/offline/` is the test of the guarantee that work is never dropped and never done twice for consumers that are not always connected: a shell consumer killed while idle, holding a lease, and restarted under its name, run against compose in CI (README, "The guarantee").
 
