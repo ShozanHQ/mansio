@@ -1,6 +1,7 @@
-//! Every rule of one work item, checked over every reachable state, and a
-//! seeded bug that pins the shortest-path helper. A failure prints the
-//! numbered shortest path in the reader's words.
+//! Every rule of one work item, checked over every reachable state, a seeded
+//! bug that pins the shortest-path helper, and a seeded two-step cycle that
+//! the cycle check fails on. A failure prints the numbered shortest path in
+//! the reader's words.
 
 use mansio_models::work_item::{
     Consumer, DEAD, ENDS, ONCE, ONE_LEASE, Phase, REACHES_DEAD, REFUSED, RETRY_ACKED, Step,
@@ -9,17 +10,20 @@ use mansio_models::work_item::{
 use mansio_models::{Kind, Outcome, Readable, check};
 use stateright::Model;
 
-use helpers::{assert_holds, max, reachable};
+use helpers::{Seeded, assert_holds, assert_no_cycle, max, reachable};
 
 /// The tests' helpers, under `#[cfg(test)]` (always set in a test target) so
 /// that, like a `#[test]` function, they may unwrap (clippy.toml).
 #[cfg(test)]
 mod helpers {
+    use std::collections::{HashMap, HashSet};
+    use std::fmt::Debug;
+    use std::hash::Hash;
     use std::num::NonZeroU8;
 
-    use mansio_models::work_item::{Item, WorkItem};
-    use mansio_models::{Outcome, Report};
-    use stateright::Model;
+    use mansio_models::work_item::{ENDS, Item, Step, WorkItem, replay};
+    use mansio_models::{Outcome, Readable, Report, check};
+    use stateright::{Model, Property};
 
     /// An attempt cap (`MANSIO_MAX_ATTEMPTS`).
     pub fn max(n: u8) -> NonZeroU8 {
@@ -32,9 +36,13 @@ mod helpers {
     }
 
     /// Every state the model reaches.
-    pub fn reachable(model: &WorkItem) -> Vec<Item> {
-        let mut seen: Vec<Item> = model.init_states();
-        let mut known: std::collections::HashSet<Item> = seen.iter().cloned().collect();
+    pub fn reachable<M>(model: &M) -> Vec<M::State>
+    where
+        M: Model,
+        M::State: Clone + Hash + Eq,
+    {
+        let mut seen: Vec<M::State> = model.init_states();
+        let mut known: HashSet<M::State> = seen.iter().cloned().collect();
         let mut i = 0;
         while let Some(s) = seen.get(i).cloned() {
             let mut steps = Vec::new();
@@ -49,6 +57,150 @@ mod helpers {
             i += 1;
         }
         seen
+    }
+
+    /// Fails on any cycle in the reachable graph, and checks that the check
+    /// visits every reachable state.
+    pub fn assert_no_cycle<M>(model: &M)
+    where
+        M: Readable + Clone + Send + Sync + 'static,
+        M::State: Clone + Debug + Hash + Eq + Send + Sync + 'static,
+        M::Action: Clone + Debug + PartialEq + Send + Sync + 'static,
+    {
+        let report = check(model.clone()).unwrap();
+        assert_eq!(report.states(), reachable(model).len());
+        if let Some(cycle) = find_cycle(model) {
+            panic!(
+                "{}: a cycle of {} steps: {cycle:#?}",
+                model.title(),
+                cycle.len()
+            );
+        }
+    }
+
+    /// A cycle among the reachable states, as the states along it, or `None`:
+    /// a depth-first search that keeps the path it is on, where a step to a
+    /// state on that path closes a cycle.
+    pub fn find_cycle<M>(model: &M) -> Option<Vec<M::State>>
+    where
+        M: Model,
+        M::State: Clone + Hash + Eq,
+    {
+        // `false` while the state is on the path, `true` once every state
+        // after it has been searched.
+        let mut done: HashMap<M::State, bool> = HashMap::new();
+        for init in model.init_states() {
+            if done.contains_key(&init) {
+                continue;
+            }
+            done.insert(init.clone(), false);
+            let next = successors(model, &init);
+            let mut path: Vec<(M::State, Vec<M::State>)> = vec![(init, next)];
+            while let Some((_, next)) = path.last_mut() {
+                let Some(n) = next.pop() else {
+                    let (s, _) = path.pop().unwrap();
+                    done.insert(s, true);
+                    continue;
+                };
+                match done.get(&n) {
+                    Some(true) => {}
+                    Some(false) => {
+                        let at = path.iter().position(|(s, _)| *s == n).unwrap();
+                        return Some(path.drain(at..).map(|(s, _)| s).collect());
+                    }
+                    None => {
+                        done.insert(n.clone(), false);
+                        let after = successors(model, &n);
+                        path.push((n, after));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn successors<M: Model>(model: &M, s: &M::State) -> Vec<M::State> {
+        let mut steps = Vec::new();
+        model.actions(s, &mut steps);
+        steps
+            .into_iter()
+            .filter_map(|step| model.next_state(s, step))
+            .collect()
+    }
+
+    /// A seeded bug: the engine drops its memory, and rebuilds it from the
+    /// topics, without counting a restart, so the two steps make a cycle.
+    #[derive(Clone, Debug)]
+    pub struct Seeded(pub WorkItem);
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SeededStep {
+        Engine(Step),
+        Forget,
+        Rebuild,
+    }
+
+    impl Model for Seeded {
+        type State = Item;
+        type Action = SeededStep;
+
+        fn init_states(&self) -> Vec<Item> {
+            self.0.init_states()
+        }
+
+        fn actions(&self, s: &Item, out: &mut Vec<SeededStep>) {
+            let mut steps = Vec::new();
+            self.0.actions(s, &mut steps);
+            out.extend(steps.into_iter().map(SeededStep::Engine));
+            out.extend([SeededStep::Forget, SeededStep::Rebuild]);
+        }
+
+        fn next_state(&self, s: &Item, step: SeededStep) -> Option<Item> {
+            let mut n = s.clone();
+            match step {
+                SeededStep::Engine(step) => return self.0.next_state(s, step),
+                SeededStep::Forget if s.attempt > 0 && s.memory == Some(replay(s)) => {
+                    n.memory = None;
+                }
+                SeededStep::Rebuild if s.attempt > 0 && s.memory.is_none() => {
+                    n.memory = Some(replay(s));
+                }
+                SeededStep::Forget | SeededStep::Rebuild => return None,
+            }
+            Some(n)
+        }
+
+        fn properties(&self) -> Vec<Property<Self>> {
+            // The engine's `eventually` rule, with the same condition.
+            vec![Property::eventually(ENDS, |_, s: &Item| {
+                s.acks == 1 || s.dead == 1
+            })]
+        }
+    }
+
+    impl Readable for Seeded {
+        fn title(&self) -> String {
+            format!(
+                "{}, with an uncounted rebuild (a seeded bug)",
+                self.0.title()
+            )
+        }
+
+        fn state_label(&self, s: &Item) -> String {
+            self.0.state_label(s)
+        }
+
+        fn step_label(&self, s: &Item, step: &SeededStep) -> String {
+            match step {
+                SeededStep::Engine(step) => self.0.step_label(s, step),
+                SeededStep::Forget => "the engine drops its memory (recover)".to_string(),
+                SeededStep::Rebuild => "the engine rebuilds it, uncounted (recover)".to_string(),
+            }
+        }
+
+        fn cites(&self, rule: &str) -> Option<&'static str> {
+            self.0.cites(rule)
+        }
     }
 }
 
@@ -195,22 +347,42 @@ fn the_engine_remembers_what_a_rebuild_from_the_topics_gives() {
 }
 
 #[test]
-fn every_loop_is_bounded() {
-    // The check ends, and every path does: no state can be reached from
-    // itself.
-    let model = WorkItem::new(max(3));
-    let states = reachable(&model);
-    let report = check(model.clone()).unwrap();
-    assert_eq!(report.states(), states.len());
-    for s in &states {
+fn no_state_is_reachable_from_itself() {
+    // The model has no cycle, of one step or of many, so every path ends and
+    // the check judges `every item ends acked or dead` on every path: no loop
+    // the item could circle forever is hidden from it. The check ends too:
+    // it visits every reachable state once.
+    for cap in [1, 2, 3] {
+        assert_no_cycle(&WorkItem::new(max(cap)));
+    }
+}
+
+#[test]
+#[should_panic(expected = "a cycle of 2 steps")]
+fn the_cycle_check_fails_on_a_seeded_two_step_cycle() {
+    assert_no_cycle(&Seeded(WorkItem::new(max(2))));
+}
+
+#[test]
+fn a_seeded_two_step_cycle_hides_from_the_eventually_rule() {
+    // The seeded bug: the engine drops its memory and rebuilds it from the
+    // topics without counting a restart, so the item can circle between the
+    // two forever.
+    let model = Seeded(WorkItem::new(max(2)));
+    // No step leaves a state as it was, so a check of one-step loops alone
+    // misses it.
+    for s in reachable(&model) {
         let mut steps = Vec::new();
-        model.actions(s, &mut steps);
+        model.actions(&s, &mut steps);
         for step in steps {
-            if let Some(n) = model.next_state(s, step) {
-                assert_ne!(&n, s, "{step:?} leaves {s:?} as it was");
-            }
+            assert_ne!(model.next_state(&s, step).as_ref(), Some(&s), "{step:?}");
         }
     }
+    // And the check, which judges `eventually` only on paths that end, finds
+    // the rule holding: the cycle hides the item that never ends.
+    let report = check(model).unwrap();
+    let r = report.rule(ENDS).unwrap();
+    assert_eq!((r.kind, r.outcome), (Kind::Eventually, Outcome::Holds));
 }
 
 #[test]

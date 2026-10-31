@@ -13,8 +13,11 @@ publish = false
 # reach is visited, and a broken rule comes with the shortest path to it, with
 # no toolchain other than cargo. Its Explorer web server (tiny_http, ascii,
 # chunked_transfer) comes with it, as stateright 0.31 has no feature that turns
-# it off; this crate never starts it.
-stateright = "0.31"
+# it off; this crate never starts it. Pinned exactly, so that a release with
+# more of that server, or a change to how it explores, arrives only by a
+# change to this line, reviewed, and not by a lockfile update; src/check.rs
+# also relies on how 0.31 judges and stops.
+stateright = "=0.31.0"
 
 [lints]
 workspace = true
