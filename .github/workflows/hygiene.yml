@@ -31,10 +31,13 @@ jobs:
           fetch-depth: 0
       - name: Install the toolchain pinned in rust-toolchain.toml
         run: rustup toolchain install
-      # What the check looks for, and the one address it lets through, are in
-      # the script. Its patterns are built from pieces, so it does not match
-      # itself.
-      - name: Nothing in the tree refers to how mansio is built
+      # The check must still refuse what it is for. The test builds its ids and
+      # hosts from pieces, so it does not match the check either.
+      - name: The names check still refuses an internal ticket id and a tracker link
+        run: bash .github/scripts/names-test.sh
+      # What the check looks for is in the script. Its patterns are built from
+      # pieces, so it does not match itself.
+      - name: Nothing in the tree carries an internal ticket id or a tracker link
         run: bash .github/scripts/names.sh tree
       - name: Nor does a commit message, or the title or body of the pull request
         if: github.event_name == 'pull_request'
