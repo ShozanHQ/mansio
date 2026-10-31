@@ -41,7 +41,7 @@ A pull request merges when all of these pass:
 | clippy | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` |
 | tests | `cargo test --workspace --locked` |
 | cargo-deny | `cargo deny check`: licences, advisories, bans, sources (`deny.toml`) |
-| hygiene | every crate is Apache-2.0, and nothing in the tree, the commit messages or the pull request text refers to how mansio is built rather than to mansio |
+| hygiene | every crate is Apache-2.0, and nothing in the tree, the commit messages or the pull request text carries an internal ticket id or a link to the issue tracker |
 | e2e | the end-to-end suite against Iggy, through compose |
 | offline | consumers killed while idle and while holding a lease, every item done once |
 
