@@ -406,19 +406,20 @@ impl Engine {
         let key = envelope.idempotency_key.clone();
         if let Some(key) = &key {
             self.ensure_keys(&envelope.tenant, &mut held).await?;
-            if let Some(first) =
-                held.keys
-                    .get(&envelope.topic, key, self.clock.now_millis(), window)
+            if let Some(first) = held
+                .keys
+                .get(&envelope.topic, key, self.clock.now_millis(), window)
+                .cloned()
             {
                 // The first envelope is its publisher's to read back. Another
                 // principal that may only publish must not read it by
                 // guessing the key, so it is told the key is taken, no more.
-                if first.envelope.principal != envelope.principal {
+                if first.principal != envelope.principal {
                     return Err(ApiError::Conflict(
                         "the idempotency key was used by another principal".to_owned(),
                     ));
                 }
-                return Ok((first.clone(), true));
+                return Ok((self.read_first(&envelope, &first).await?, true));
             }
         }
         let is_alert = envelope.topic == Topic::Alerts;
@@ -443,6 +444,45 @@ impl Engine {
         Ok((stored, false))
     }
 
+    /// Read the first publish of a key back from its topic. The server keeps
+    /// no message bodies for this, only where the message landed. If that
+    /// cannot be found (the broker did not say the offset, or retention has
+    /// since removed the message) nothing is published and the answer is 409
+    /// naming the first id.
+    async fn read_first(
+        &self,
+        envelope: &Envelope,
+        first: &idempotency::First,
+    ) -> Result<Published, ApiError> {
+        let gone = || {
+            ApiError::Conflict(format!(
+                "the idempotency key was used by the publish with id {}, which can no longer \
+                 be read back; nothing was published",
+                first.id
+            ))
+        };
+        let Some(offset) = first.offset else {
+            return Err(gone());
+        };
+        let found = match self
+            .broker
+            .poll(&Caller::Admin, &envelope.tenant, &envelope.topic, offset, 1)
+            .await
+        {
+            Ok(found) => found,
+            Err(BrokerError::NotFound(_)) => return Err(gone()),
+            Err(error) => return Err(error.into()),
+        };
+        found
+            .into_iter()
+            .find(|stored| stored.offset == offset && stored.envelope.id == first.id)
+            .map(|stored| Published {
+                offset: Some(stored.offset),
+                envelope: stored.envelope,
+            })
+            .ok_or_else(gone)
+    }
+
     /// Remember that a publish used a key, in memory and in the log. A log
     /// that cannot be written does not undo a publish that is stored: the key
     /// holds until the next restart.
@@ -453,7 +493,7 @@ impl Engine {
         held.keys.insert(
             (stored.envelope.topic.clone(), key),
             at,
-            stored.clone(),
+            idempotency::First::of(stored),
             at,
             millis(self.settings.idempotency_window),
             self.settings.idempotency_max_keys,

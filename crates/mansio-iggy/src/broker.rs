@@ -14,7 +14,7 @@ use iggy::prelude::{
     AutoLogin, Client, Consumer, Credentials, Durability as IggyDurability, Identifier,
     IggyByteSize, IggyClient, IggyClientBuilder, IggyDuration, IggyError, IggyExpiry, IggyMessage,
     MaxTopicSize, MessageClient, Partitioning, PersonalAccessTokenClient, PollingStrategy,
-    StreamClient, TopicClient, TopicCreateOptions, UserClient, UserStatus,
+    StreamClient, TopicClient, TopicCreateOptions, TopicUpdateOptions, UserClient, UserStatus,
 };
 use mansio_core::{
     Broker, BrokerError, BrokerUser, BrokerUserInfo, Caller, Credential, Envelope, EventId, Grant,
@@ -530,6 +530,45 @@ impl IggyBroker {
         }
     }
 
+    /// Make an existing topic's message expiry equal `window`, so that a
+    /// window changed in the settings applies to a log made under the old one.
+    async fn align_expiry(
+        &self,
+        stream: &str,
+        name: &str,
+        window: Duration,
+    ) -> Result<(), BrokerError> {
+        let stream_id = Identifier::named(stream).map_err(map_iggy)?;
+        let id = Identifier::named(name).map_err(map_iggy)?;
+        let want = IggyExpiry::ExpireDuration(IggyDuration::from(window));
+        let Some(topic) = self
+            .client
+            .get_topic(&stream_id, &id)
+            .await
+            .map_err(map_iggy)?
+        else {
+            return Ok(());
+        };
+        if topic.message_expiry == want {
+            return Ok(());
+        }
+        let options = TopicUpdateOptions {
+            message_expiry: Some(want),
+            ..TopicUpdateOptions::default()
+        };
+        self.client
+            .update_topic(&stream_id, &id, name, &options)
+            .await
+            .map_err(map_iggy)?;
+        info!(
+            stream,
+            topic = name,
+            ?window,
+            "set the topic's message expiry"
+        );
+        Ok(())
+    }
+
     // ---- the server's own records -----------------------------------------
 
     /// Make the stream and the topics for the server's own records, once.
@@ -544,8 +583,13 @@ impl IggyBroker {
                         }
                         _ => system_topic_options(),
                     };
-                    self.make_topic(SYSTEM_STREAM, log.as_str(), &options)
+                    let made = self
+                        .make_topic(SYSTEM_STREAM, log.as_str(), &options)
                         .await?;
+                    if !made && log == SystemLog::Idempotency {
+                        self.align_expiry(SYSTEM_STREAM, log.as_str(), self.idempotency_expiry)
+                            .await?;
+                    }
                 }
                 Ok::<(), BrokerError>(())
             })

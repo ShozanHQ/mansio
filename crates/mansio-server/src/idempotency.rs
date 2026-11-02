@@ -3,7 +3,8 @@
 //! Iggy deduplicates a client's retried requests and not message ids, so a
 //! producer that sends again after a timeout would put the event on the bus
 //! twice. A publish that carries an `idempotencykey` is remembered, per tenant
-//! and topic, with the answer it got. A second publish with the same key inside
+//! and topic, with where the first publish landed (offset, id and principal,
+//! never its body). A repeat reads the envelope back from the topic. A second publish with the same key inside
 //! the window ([`crate::WorkSettings::idempotency_window`]) is answered with
 //! that first answer and publishes nothing.
 //!
@@ -34,7 +35,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use mansio_core::api::Published;
-use mansio_core::{IdempotencyKey, TenantId, Topic};
+use mansio_core::{EventId, IdempotencyKey, Principal, TenantId, Topic};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -42,12 +43,35 @@ use crate::records;
 
 type Slot = (Topic, IdempotencyKey);
 
+/// Where the first publish with a key landed: enough to read it back from the
+/// topic, and no message body, so that what a tenant remembers is a few
+/// hundred bytes a key whatever it published.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct First {
+    /// The offset in the topic, if the broker said.
+    pub(crate) offset: Option<u64>,
+    /// The id of the envelope stored.
+    pub(crate) id: EventId,
+    /// Who published it.
+    pub(crate) principal: Principal,
+}
+
+impl First {
+    pub(crate) fn of(published: &Published) -> Self {
+        Self {
+            offset: published.offset,
+            id: published.envelope.id,
+            principal: published.envelope.principal.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Remembered {
     seq: u64,
     /// When the publish was accepted, in milliseconds since the Unix epoch.
     at: i64,
-    published: Published,
+    first: First,
 }
 
 /// The keys of one tenant, oldest first by when they were remembered.
@@ -71,11 +95,11 @@ impl Keys {
         key: &IdempotencyKey,
         now: i64,
         window: i64,
-    ) -> Option<&Published> {
+    ) -> Option<&First> {
         self.by_slot
             .get(&(topic.clone(), key.clone()))
             .filter(|known| !expired(known.at, now, window))
-            .map(|known| &known.published)
+            .map(|known| &known.first)
     }
 
     /// Remember a publish accepted at `at`. A key that was remembered before
@@ -85,7 +109,7 @@ impl Keys {
         &mut self,
         (topic, key): Slot,
         at: i64,
-        published: Published,
+        first: First,
         now: i64,
         window: i64,
         max: usize,
@@ -97,7 +121,7 @@ impl Keys {
         let seq = self.next;
         self.next = self.next.saturating_add(1);
         self.order.insert(seq, slot.clone());
-        self.by_slot.insert(slot, Remembered { seq, at, published });
+        self.by_slot.insert(slot, Remembered { seq, at, first });
         while let Some((&seq, slot)) = self.order.first_key_value() {
             let drop = self.by_slot.len() > max
                 || self
@@ -145,7 +169,7 @@ pub(crate) enum Entry {
         key: IdempotencyKey,
         /// When the publish was accepted, in milliseconds since the Unix epoch.
         at: i64,
-        published: Published,
+        first: First,
     },
 }
 
@@ -161,7 +185,7 @@ impl Entry {
             topic: published.envelope.topic.clone(),
             key,
             at,
-            published: published.clone(),
+            first: First::of(published),
         }
     }
 }
@@ -183,7 +207,7 @@ pub(crate) fn replay_into(
                 topic,
                 key,
                 at,
-                published,
+                first,
             }) => {
                 if expired(at, now, window) {
                     continue;
@@ -191,7 +215,7 @@ pub(crate) fn replay_into(
                 tenants.entry(tenant).or_default().insert(
                     (topic, key),
                     at,
-                    published,
+                    first,
                     now,
                     window,
                     max,
@@ -220,7 +244,7 @@ mod tests {
         format!("k{n}").parse().unwrap()
     }
 
-    fn published(offset: u64) -> Published {
+    fn full(offset: u64) -> Published {
         Published {
             offset: Some(offset),
             envelope: Envelope::new(
@@ -232,6 +256,10 @@ mod tests {
                 "service:test".parse().unwrap(),
             ),
         }
+    }
+
+    fn published(offset: u64) -> First {
+        First::of(&full(offset))
     }
 
     #[test]
@@ -284,7 +312,7 @@ mod tests {
             .into_iter()
             .enumerate()
         {
-            let entry = Entry::seen(tenant.clone(), key(n), at, &published(offset as u64));
+            let entry = Entry::seen(tenant.clone(), key(n), at, &full(offset as u64));
             log.push(mansio_core::SystemRecord {
                 offset: offset as u64,
                 payload: records::encode(&entry).unwrap(),
@@ -304,5 +332,20 @@ mod tests {
         assert!(keys.get(&topic(), &key(2), 1_000, 200).is_none());
         assert!(keys.get(&topic(), &key(3), 1_000, 200).is_some());
         assert!(keys.get(&topic(), &key(4), 1_000, 200).is_some());
+    }
+
+    #[test]
+    fn a_remembered_key_holds_no_message_body() {
+        // The most the server accepts in one body is large; what a key holds
+        // must not grow with it, in memory or in the log.
+        let mut big = full(0);
+        big.envelope.data = Some(serde_json::json!({ "blob": "x".repeat(1_000_000) }));
+        let first = First::of(&big);
+        let entry = Entry::seen("acme".parse().unwrap(), key(1), 0, &big);
+        let written = records::encode(&entry).unwrap();
+        assert!(written.len() < 1_000, "a record is {} bytes", written.len());
+        assert!(std::mem::size_of_val(&first) < 1_000);
+        let json = serde_json::to_string(&first).unwrap();
+        assert!(!json.contains("blob"));
     }
 }

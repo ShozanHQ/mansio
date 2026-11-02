@@ -2051,6 +2051,36 @@ async fn a_log_that_cannot_be_read_fails_keyed_publishes_and_forgets_nothing() {
 }
 
 #[tokio::test]
+async fn a_repeat_reads_the_first_body_back_and_the_server_keeps_none() {
+    let rig = Rig::new();
+    let mut message = keyed("big", "facts.build");
+    message.data = Some(serde_json::json!({ "blob": "x".repeat(200_000) }));
+    let (first, _) = rig.engine.publish_once(message.clone()).await.unwrap();
+    // What is remembered is a pointer, however large the body.
+    let held = rig.engine.lock(&tenant()).await.unwrap();
+    let remembered = held
+        .keys
+        .get(
+            &"facts.build".parse().unwrap(),
+            &"big".parse().unwrap(),
+            rig.clock.now_millis(),
+            60_000,
+        )
+        .unwrap()
+        .clone();
+    drop(held);
+    assert!(format!("{remembered:?}").len() < 1_000);
+    // The repeat still answers with the whole first envelope.
+    let mut again = message;
+    again.id = EventId::generate();
+    again.data = None;
+    let (answer, repeat) = rig.engine.publish_once(again).await.unwrap();
+    assert!(repeat);
+    assert_eq!(answer, first);
+    assert!(answer.envelope.data.is_some());
+}
+
+#[tokio::test]
 async fn the_timer_drops_keys_past_their_window() {
     let rig = Rig::new();
     publish_keyed(&rig, "k", "facts.build").await;

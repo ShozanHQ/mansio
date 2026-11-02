@@ -337,8 +337,10 @@ publish's envelope and offset, and nothing is published. The first is a 201. The
 server remembers at most `MANSIO_IDEMPOTENCY_MAX_KEYS` keys per tenant, forgets
 the one remembered longest ago first, drops keys past their window on every
 timer tick, and keeps them across a restart in a log that Iggy trims to the
-window (the log is created with that expiry, so changing the window later does
-not change the expiry of a log that exists). The log is read when the server
+window (the server sets the log's expiry to the window each time it starts).
+A key holds only where the first publish landed, never its body; a repeat reads
+the envelope back from the topic, and if retention has removed it the answer is
+409 naming the first id. The log is read when the server
 starts, not inside a request. The same key from another principal is answered
 409 with no envelope. A publish
 without a key, a key on `presence` and `work_publish` are not deduplicated, and a
@@ -806,7 +808,7 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_ALERT_RESURFACE_SECONDS` | `3600` | How long an alert may go unacknowledged before it is surfaced again, and again after each further interval. |
 | `MANSIO_TICK_MILLIS` | `500` | How often the timer looks for leases to expire, items to republish and alerts to surface again. |
 | `MANSIO_IDEMPOTENCY_WINDOW_SECONDS` | `86400` | How long a publish's `idempotencykey` is remembered. A second publish to the same tenant and topic with the same key inside the window is answered 200 with the first envelope and offset and publishes nothing. At least `1`, at most `315360000` (ten years). |
-| `MANSIO_IDEMPOTENCY_MAX_KEYS` | `10000` | The most keys a tenant remembers, in memory and when they are read back after a restart. Past it the key remembered longest ago is forgotten first, even inside its window. At least `1`. |
+| `MANSIO_IDEMPOTENCY_MAX_KEYS` | `10000` | The most keys a tenant remembers, in memory and when they are read back after a restart. Past it the key remembered longest ago is forgotten first, even inside its window. A key holds a few hundred bytes (no message body), so this bounds memory. At least `1`. |
 | `MANSIO_STREAM_POLL_MILLIS` | `500` | How often an event stream and a webhook look for new messages once they have caught up. |
 | `MANSIO_SSE_KEEPALIVE_SECONDS` | `15` | How often a quiet event stream sends a comment. |
 | `MANSIO_SHUTDOWN_GRACE_SECONDS` | `10` | On SIGINT or SIGTERM the server ends every event stream, and waits this long for the requests still being served before it stops anyway. |
