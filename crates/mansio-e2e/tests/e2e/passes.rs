@@ -75,7 +75,7 @@ fn state_path(pass: &str) -> anyhow::Result<PathBuf> {
 /// Keep the state of a pass for the next. It holds the credentials the first
 /// pass issued, so it is readable by its owner alone, and the directory is the
 /// job's, outside the checkout.
-fn save(pass: &str, state: &Value) -> anyhow::Result<()> {
+pub(crate) fn save(pass: &str, state: &Value) -> anyhow::Result<()> {
     use std::io::Write;
     let path = state_path(pass)?;
     let mut options = std::fs::OpenOptions::new();
@@ -88,7 +88,7 @@ fn save(pass: &str, state: &Value) -> anyhow::Result<()> {
         .with_context(|| format!("writing {}", path.display()))
 }
 
-fn load(pass: &str) -> anyhow::Result<Value> {
+pub(crate) fn load(pass: &str) -> anyhow::Result<Value> {
     let path = state_path(pass)?;
     let text = std::fs::read(&path)
         .with_context(|| format!("reading {}: has the first pass run?", path.display()))?;

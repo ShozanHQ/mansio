@@ -230,6 +230,11 @@ pub struct EffectiveSettings {
     pub alert_resurface_seconds: u64,
     /// `MANSIO_TICK_MILLIS`: how often the timer looks for work to do.
     pub tick_millis: u64,
+    /// `MANSIO_IDEMPOTENCY_WINDOW_SECONDS`: how long a publish's idempotency
+    /// key is remembered.
+    pub idempotency_window_seconds: u64,
+    /// `MANSIO_IDEMPOTENCY_MAX_KEYS`: the most keys a tenant remembers.
+    pub idempotency_max_keys: u64,
     /// `MANSIO_MAX_BODY_BYTES`.
     pub max_body_bytes: u64,
     /// `MANSIO_POLL_DEFAULT_COUNT`.

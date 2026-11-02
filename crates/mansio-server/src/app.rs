@@ -482,6 +482,8 @@ async fn settings(
         backoff_cap_seconds: seconds(work.backoff_cap),
         alert_resurface_seconds: seconds(work.alert_resurface),
         tick_millis: u64::try_from(work.tick.as_millis()).unwrap_or(u64::MAX),
+        idempotency_window_seconds: seconds(work.idempotency_window),
+        idempotency_max_keys: u64::try_from(work.idempotency_max_keys).unwrap_or(u64::MAX),
         max_body_bytes: u64::try_from(limits.max_body_bytes).unwrap_or(u64::MAX),
         poll_default_count: limits.poll_default_count,
         poll_max_count: limits.poll_max_count,
@@ -629,12 +631,18 @@ async fn publish(
         &now,
         Origin::Message,
     )?;
-    let published = state
+    let (published, repeat) = state
         .engine
-        .publish(envelope)
+        .publish_once(envelope)
         .await
         .map_err(|error| error.logged(&tenant, &topic))?;
-    Ok((StatusCode::CREATED, Json(published)))
+    // A repeat of a key is answered with the first publish and stores nothing.
+    let status = if repeat {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((status, Json(published)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -746,6 +754,31 @@ mod tests {
         let (status, body) = send(&router(), Method::GET, "/healthz", None, "").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, json!({"status": "ok"}));
+    }
+
+    #[tokio::test]
+    async fn a_repeated_idempotency_key_is_a_200_with_the_first_and_publishes_nothing() {
+        let _serial = serial().await;
+        let router = router();
+        let keyed = r#"{"source":"s","type":"build.finished","idempotencykey":"k1"}"#;
+        let (status, body) = send(&router, Method::POST, URI, Some(TOKEN), keyed).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let first: Published = serde_json::from_value(body).unwrap();
+
+        let again = r#"{"source":"s","type":"build.finished","idempotencykey":"k1","subject":"x"}"#;
+        let (status, body) = send(&router, Method::POST, URI, Some(TOKEN), again).await;
+        assert_eq!(status, StatusCode::OK);
+        let second: Published = serde_json::from_value(body).unwrap();
+        assert_eq!(second, first);
+
+        let (_, body) = send(&router, Method::GET, URI, Some(TOKEN), "").await;
+        let polled: Polled = serde_json::from_value(body).unwrap();
+        assert_eq!(polled.messages.len(), 1);
+
+        // A key is the topic's: the next key publishes.
+        let other = r#"{"source":"s","type":"build.finished","idempotencykey":"k2"}"#;
+        let (status, _) = send(&router, Method::POST, URI, Some(TOKEN), other).await;
+        assert_eq!(status, StatusCode::CREATED);
     }
 
     #[tokio::test]
@@ -1133,6 +1166,8 @@ mod tests {
         assert_eq!(settings.backoff_cap_seconds, 300);
         assert_eq!(settings.alert_resurface_seconds, 3600);
         assert_eq!(settings.tick_millis, 500);
+        assert_eq!(settings.idempotency_window_seconds, 86_400);
+        assert_eq!(settings.idempotency_max_keys, 10_000);
         assert_eq!(settings.max_body_bytes, 2048);
         assert_eq!(settings.poll_default_count, 3);
         assert_eq!(settings.poll_max_count, 5);

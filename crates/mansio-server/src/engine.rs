@@ -30,8 +30,9 @@ use std::time::Duration;
 
 use mansio_core::api::{Claimed, Published};
 use mansio_core::{
-    AlertEvent, AlertFact, Broker, BrokerError, Caller, ConsumerName, Envelope, EventId, ItemId,
-    LeaseId, Next, Principal, Segment, Sink, TenantId, Timestamp, Topic, WorkEvent, WorkFact,
+    AlertEvent, AlertFact, Broker, BrokerError, Caller, ConsumerName, Envelope, EventId,
+    IdempotencyKey, ItemId, LeaseId, Next, Principal, Segment, Sink, SystemLog, TenantId,
+    Timestamp, Topic, WorkEvent, WorkFact,
 };
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::time::MissedTickBehavior;
@@ -40,6 +41,8 @@ use tracing::{debug, info, warn};
 use crate::clock::Clock;
 use crate::error::ApiError;
 use crate::facts::Facts;
+use crate::idempotency::{self, Keys};
+use crate::records;
 use crate::recover;
 use crate::settings::WorkSettings;
 pub use crate::state::Holder;
@@ -81,6 +84,9 @@ pub struct Engine {
     tenants: StdMutex<HashMap<TenantId, Arc<Mutex<TenantState>>>>,
     /// Whether the tenants the broker holds have all been taken up.
     discovered: AtomicBool,
+    /// The idempotency keys the log holds, read once, until each tenant takes
+    /// its own.
+    seeded_keys: Mutex<Option<HashMap<TenantId, Keys>>>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -111,6 +117,7 @@ impl Engine {
             facts: Facts::new(),
             tenants: StdMutex::default(),
             discovered: AtomicBool::new(false),
+            seeded_keys: Mutex::new(None),
         }
     }
 
@@ -156,6 +163,69 @@ impl Engine {
         Ok(held)
     }
 
+    /// Read the idempotency log, once, into per-tenant keys. A page at a time
+    /// goes straight into the keys, which evict by window and bound as they
+    /// fill, so memory stays within the bound. The broker drops records past
+    /// the window, so the read is about as long as the window's worth of
+    /// keyed publishes. A broker that keeps no such log has none. Any other
+    /// failure is returned and nothing is stored, so the next call tries
+    /// again.
+    async fn seed_keys(
+        &self,
+        seeded: &mut Option<HashMap<TenantId, Keys>>,
+    ) -> Result<(), ApiError> {
+        if seeded.is_some() {
+            return Ok(());
+        }
+        let now = self.clock.now_millis();
+        let window = millis(self.settings.idempotency_window);
+        let mut tenants = HashMap::new();
+        let mut offset = 0;
+        loop {
+            let batch = match self
+                .broker
+                .system_read(SystemLog::Idempotency, offset, self.page)
+                .await
+            {
+                Ok(batch) => batch,
+                Err(BrokerError::Unsupported(reason)) => {
+                    debug!(%reason, "the broker keeps no idempotency keys across a restart");
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let Some(last) = batch.last() else { break };
+            offset = last.offset.saturating_add(1);
+            idempotency::replay_into(
+                &mut tenants,
+                &batch,
+                now,
+                window,
+                self.settings.idempotency_max_keys,
+            );
+        }
+        *seeded = Some(tenants);
+        Ok(())
+    }
+
+    /// Give the tenant its idempotency keys from the log, if it has not got
+    /// them. The log is normally read when the server starts
+    /// ([`Engine::recover`]); this reads it if that could not, and a log that
+    /// cannot be read fails keyed publishes and nothing else.
+    async fn ensure_keys(&self, tenant: &TenantId, held: &mut TenantState) -> Result<(), ApiError> {
+        if held.keys_loaded {
+            return Ok(());
+        }
+        let mut seeded = self.seeded_keys.lock().await;
+        self.seed_keys(&mut seeded).await?;
+        held.keys = seeded
+            .as_mut()
+            .and_then(|tenants| tenants.remove(tenant))
+            .unwrap_or_default();
+        held.keys_loaded = true;
+        Ok(())
+    }
+
     /// Rebuild a tenant's state from its topics.
     async fn load(&self, tenant: &TenantId, state: &mut TenantState) -> Result<(), ApiError> {
         let topics = match self.broker.topics(tenant).await {
@@ -191,10 +261,35 @@ impl Engine {
     /// Returns an error if the broker cannot list its tenants. A tenant that
     /// cannot be rebuilt is logged and tried again by the timer.
     pub async fn recover(&self) -> Result<(), ApiError> {
-        for tenant in self.broker.tenants().await? {
-            if let Err(error) = self.lock(&tenant).await {
-                warn!(%tenant, ?error, "the state could not be rebuilt");
+        // The idempotency log is read first, before any tenant is locked, so
+        // that no request waits on it.
+        let mut keys_ready = {
+            let mut seeded = self.seeded_keys.lock().await;
+            match self.seed_keys(&mut seeded).await {
+                Ok(()) => true,
+                Err(error) => {
+                    warn!(?error, "the idempotency keys could not be read");
+                    false
+                }
             }
+        };
+        for tenant in self.broker.tenants().await? {
+            match self.lock(&tenant).await {
+                Ok(mut held) => {
+                    if keys_ready && self.ensure_keys(&tenant, &mut held).await.is_err() {
+                        keys_ready = false;
+                    }
+                }
+                Err(error) => {
+                    keys_ready = false;
+                    warn!(%tenant, ?error, "the state could not be rebuilt");
+                }
+            }
+        }
+        if keys_ready {
+            // Every tenant has taken its keys; what is left belongs to
+            // tenants the broker does not list, and is not kept.
+            *self.seeded_keys.lock().await = Some(HashMap::new());
         }
         self.discovered.store(true, Ordering::Release);
         Ok(())
@@ -269,6 +364,21 @@ impl Engine {
     /// whether it stored the message, and 502 if the broker names a refusal
     /// that comes before it stores anything.
     pub async fn publish(&self, envelope: Envelope) -> Result<Published, ApiError> {
+        self.publish_once(envelope)
+            .await
+            .map(|(published, _)| published)
+    }
+
+    /// Publish an envelope as [`Engine::publish`] does, unless an earlier
+    /// publish to the same tenant and topic carried the same idempotency key
+    /// inside the window (`MANSIO_IDEMPOTENCY_WINDOW_SECONDS`): then nothing is
+    /// published and the answer is the first one, with `true` to say it is a
+    /// repeat. Only durable topics are deduplicated; `presence` is not.
+    ///
+    /// # Errors
+    ///
+    /// As [`Engine::publish`].
+    pub async fn publish_once(&self, envelope: Envelope) -> Result<(Published, bool), ApiError> {
         match &envelope.topic {
             Topic::Work(_) => {
                 return Err(ApiError::BadRequest(
@@ -289,9 +399,28 @@ impl Engine {
                 .ensure_topic(&envelope.tenant, &envelope.topic)
                 .await?;
             let offset = self.broker.publish(&Caller::Admin, &envelope).await?;
-            return Ok(Published { offset, envelope });
+            return Ok((Published { offset, envelope }, false));
         }
         let mut held = self.lock(&envelope.tenant).await?;
+        let window = millis(self.settings.idempotency_window);
+        let key = envelope.idempotency_key.clone();
+        if let Some(key) = &key {
+            self.ensure_keys(&envelope.tenant, &mut held).await?;
+            if let Some(first) =
+                held.keys
+                    .get(&envelope.topic, key, self.clock.now_millis(), window)
+            {
+                // The first envelope is its publisher's to read back. Another
+                // principal that may only publish must not read it by
+                // guessing the key, so it is told the key is taken, no more.
+                if first.envelope.principal != envelope.principal {
+                    return Err(ApiError::Conflict(
+                        "the idempotency key was used by another principal".to_owned(),
+                    ));
+                }
+                return Ok((first.clone(), true));
+            }
+        }
         let is_alert = envelope.topic == Topic::Alerts;
         if is_alert
             && (held.alerts.contains_key(&envelope.id)
@@ -308,7 +437,41 @@ impl Engine {
             held.alerts
                 .insert(stored.envelope.id, self.clock.now_millis());
         }
-        Ok(stored)
+        if let Some(key) = key {
+            self.remember(&mut held, key, &stored).await;
+        }
+        Ok((stored, false))
+    }
+
+    /// Remember that a publish used a key, in memory and in the log. A log
+    /// that cannot be written does not undo a publish that is stored: the key
+    /// holds until the next restart.
+    async fn remember(&self, held: &mut TenantState, key: IdempotencyKey, stored: &Published) {
+        let at = self.clock.now_millis();
+        let entry =
+            idempotency::Entry::seen(stored.envelope.tenant.clone(), key.clone(), at, stored);
+        held.keys.insert(
+            (stored.envelope.topic.clone(), key),
+            at,
+            stored.clone(),
+            at,
+            millis(self.settings.idempotency_window),
+            self.settings.idempotency_max_keys,
+        );
+        let written = match records::encode(&entry) {
+            Ok(record) => self
+                .broker
+                .system_append(SystemLog::Idempotency, &record)
+                .await
+                .map_err(ApiError::from),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = written {
+            warn!(
+                ?error,
+                "an idempotency key could not be recorded, so a restart forgets it"
+            );
+        }
     }
 
     /// Publish a work item. The envelope is for `work.<queue>`, with its
@@ -678,6 +841,8 @@ impl Engine {
                 continue;
             }
             let now = self.clock.now_millis();
+            held.keys
+                .prune(now, millis(self.settings.idempotency_window));
             self.process_due(&mut held, &tenant, now).await;
         }
     }

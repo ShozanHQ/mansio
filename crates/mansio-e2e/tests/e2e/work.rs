@@ -444,6 +444,8 @@ async fn the_settings_are_served_and_need_the_token() -> anyhow::Result<()> {
     assert!(settings.backoff_cap_seconds >= settings.backoff_base_seconds);
     assert!(settings.alert_resurface_seconds >= 1);
     assert!(settings.tick_millis >= 1);
+    assert!(settings.idempotency_window_seconds >= 1);
+    assert!(settings.idempotency_max_keys >= 1);
     assert!(settings.poll_max_count >= settings.poll_default_count);
     assert!(settings.agent_credential_ttl_seconds >= 1);
     assert!(settings.credential_recheck_seconds >= 1);
@@ -468,6 +470,8 @@ async fn the_settings_are_served_and_need_the_token() -> anyhow::Result<()> {
         "backoff_cap_seconds",
         "alert_resurface_seconds",
         "tick_millis",
+        "idempotency_window_seconds",
+        "idempotency_max_keys",
         "agent_credential_ttl_seconds",
         "credential_recheck_seconds",
         "credential_sweep_seconds",

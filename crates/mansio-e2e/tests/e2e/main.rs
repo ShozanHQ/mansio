@@ -13,6 +13,7 @@ mod consumers;
 mod credentials;
 mod events;
 mod harness;
+mod idempotency;
 mod ordering;
 mod passes;
 mod receiver;

@@ -330,6 +330,21 @@ landed and mansio could not find it among the recent messages (see
 `MANSIO_IGGY_LOCATE_WINDOW`). The answer is still 201: the message is stored,
 so do not publish it again. Poll and match on the envelope's `id` to find it.
 
+A publish that carries an `idempotencykey` is safe to send again. If the tenant
+has already accepted a publish to the same topic with the same key less than
+`MANSIO_IDEMPOTENCY_WINDOW_SECONDS` ago, the answer is 200 with the first
+publish's envelope and offset, and nothing is published. The first is a 201. The
+server remembers at most `MANSIO_IDEMPOTENCY_MAX_KEYS` keys per tenant, forgets
+the one remembered longest ago first, drops keys past their window on every
+timer tick, and keeps them across a restart in a log that Iggy trims to the
+window (the log is created with that expiry, so changing the window later does
+not change the expiry of a log that exists). The log is read when the server
+starts, not inside a request. The same key from another principal is answered
+409 with no envelope. A publish
+without a key, a key on `presence` and `work_publish` are not deduplicated, and a
+publish that answered 503 may be stored without its key being remembered, so
+consumers still deduplicate on `id`. ARCHITECTURE.md has the whole rule.
+
 A refusal is `{"error":{"code":"...","message":"..."}}` with status 400, 401
 (no valid credential), 403 (a valid credential that may not do this, or a lease
 that is not yours), 404, 409, 413, 502 or 503. A 502 is a refusal the broker
@@ -790,6 +805,8 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_BACKOFF_CAP_SECONDS` | `300` | The longest that wait gets. At least the base. |
 | `MANSIO_ALERT_RESURFACE_SECONDS` | `3600` | How long an alert may go unacknowledged before it is surfaced again, and again after each further interval. |
 | `MANSIO_TICK_MILLIS` | `500` | How often the timer looks for leases to expire, items to republish and alerts to surface again. |
+| `MANSIO_IDEMPOTENCY_WINDOW_SECONDS` | `86400` | How long a publish's `idempotencykey` is remembered. A second publish to the same tenant and topic with the same key inside the window is answered 200 with the first envelope and offset and publishes nothing. At least `1`, at most `315360000` (ten years). |
+| `MANSIO_IDEMPOTENCY_MAX_KEYS` | `10000` | The most keys a tenant remembers, in memory and when they are read back after a restart. Past it the key remembered longest ago is forgotten first, even inside its window. At least `1`. |
 | `MANSIO_STREAM_POLL_MILLIS` | `500` | How often an event stream and a webhook look for new messages once they have caught up. |
 | `MANSIO_SSE_KEEPALIVE_SECONDS` | `15` | How often a quiet event stream sends a comment. |
 | `MANSIO_SHUTDOWN_GRACE_SECONDS` | `10` | On SIGINT or SIGTERM the server ends every event stream, and waits this long for the requests still being served before it stops anyway. |
@@ -855,8 +872,8 @@ topics it creates, and leaves Iggy's own settings at its defaults.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MANSIO_E2E_URL` | unset | A running server for `mansio-e2e` to use, with `MANSIO_TOKEN` set to its token. Unset starts a server in the test process on the memory broker, with a lease of 2 s that may run to 60 s, 3 attempts, a backoff from 1 s to 4 s, alerts surfaced every 2 s, an agent credential that lasts 3 s, is checked every second and swept every second, streams that look every 50 ms and send a comment every second, a grace of 2 s for a shutdown, and webhooks that retry after 1 s to 4 s, give up after 3 attempts and wait 2 s for an answer. Against a running server the tests read its settings from `GET /v1/settings`. |
-| `MANSIO_E2E_STATE_DIR` | unset | A directory that the first and second passes of the restart and retention tests (see [Develop](#develop)) keep their state in. Required by those tests, which fail without it. |
+| `MANSIO_E2E_URL` | unset | A running server for `mansio-e2e` to use, with `MANSIO_TOKEN` set to its token. Unset starts a server in the test process on the memory broker, with a lease of 2 s that may run to 60 s, 3 attempts, a backoff from 1 s to 4 s, alerts surfaced every 2 s, an agent credential that lasts 3 s, is checked every second and swept every second, streams that look every 50 ms and send a comment every second, a grace of 2 s for a shutdown, and webhooks that retry after 1 s to 4 s, give up after 3 attempts and wait 2 s for an answer, and an idempotency window of 4 s over at most 20 keys. Against a running server the tests read its settings from `GET /v1/settings`. |
+| `MANSIO_E2E_STATE_DIR` | unset | A directory that the first and second passes of the restart, idempotency and retention tests (see [Develop](#develop)) keep their state in. Required by those tests, which fail without it. |
 | `MANSIO_E2E_SINK_PATH` | unset | The sink file of the running server, as the test process can read it. With it the tests also check the order of the sink; without it they check the topics only. |
 | `MANSIO_E2E_IGGY_ADDRESS` | unset | Iggy's TCP address as the test process reaches it (`127.0.0.1:8090` for `compose.yaml`). With `MANSIO_E2E_URL` set it is required: the credential tests ask Iggy itself, without mansio-server, what a credential may do, and fail if they cannot. Without `MANSIO_E2E_URL` they ask the memory broker. |
 | `MANSIO_E2E_WEBHOOK_HOST` | unset | The name by which mansio-server reaches the webhook receiver that the tests start (`host.docker.internal` for `compose.yaml`, which maps it to the host). With `MANSIO_E2E_URL` set it is required, and the receiver then listens on every interface; the webhook tests fail without it. In process the receiver listens on loopback. |
@@ -912,6 +929,7 @@ MANSIO_LEASE_SECONDS=2 MANSIO_MAX_ATTEMPTS=3 MANSIO_BACKOFF_BASE_SECONDS=1 \
   MANSIO_STREAM_POLL_MILLIS=100 MANSIO_SSE_KEEPALIVE_SECONDS=1 \
   MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS=1 MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS=4 \
   MANSIO_WEBHOOK_MAX_ATTEMPTS=3 MANSIO_WEBHOOK_TIMEOUT_SECONDS=2 \
+  MANSIO_IDEMPOTENCY_WINDOW_SECONDS=10 MANSIO_IDEMPOTENCY_MAX_KEYS=20 \
   docker compose up --build --wait
 MANSIO_E2E_URL=http://127.0.0.1:7070 MANSIO_TOKEN=mansio-dev-token \
   MANSIO_E2E_IGGY_ADDRESS=127.0.0.1:8090 \
@@ -925,14 +943,19 @@ the server run only against the in-process one.
 
 The tests that need Iggy to hold real messages across a restart come in pairs
 of passes, `restart_first_pass` and `restart_second_pass`, `retention_first_pass`
-and `retention_second_pass` in `crates/mansio-e2e/tests/e2e/passes.rs`. They are
+and `retention_second_pass` in `crates/mansio-e2e/tests/e2e/passes.rs`, and
+`idempotency_first_pass` and `idempotency_second_pass` in
+`crates/mansio-e2e/tests/e2e/idempotency.rs`. They are
 `#[ignore]`d, so a plain `cargo test` leaves them alone, and they fail, not
 skip, without `MANSIO_E2E_URL` or `MANSIO_E2E_STATE_DIR`. The `e2e` job in
 `.github/workflows/ci.yml`, through the action in `.github/actions/e2e`, runs
 them in order: it recreates mansio-server with
-pages of 5, a lease of 30 s, a segment of 1 MiB and alerts kept for 5 s, runs
-the two first passes, restarts mansio-server (`docker compose restart`), and
-runs the two second passes. The restart pair publishes a queue longer than
+pages of 5, a lease of 30 s, a segment of 1 MiB, alerts kept for 5 s and an
+idempotency window of 600 s, runs the three first passes, restarts mansio-server
+(`docker compose restart`), and runs the three second passes. The idempotency
+pair publishes with a key, and after the restart checks that the same key is
+answered 200 with the first envelope and offset and that the topic holds one
+message. The restart pair publishes a queue longer than
 `MANSIO_POLL_MAX_COUNT`, claims one item and extends its lease to twice the
 lease setting, and after the restart checks that the lease still holds past
 the end it first had and until the end it was extended to, that the item is

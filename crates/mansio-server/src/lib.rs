@@ -29,6 +29,7 @@ mod engine;
 mod error;
 mod events_api;
 mod facts;
+mod idempotency;
 mod principals_api;
 mod records;
 mod recover;

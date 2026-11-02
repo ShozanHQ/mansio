@@ -130,6 +130,7 @@ pub struct IggyBroker {
     retention: Retention,
     durability: DurabilityPolicy,
     segment_size_bytes: u64,
+    idempotency_expiry: Duration,
     locate_window: u32,
     ensured: Ensured,
     /// The clients signed in with a principal's credential.
@@ -204,6 +205,7 @@ impl IggyBroker {
             retention: config.retention,
             durability: config.durability,
             segment_size_bytes: config.segment_size_bytes,
+            idempotency_expiry: config.idempotency_expiry,
             locate_window: config.locate_window,
             ensured: Ensured::default(),
             sessions: Sessions::default(),
@@ -536,7 +538,13 @@ impl IggyBroker {
             .get_or_try_init(|| async {
                 self.make_stream(SYSTEM_STREAM).await?;
                 for log in SystemLog::ALL {
-                    self.make_topic(SYSTEM_STREAM, log.as_str(), &system_topic_options())
+                    let options = match log {
+                        SystemLog::Idempotency => {
+                            idempotency_topic_options(self.idempotency_expiry)
+                        }
+                        _ => system_topic_options(),
+                    };
+                    self.make_topic(SYSTEM_STREAM, log.as_str(), &options)
                         .await?;
                 }
                 Ok::<(), BrokerError>(())
@@ -685,6 +693,16 @@ fn system_topic_options() -> TopicCreateOptions {
         durability: IggyDurability::Persisted,
         consumer_offset_durability: IggyDurability::Persisted,
         ..TopicCreateOptions::default()
+    }
+}
+
+/// How the log of idempotency keys is created: the same as the other system
+/// logs, except that Iggy drops a record once the window has passed, so the
+/// log (and a restart's read of it) stays about as long as the window.
+fn idempotency_topic_options(window: Duration) -> TopicCreateOptions {
+    TopicCreateOptions {
+        message_expiry: Some(IggyExpiry::ExpireDuration(IggyDuration::from(window))),
+        ..system_topic_options()
     }
 }
 
@@ -1254,6 +1272,18 @@ mod tests {
     }
 
     #[test]
+    fn the_idempotency_log_expires_with_the_window() {
+        let options = idempotency_topic_options(Duration::from_secs(90));
+        assert_eq!(
+            options.message_expiry,
+            Some(IggyExpiry::ExpireDuration(IggyDuration::from(
+                Duration::from_secs(90)
+            )))
+        );
+        assert_eq!(options.durability, IggyDurability::Persisted);
+    }
+
+    #[test]
     fn the_stream_of_the_servers_own_records_cannot_be_a_tenant() {
         assert!(SYSTEM_STREAM.parse::<TenantId>().is_err());
         assert!(SYSTEM_TOPIC.parse::<Topic>().is_err());
@@ -1261,6 +1291,8 @@ mod tests {
         assert_eq!(SystemLog::Principals.as_str(), SYSTEM_TOPIC);
         assert_eq!(SystemLog::Webhooks.as_str(), SYSTEM_WEBHOOKS_TOPIC);
         assert_eq!(SystemLog::Cursors.as_str(), SYSTEM_CURSORS_TOPIC);
+        assert_eq!(SystemLog::Idempotency.as_str(), "idempotency");
+        assert!(SystemLog::Idempotency.as_str().parse::<Topic>().is_err());
         assert!(SYSTEM_CURSORS_TOPIC.parse::<Topic>().is_err());
         assert!(user_id(BrokerUser(7)).is_ok());
     }

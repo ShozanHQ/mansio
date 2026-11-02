@@ -132,7 +132,7 @@ impl From<BrokerError> for ApiError {
         match error {
             BrokerError::NotFound(what) => ApiError::NotFound(what),
             BrokerError::Unavailable(why) => ApiError::Unavailable(why),
-            BrokerError::Rejected(why) => ApiError::BadGateway(why),
+            BrokerError::Rejected(why) | BrokerError::Unsupported(why) => ApiError::BadGateway(why),
             BrokerError::Forbidden(why) => ApiError::Forbidden(why),
             BrokerError::Unauthenticated(_) => ApiError::Unauthorized,
             BrokerError::Corrupt(_) | BrokerError::Envelope(_) => {

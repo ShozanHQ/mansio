@@ -54,6 +54,10 @@ impl Default for Limits {
 /// not read back as it was.
 pub const MAX_LEASE: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
 
+/// The longest an idempotency window can be set to: ten years, so that a time
+/// plus a window stays in range of a timestamp.
+pub const MAX_IDEMPOTENCY_WINDOW: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
+
 /// How the work and alert engine behaves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkSettings {
@@ -77,6 +81,15 @@ pub struct WorkSettings {
     /// How often the timer looks for expiries, republishes and alerts to
     /// surface (`MANSIO_TICK_MILLIS`).
     pub tick: Duration,
+    /// How long a publish's idempotency key is remembered: a second publish
+    /// to the same tenant and topic with the same key inside this window is
+    /// answered with the first and publishes nothing
+    /// (`MANSIO_IDEMPOTENCY_WINDOW_SECONDS`).
+    pub idempotency_window: Duration,
+    /// The most keys a tenant remembers; past it the one remembered longest
+    /// ago is forgotten, even inside its window
+    /// (`MANSIO_IDEMPOTENCY_MAX_KEYS`).
+    pub idempotency_max_keys: usize,
 }
 
 impl Default for WorkSettings {
@@ -89,6 +102,8 @@ impl Default for WorkSettings {
             backoff_cap: Duration::from_secs(300),
             alert_resurface: Duration::from_secs(3600),
             tick: Duration::from_millis(500),
+            idempotency_window: Duration::from_secs(86_400),
+            idempotency_max_keys: 10_000,
         }
     }
 }
@@ -145,6 +160,21 @@ impl WorkSettings {
         }
         if self.tick.is_zero() {
             return Err(invalid("MANSIO_TICK_MILLIS", "must be at least 1"));
+        }
+        if self.idempotency_window < Duration::from_secs(1) {
+            return Err(invalid(
+                "MANSIO_IDEMPOTENCY_WINDOW_SECONDS",
+                "must be at least 1",
+            ));
+        }
+        if self.idempotency_window > MAX_IDEMPOTENCY_WINDOW {
+            return Err(invalid(
+                "MANSIO_IDEMPOTENCY_WINDOW_SECONDS",
+                "must be at most 315360000 (ten years)",
+            ));
+        }
+        if self.idempotency_max_keys == 0 {
+            return Err(invalid("MANSIO_IDEMPOTENCY_MAX_KEYS", "must be at least 1"));
         }
         Ok(())
     }
@@ -436,6 +466,14 @@ impl Settings {
                 "MANSIO_TICK_MILLIS",
                 u64::try_from(work_defaults.tick.as_millis()).unwrap_or(u64::MAX),
             )?),
+            idempotency_window: env.seconds(
+                "MANSIO_IDEMPOTENCY_WINDOW_SECONDS",
+                work_defaults.idempotency_window,
+            )?,
+            idempotency_max_keys: env.parse(
+                "MANSIO_IDEMPOTENCY_MAX_KEYS",
+                work_defaults.idempotency_max_keys,
+            )?,
         };
         work.validate()?;
 
@@ -491,7 +529,7 @@ impl Settings {
         webhooks.validate()?;
 
         let broker = match env.string("MANSIO_BROKER", "iggy").as_str() {
-            "iggy" => Backend::Iggy(Self::iggy_config(&env)?),
+            "iggy" => Backend::Iggy(Self::iggy_config(&env, work.idempotency_window)?),
             "memory" => Backend::Memory,
             _ => {
                 return Err(SettingsError::Invalid {
@@ -553,6 +591,7 @@ impl Settings {
 
     fn iggy_config<F: Fn(&str) -> Option<String>>(
         env: &Env<F>,
+        idempotency_window: Duration,
     ) -> Result<IggyConfig, SettingsError> {
         let retention = |name: &'static str,
                          default: Option<Duration>|
@@ -569,6 +608,7 @@ impl Settings {
             "MANSIO_IGGY_CONNECT_TIMEOUT_SECONDS",
             DEFAULT_CONNECT_TIMEOUT.as_secs(),
         )?);
+        config.idempotency_expiry = idempotency_window;
         config.locate_window = env.parse("MANSIO_IGGY_LOCATE_WINDOW", DEFAULT_LOCATE_WINDOW)?;
         config.segment_size_bytes = env.parse("MANSIO_IGGY_SEGMENT_SIZE_BYTES", 0_u64)?;
         check_segment_size(config.segment_size_bytes).map_err(|reason| SettingsError::Invalid {
@@ -758,6 +798,8 @@ mod tests {
             ("MANSIO_BACKOFF_CAP_SECONDS", "4"),
             ("MANSIO_ALERT_RESURFACE_SECONDS", "7"),
             ("MANSIO_TICK_MILLIS", "100"),
+            ("MANSIO_IDEMPOTENCY_WINDOW_SECONDS", "90"),
+            ("MANSIO_IDEMPOTENCY_MAX_KEYS", "50"),
         ])
         .unwrap();
         assert_eq!(
@@ -770,6 +812,8 @@ mod tests {
                 backoff_cap: Duration::from_secs(4),
                 alert_resurface: Duration::from_secs(7),
                 tick: Duration::from_millis(100),
+                idempotency_window: Duration::from_secs(90),
+                idempotency_max_keys: 50,
             }
         );
     }

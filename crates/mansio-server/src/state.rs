@@ -13,6 +13,7 @@ use mansio_core::{
 use subtle::ConstantTimeEq;
 
 use crate::error::ApiError;
+use crate::idempotency::Keys;
 
 /// A lease id the server still has, in memory only. It shows in no log, no
 /// fact and no `Debug` output.
@@ -255,6 +256,11 @@ pub(crate) struct TenantState {
     /// The ids of alerts that were acknowledged, which are all that is kept
     /// of them.
     pub(crate) acknowledged_alerts: HashSet<EventId>,
+    /// The idempotency keys publishes have used. Unlike the rest of the
+    /// state they are not rebuilt from the topics: they are read once from
+    /// the log of keys, and a reload of the rest keeps them.
+    pub(crate) keys: Keys,
+    pub(crate) keys_loaded: bool,
 }
 
 impl TenantState {

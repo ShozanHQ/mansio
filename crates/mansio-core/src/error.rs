@@ -59,6 +59,9 @@ pub enum BrokerError {
     /// is not one of those is [`BrokerError::Unavailable`].
     #[error("broker refused the request: {0}")]
     Rejected(String),
+    /// The broker does not offer what was asked, whatever the request.
+    #[error("not supported: {0}")]
+    Unsupported(String),
     /// The credential is valid, and the broker's permissions do not let it do
     /// this.
     #[error("not permitted: {0}")]

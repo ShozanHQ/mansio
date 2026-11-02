@@ -26,6 +26,10 @@ runs:
           echo MANSIO_BACKOFF_CAP_SECONDS=4
           echo MANSIO_ALERT_RESURFACE_SECONDS=2
           echo MANSIO_TICK_MILLIS=200
+          # A key is remembered for 10 s and a tenant keeps 20, so that the tests
+          # of the window and of the bound take seconds.
+          echo MANSIO_IDEMPOTENCY_WINDOW_SECONDS=10
+          echo MANSIO_IDEMPOTENCY_MAX_KEYS=20
           # An agent credential lasts seconds, is checked with Iggy every 2 s,
           # and the sweep runs every 2 s.
           echo MANSIO_AGENT_CREDENTIAL_TTL_SECONDS=5
@@ -69,7 +73,7 @@ runs:
     # server is restarted, and a second pass checks what the new server made
     # of them. They are #[ignore]d and selected by name, and they fail
     # without a live server and a state directory.
-    - name: A server with pages of 5, a lease of 30 s, and a segment of 1 MiB and alerts kept 5 s
+    - name: A server with pages of 5, a lease of 30 s, a segment of 1 MiB, alerts kept 5 s and keys kept 10 min
       shell: bash
       run: |
         # Set here, in the command's own environment, over the 2 s lease above.
@@ -78,6 +82,8 @@ runs:
         export MANSIO_POLL_MAX_COUNT=5
         export MANSIO_IGGY_SEGMENT_SIZE_BYTES=1048576
         export MANSIO_RETENTION_ALERTS_SECONDS=5
+        # Long enough that a key outlasts the restart below.
+        export MANSIO_IDEMPOTENCY_WINDOW_SECONDS=600
         docker compose up --detach --wait --no-deps --force-recreate mansio-server
     - name: Retention, first pass (alerts lose their head to Iggy, then another is published)
       shell: bash
@@ -85,6 +91,9 @@ runs:
     - name: Restart, first pass (a queue longer than a page, one item claimed)
       shell: bash
       run: cargo test -p mansio-e2e --locked -- --ignored restart_first_pass
+    - name: Idempotency, first pass (a publish with a key)
+      shell: bash
+      run: cargo test -p mansio-e2e --locked -- --ignored idempotency_first_pass
     - name: Restart mansio-server and wait for /healthz
       shell: bash
       run: |
@@ -97,9 +106,9 @@ runs:
         done
         echo "::error::mansio-server did not answer /healthz after the restart"
         exit 1
-    - name: Restart and retention, second pass (the lease holds, the retry happens once, the alerts are known)
+    - name: Restart, retention and idempotency, second pass (the lease holds, the retry happens once, the alerts are known, the key answers with the first)
       shell: bash
-      run: cargo test -p mansio-e2e --locked -- --ignored restart_second_pass retention_second_pass
+      run: cargo test -p mansio-e2e --locked -- --ignored restart_second_pass retention_second_pass idempotency_second_pass
     - name: Compose logs
       if: failure()
       shell: bash
