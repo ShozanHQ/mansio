@@ -1143,6 +1143,114 @@ async fn a_restarted_server_knows_who_has_a_credential() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Revoking a principal ends every live lease it holds, even one extended as
+/// far as it can go: each ending is an `expired` fact with the reason
+/// `revoked`, and the item is retried after the backoff and claimed by
+/// another.
+#[tokio::test]
+async fn revoking_a_principal_ends_its_leases_and_the_item_is_retried_after_the_backoff()
+-> anyhow::Result<()> {
+    let target = Target::start().await?;
+    target.seed_queue("builds").await?;
+    anyhow::ensure!(
+        target.lease_max() > SLACK * 2,
+        "the lease max must be longer than the wait for a retry"
+    );
+    let agent = target
+        .issue(
+            "agent",
+            "builder-1",
+            &scopes(&[("work.builds", &["claim"])]),
+            None,
+        )
+        .await?;
+    // The seeded item is the only one in the queue.
+    let (status, claim) = agent.pull("builds").await?;
+    assert_eq!(status, StatusCode::OK, "{claim}");
+    // Asking for as long as it can have: nothing else could claim the item
+    // for the whole of it.
+    let (status, extended) = agent
+        .extend_for("builds", &claim, target.lease_max().as_secs())
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{extended}");
+    assert!(
+        target.pull("builds", "other").await?.is_none(),
+        "the item is held"
+    );
+
+    let (status, revoked) = target.revoke(&agent.id).await?;
+    assert_eq!(status, StatusCode::OK, "{revoked}");
+    let revoked_at = Instant::now();
+
+    // Another consumer has it after the backoff, as the second attempt.
+    let again = target
+        .claim("builds", "other", target.backoff(1) + SLACK)
+        .await?;
+    assert!(
+        revoked_at.elapsed() < SLACK,
+        "claimed long before the lease"
+    );
+    assert_eq!(again.item.attempt, Some(2));
+    assert_eq!(
+        again.item.item_id.as_ref().map(|id| id.to_string()),
+        claim["item"]["itemid"].as_str().map(str::to_owned)
+    );
+
+    assert_eq!(
+        target.work_transitions().await?,
+        ["claimed", "extended", "expired", "retried", "claimed"]
+    );
+    let facts = target.read("facts.work").await?;
+    let expired = facts[2].data.as_ref().context("data")?;
+    assert_eq!(expired["reason"], "revoked");
+    assert_eq!(expired["holder"], "agent:builder-1");
+    assert_eq!(expired["next"], "retry");
+    Ok(())
+}
+
+/// An agent credential cannot extend a lease past its own expiry: the
+/// extension is capped there.
+#[tokio::test]
+async fn an_agent_credential_cannot_extend_a_lease_past_its_own_expiry() -> anyhow::Result<()> {
+    let target = Target::start().await?;
+    target.seed_queue("builds").await?;
+    anyhow::ensure!(
+        target.lease_max() > Duration::from_secs(30),
+        "the lease max must be longer than the credential"
+    );
+    let agent = target
+        .issue(
+            "agent",
+            "builder-1",
+            &scopes(&[("work.builds", &["claim"])]),
+            Some(10),
+        )
+        .await?;
+    let expires = millis(
+        &agent.principal["expires_at"]
+            .as_str()
+            .context("an agent credential has an expiry")?
+            .parse()?,
+    )?;
+    let (status, claim) = agent.pull("builds").await?;
+    assert_eq!(status, StatusCode::OK, "{claim}");
+
+    // Asking for far more than the credential has left.
+    let (status, extended) = agent.extend_for("builds", &claim, 30).await?;
+    assert_eq!(status, StatusCode::OK, "{extended}");
+    let ends = millis(
+        &extended["envelope"]["data"]["expires_at"]
+            .as_str()
+            .context("an extended fact says where the lease ends")?
+            .parse()?,
+    )?;
+    assert!(
+        (expires - 1..=expires).contains(&ends),
+        "the lease ends at {ends}, the credential at {expires}"
+    );
+    Ok(())
+}
+
 fn now_millis() -> anyhow::Result<i64> {
     let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
     Ok(i64::try_from(since.as_millis())?)

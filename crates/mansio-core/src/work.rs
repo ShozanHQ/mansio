@@ -136,7 +136,9 @@ pub struct WorkFact {
     /// one, the end it was extended to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<Timestamp>,
-    /// `failed`: why, as the holder said.
+    /// `failed`: why, as the holder said. `expired`: `revoked` when the lease
+    /// was ended because its holder's credential was revoked or expired; not
+    /// set when the lease simply ran out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// `failed` and `expired`: what happens next.

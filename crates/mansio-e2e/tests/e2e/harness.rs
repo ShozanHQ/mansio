@@ -1301,6 +1301,26 @@ impl Issued {
         self.call(Method::POST, &uri, Some(&body)).await
     }
 
+    /// `work_extend` of a claim that `pull` answered with, for `seconds` from
+    /// now.
+    pub async fn extend_for(
+        &self,
+        queue: &str,
+        claim: &Value,
+        seconds: u64,
+    ) -> anyhow::Result<(StatusCode, Value)> {
+        let item = claim["item"]["itemid"]
+            .as_str()
+            .context("a claim names its item")?;
+        let uri = self.tenant_uri(&self.tenant, &format!("work/{queue}/items/{item}/extend"));
+        let body = json!({
+            "lease_id": claim["lease_id"],
+            "consumer": claim["consumer"],
+            "seconds": seconds,
+        });
+        self.call(Method::POST, &uri, Some(&body)).await
+    }
+
     /// `alerts_ack`.
     pub async fn alert_ack(&self, alert: &str) -> anyhow::Result<(StatusCode, Value)> {
         let uri = self.tenant_uri(&self.tenant, &format!("alerts/{alert}/ack"));
