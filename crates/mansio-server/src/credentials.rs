@@ -27,7 +27,7 @@ use mansio_core::{
 };
 use tokio::sync::{Mutex, OnceCell};
 use tokio::time::MissedTickBehavior;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::auth::Actor;
 use crate::clock::Clock;
@@ -350,6 +350,11 @@ impl Credentials {
             record.info.tenant,
             record.info.scopes,
             credential,
+            record
+                .info
+                .expires_at
+                .as_ref()
+                .and_then(Timestamp::unix_millis),
         ))
     }
 
@@ -546,8 +551,27 @@ impl Credentials {
         self.checked().remove(&id);
         self.save_revoked(id).await;
         self.record_revoked(by, &record.info, reason).await;
+        self.end_leases(&record.info).await;
         info!(principal = %id, name = %record.info.name, ?reason, "credential revoked");
         Ok(record.info)
+    }
+
+    /// End the leases the revoked principal holds, so that nobody waits on a
+    /// holder that can no longer act. If that fails the revocation stands, the
+    /// failure is logged, and each lease ends when it runs out.
+    async fn end_leases(&self, info: &PrincipalInfo) {
+        match self
+            .engine
+            .end_leases_of(&info.tenant, &info.principal())
+            .await
+        {
+            Ok(ended) => {
+                debug!(principal = %info.id, ended, "leases of a revoked principal ended");
+            }
+            Err(error) => {
+                warn!(principal = %info.id, ?error, "the leases of a revoked principal could not be ended");
+            }
+        }
     }
 
     /// Write the revocation to the registry's log. If that fails the
@@ -781,6 +805,7 @@ mod tests {
     struct Rig {
         broker: Arc<Spy>,
         clock: Arc<ManualClock>,
+        engine: Arc<Engine>,
         credentials: Arc<Credentials>,
     }
 
@@ -808,7 +833,7 @@ mod tests {
             ));
             let credentials = Arc::new(Credentials::new(
                 broker.clone(),
-                engine,
+                Arc::clone(&engine),
                 clock.clone(),
                 settings(),
                 admin(),
@@ -817,6 +842,7 @@ mod tests {
             Self {
                 broker,
                 clock,
+                engine,
                 credentials,
             }
         }
@@ -1024,6 +1050,106 @@ mod tests {
                     Some("expired".to_owned())
                 ),
             ]
+        );
+    }
+
+    /// Publish an item to `work.builds` and have `holder` claim it.
+    async fn leased_to(rig: &Rig, holder: &Principal) {
+        let id = mansio_core::EventId::generate();
+        let mut message = Envelope::new(
+            id,
+            "test".parse().unwrap(),
+            "job.requested".parse().unwrap(),
+            tenant(),
+            Topic::Work("builds".parse().unwrap()),
+            admin(),
+        );
+        message.item_id = Some(id.to_string().parse().unwrap());
+        message.attempt = Some(1);
+        rig.engine.work_publish(message).await.unwrap();
+        rig.engine
+            .work_pull(
+                &tenant(),
+                &"builds".parse().unwrap(),
+                holder,
+                &"worker".parse().unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// The `expired` facts on `facts.work`: `(holder, reason)`.
+    async fn expired_work_facts(rig: &Rig) -> Vec<(String, Option<String>)> {
+        let topic: Topic = "facts.work".parse().unwrap();
+        let stored = match rig
+            .broker
+            .poll(&Caller::Admin, &tenant(), &topic, 0, 100)
+            .await
+        {
+            Ok(stored) => stored,
+            Err(BrokerError::NotFound(_)) => Vec::new(),
+            Err(error) => panic!("{error}"),
+        };
+        stored
+            .into_iter()
+            .map(|s| s.envelope)
+            .filter(|fact| fact.event_type.as_str() == "mansio.work.expired")
+            .map(|fact| {
+                let data = fact.data.unwrap_or_default();
+                (
+                    data["holder"].as_str().unwrap_or_default().to_owned(),
+                    data["reason"].as_str().map(str::to_owned),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_sweep_ends_the_leases_of_the_credential_it_removes() {
+        let rig = Rig::new();
+        let agent = rig.issue("agent", "builder-1", Some(5)).await.unwrap();
+        let other = rig.issue("agent", "builder-2", Some(500)).await.unwrap();
+        leased_to(&rig, &agent.principal.principal()).await;
+        leased_to(&rig, &other.principal.principal()).await;
+
+        // Nothing is ended before the credential is.
+        rig.credentials.sweep().await;
+        assert!(expired_work_facts(&rig).await.is_empty());
+
+        rig.clock.advance(Duration::from_secs(6));
+        rig.credentials.sweep().await;
+        assert_eq!(
+            expired_work_facts(&rig).await,
+            [("agent:builder-1".to_owned(), Some("revoked".to_owned()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn revoking_a_principal_ends_its_leases_and_a_credential_carries_its_expiry() {
+        let rig = Rig::new();
+        let agent = rig.issue("agent", "builder-1", Some(30)).await.unwrap();
+        leased_to(&rig, &agent.principal.principal()).await;
+        let actor = rig.credentials.authenticate(&token(&agent)).await.unwrap();
+        assert_eq!(
+            actor.expires_at(),
+            agent
+                .principal
+                .expires_at
+                .as_ref()
+                .and_then(|t| t.unix_millis())
+        );
+        let person = rig.issue("person", "paul", None).await.unwrap();
+        let actor = rig.credentials.authenticate(&token(&person)).await.unwrap();
+        assert_eq!(actor.expires_at(), None);
+
+        rig.credentials
+            .revoke(&admin(), agent.principal.id, RevokeReason::Requested)
+            .await
+            .unwrap();
+        assert_eq!(
+            expired_work_facts(&rig).await,
+            [("agent:builder-1".to_owned(), Some("revoked".to_owned()))]
         );
     }
 

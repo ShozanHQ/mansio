@@ -422,6 +422,16 @@ curl ... -d '{"lease_id":"<uuid>","consumer":"worker-1","reason":"out of memory"
   answer was lost is safe: the lease runs to the later of the two ends. A
   restarted server takes the latest end recorded for the attempt, and counts
   the longest lease from the first claim.
+- A credential's own end caps its leases. A credential that expires, which an
+  agent's always does, cannot extend a lease past that expiry: the extension is
+  capped there, as at the longest lease, and the answer says where the lease
+  ends. Revoking a principal (`principals_revoke`), or the sweep removing an
+  agent credential whose expiry has passed, ends every live lease the
+  principal holds at once. Each ending is recorded as a `mansio.work.expired`
+  fact with the reason `revoked`, and the item is retried after its backoff,
+  or goes to `dead` at the attempt cap, as for any lease that runs out. So a
+  crashed or revoked holder that asked for a long extension does not keep its
+  item until `MANSIO_LEASE_MAX_SECONDS`.
 - A fail, or a lease that ends unanswered, republishes the item to its queue
   as a new message with the same `itemid`, `attempt` plus one and
   `causationid` the message before. The wait is
