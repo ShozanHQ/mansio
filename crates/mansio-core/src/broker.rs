@@ -70,14 +70,19 @@ pub enum SystemLog {
     /// position is kept here and not in the broker's own consumer offsets,
     /// which any credential that may read a topic could move.
     Cursors,
+    /// The idempotency keys a publish has used, with the envelope and offset
+    /// each first got, so that a restarted server still answers a repeat with
+    /// the first.
+    Idempotency,
 }
 
 impl SystemLog {
     /// Every log.
-    pub const ALL: [SystemLog; 3] = [
+    pub const ALL: [SystemLog; 4] = [
         SystemLog::Principals,
         SystemLog::Webhooks,
         SystemLog::Cursors,
+        SystemLog::Idempotency,
     ];
 
     /// The name of the log: the topic it lives in.
@@ -87,6 +92,7 @@ impl SystemLog {
             SystemLog::Principals => "principals",
             SystemLog::Webhooks => "webhooks",
             SystemLog::Cursors => "cursors",
+            SystemLog::Idempotency => "idempotency",
         }
     }
 }
@@ -110,7 +116,7 @@ pub struct SystemRecord {
 }
 
 fn unsupported(what: &str) -> BrokerError {
-    BrokerError::Rejected(format!("this broker does not support {what}"))
+    BrokerError::Unsupported(format!("this broker does not support {what}"))
 }
 
 /// A message broker with tenants, topics and offsets.
@@ -168,7 +174,8 @@ pub trait Broker: Send + Sync {
     /// say where it landed. The caller must not publish it again.
     ///
     /// The broker does not deduplicate: publishing the same id twice stores
-    /// it twice.
+    /// it twice. The server
+    /// deduplicates on the idempotency key before it gets here.
     ///
     /// # Errors
     ///

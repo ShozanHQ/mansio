@@ -43,6 +43,9 @@ pub fn check_segment_size(bytes: u64) -> Result<(), &'static str> {
     }
 }
 
+/// The default expiry of the idempotency log: one day, the default window.
+pub const DEFAULT_IDEMPOTENCY_EXPIRY: Duration = Duration::from_secs(86_400);
+
 /// How long Iggy keeps messages, per kind of topic. `None` keeps them
 /// forever.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +180,10 @@ pub struct IggyConfig {
     /// to the one it is writing, so this is also how coarsely retention
     /// trims a topic.
     pub segment_size_bytes: u64,
+    /// How long the log of idempotency keys keeps a record. Set it to the
+    /// server's idempotency window: Iggy then drops records the server would
+    /// skip anyway.
+    pub idempotency_expiry: Duration,
 }
 
 impl IggyConfig {
@@ -197,6 +204,7 @@ impl IggyConfig {
             retention: Retention::default(),
             durability: DurabilityPolicy::default(),
             segment_size_bytes: 0,
+            idempotency_expiry: DEFAULT_IDEMPOTENCY_EXPIRY,
         }
     }
 }

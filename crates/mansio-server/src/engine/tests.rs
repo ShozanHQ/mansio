@@ -5,7 +5,7 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use mansio_core::{MemoryBroker, Record, SinkError, Stored};
+use mansio_core::{MemoryBroker, Record, SinkError, Stored, SystemRecord};
 use serde_json::{Value, json};
 
 use super::*;
@@ -22,6 +22,8 @@ fn settings() -> WorkSettings {
         backoff_cap: Duration::from_secs(5),
         alert_resurface: Duration::from_secs(30),
         tick: Duration::from_millis(100),
+        idempotency_window: Duration::from_secs(60),
+        idempotency_max_keys: 3,
     }
 }
 
@@ -50,9 +52,18 @@ struct FlakyBroker {
     refused: StdMutex<HashSet<String>>,
     lost: StdMutex<HashSet<String>>,
     corrupt: StdMutex<Option<(Topic, u64)>>,
+    /// Appends to the server's own logs fail.
+    system_down: std::sync::atomic::AtomicBool,
+    /// Reads of the server's own logs are refused.
+    system_unreadable: std::sync::atomic::AtomicBool,
 }
 
 impl FlakyBroker {
+    /// Appends to the server's own logs fail, as when only that stream is down.
+    fn fail_system_appends(&self) {
+        self.system_down.store(true, Ordering::SeqCst);
+    }
+
     /// Publishes to the topic, or of the event type, fail as if the broker
     /// could not be reached: whether the message was stored is not known.
     fn fail(&self, what: &str) {
@@ -82,6 +93,7 @@ impl FlakyBroker {
         self.refused.lock().unwrap().clear();
         self.lost.lock().unwrap().clear();
         *self.corrupt.lock().unwrap() = None;
+        self.system_down.store(false, Ordering::SeqCst);
     }
 }
 
@@ -154,6 +166,25 @@ impl Broker for FlakyBroker {
             )));
         }
         self.inner.poll(caller, tenant, topic, offset, max).await
+    }
+
+    async fn system_append(&self, log: SystemLog, record: &[u8]) -> Result<(), BrokerError> {
+        if self.system_down.load(Ordering::SeqCst) {
+            return Err(BrokerError::Unavailable("injected".to_owned()));
+        }
+        self.inner.system_append(log, record).await
+    }
+
+    async fn system_read(
+        &self,
+        log: SystemLog,
+        offset: u64,
+        max: u32,
+    ) -> Result<Vec<SystemRecord>, BrokerError> {
+        if self.system_unreadable.load(Ordering::SeqCst) {
+            return Err(BrokerError::Rejected("injected".to_owned()));
+        }
+        self.inner.system_read(log, offset, max).await
     }
 }
 
@@ -1901,6 +1932,225 @@ async fn another_consumer_of_the_same_principal_cannot_ack_or_fail_the_lease() {
     }
     assert_eq!(rig.sink.all().len(), before, "a refusal records nothing");
     rig.ack("one", &item, &claim.lease_id).await.unwrap();
+}
+
+// ---- idempotency keys ------------------------------------------------------
+
+fn keyed(key: &str, topic: &str) -> Envelope {
+    let mut message = Envelope::new(
+        EventId::generate(),
+        "test".parse().unwrap(),
+        "build.finished".parse().unwrap(),
+        tenant(),
+        topic.parse().unwrap(),
+        agent("one"),
+    );
+    message.idempotency_key = Some(key.parse().unwrap());
+    message
+}
+
+async fn publish_keyed(rig: &Rig, key: &str, topic: &str) -> (Published, bool) {
+    rig.engine.publish_once(keyed(key, topic)).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_repeated_key_gets_the_first_answer_and_stores_nothing() {
+    let rig = Rig::new();
+    let (first, repeat) = publish_keyed(&rig, "k", "facts.build").await;
+    assert!(!repeat);
+    let (again, repeat) = publish_keyed(&rig, "k", "facts.build").await;
+    assert!(repeat);
+    assert_eq!(again, first);
+    assert_eq!(rig.read(&"facts.build".parse().unwrap()).await.len(), 1);
+    assert_eq!(rig.sink.topic("facts.build").len(), 1);
+
+    // Another topic, another key, and no key at all, publish.
+    let mut unkeyed = keyed("k", "facts.build");
+    unkeyed.idempotency_key = None;
+    for message in [
+        keyed("k", "facts.deploy"),
+        keyed("other", "facts.build"),
+        unkeyed.clone(),
+        unkeyed,
+    ] {
+        let (_, repeat) = rig.engine.publish_once(message).await.unwrap();
+        assert!(!repeat);
+    }
+}
+
+#[tokio::test]
+async fn a_key_is_forgotten_after_the_window() {
+    let rig = Rig::new();
+    publish_keyed(&rig, "k", "facts.build").await;
+    rig.clock.advance(Duration::from_secs(59));
+    assert!(publish_keyed(&rig, "k", "facts.build").await.1);
+    rig.clock.advance(Duration::from_secs(1));
+    assert!(!publish_keyed(&rig, "k", "facts.build").await.1);
+    assert_eq!(rig.read(&"facts.build".parse().unwrap()).await.len(), 2);
+}
+
+#[tokio::test]
+async fn the_oldest_key_is_forgotten_past_the_bound() {
+    let rig = Rig::new();
+    for key in ["a", "b", "c", "d"] {
+        publish_keyed(&rig, key, "facts.build").await;
+    }
+    // The bound is 3: "a" is gone, "d" is not.
+    assert!(publish_keyed(&rig, "d", "facts.build").await.1);
+    assert!(!publish_keyed(&rig, "a", "facts.build").await.1);
+}
+
+#[tokio::test]
+async fn a_restarted_server_answers_with_the_first_inside_the_window_and_the_bound() {
+    let rig = Rig::new();
+    let (first, _) = publish_keyed(&rig, "k", "facts.build").await;
+    rig.clock.advance(Duration::from_secs(10));
+    let rig = rig.restart().await;
+    let (again, repeat) = publish_keyed(&rig, "k", "facts.build").await;
+    assert!(repeat);
+    assert_eq!(again, first);
+    assert_eq!(rig.read(&"facts.build".parse().unwrap()).await.len(), 1);
+
+    // The window counts from the first publish, across the restart.
+    rig.clock.advance(Duration::from_secs(50));
+    let rig = rig.restart().await;
+    assert!(!publish_keyed(&rig, "k", "facts.build").await.1);
+
+    // Past the bound, the oldest did not survive and the newest did.
+    for key in ["a", "b", "c", "d"] {
+        publish_keyed(&rig, key, "facts.deploy").await;
+    }
+    let rig = rig.restart().await;
+    assert!(publish_keyed(&rig, "d", "facts.deploy").await.1);
+    assert!(!publish_keyed(&rig, "a", "facts.deploy").await.1);
+}
+
+#[tokio::test]
+async fn a_log_that_cannot_be_read_fails_keyed_publishes_and_forgets_nothing() {
+    let rig = Rig::new();
+    let (first, _) = publish_keyed(&rig, "k", "facts.build").await;
+    rig.broker.system_unreadable.store(true, Ordering::SeqCst);
+    let restarted = Rig::over(rig.broker.clone(), rig.sink.clone(), rig.clock.clone());
+    restarted.engine.recover().await.unwrap();
+    let error = restarted
+        .engine
+        .publish_once(keyed("k", "facts.build"))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ApiError::BadGateway(_)), "{error:?}");
+    // A publish without a key is not affected.
+    let mut unkeyed = keyed("unused", "facts.build");
+    unkeyed.idempotency_key = None;
+    restarted.engine.publish(unkeyed).await.unwrap();
+    restarted
+        .broker
+        .system_unreadable
+        .store(false, Ordering::SeqCst);
+    let (again, repeat) = publish_keyed(&restarted, "k", "facts.build").await;
+    assert!(repeat);
+    assert_eq!(again, first);
+}
+
+#[tokio::test]
+async fn a_repeat_reads_the_first_body_back_and_the_server_keeps_none() {
+    let rig = Rig::new();
+    let mut message = keyed("big", "facts.build");
+    message.data = Some(serde_json::json!({ "blob": "x".repeat(200_000) }));
+    let (first, _) = rig.engine.publish_once(message.clone()).await.unwrap();
+    // What is remembered is a pointer, however large the body.
+    let held = rig.engine.lock(&tenant()).await.unwrap();
+    let remembered = held
+        .keys
+        .get(
+            &"facts.build".parse().unwrap(),
+            &"big".parse().unwrap(),
+            rig.clock.now_millis(),
+            60_000,
+        )
+        .unwrap()
+        .clone();
+    drop(held);
+    assert!(format!("{remembered:?}").len() < 1_000);
+    // The repeat still answers with the whole first envelope.
+    let mut again = message;
+    again.id = EventId::generate();
+    again.data = None;
+    let (answer, repeat) = rig.engine.publish_once(again).await.unwrap();
+    assert!(repeat);
+    assert_eq!(answer, first);
+    assert!(answer.envelope.data.is_some());
+}
+
+#[tokio::test]
+async fn the_timer_drops_keys_past_their_window() {
+    let rig = Rig::new();
+    publish_keyed(&rig, "k", "facts.build").await;
+    let tenant = tenant();
+    assert_eq!(rig.engine.lock(&tenant).await.unwrap().keys.len(), 1);
+    rig.clock.advance(Duration::from_secs(61));
+    rig.engine.tick().await;
+    assert_eq!(rig.engine.lock(&tenant).await.unwrap().keys.len(), 0);
+}
+
+#[tokio::test]
+async fn concurrent_publishes_with_one_key_store_one_message() {
+    let rig = Rig::new();
+    let mut publishes = Vec::new();
+    for _ in 0..8 {
+        let engine = Arc::clone(&rig.engine);
+        publishes.push(tokio::spawn(async move {
+            engine
+                .publish_once(keyed("k", "facts.build"))
+                .await
+                .unwrap()
+        }));
+    }
+    let mut firsts = 0;
+    for publish in publishes {
+        let (_, repeat) = publish.await.unwrap();
+        firsts += usize::from(!repeat);
+    }
+    assert_eq!(firsts, 1);
+    assert_eq!(rig.read(&"facts.build".parse().unwrap()).await.len(), 1);
+}
+
+#[tokio::test]
+async fn another_principal_never_gets_the_first_envelope() {
+    let rig = Rig::new();
+    let (first, _) = publish_keyed(&rig, "k", "facts.build").await;
+    let mut other = keyed("k", "facts.build");
+    other.principal = agent("two");
+    let error = rig.engine.publish_once(other).await.unwrap_err();
+    assert!(matches!(error, ApiError::Conflict(_)), "{error:?}");
+    let text = format!("{error:?}");
+    assert!(
+        !text.contains(&first.envelope.id.to_string()),
+        "the refusal must not carry the first envelope: {text}"
+    );
+    assert_eq!(rig.read(&"facts.build".parse().unwrap()).await.len(), 1);
+    // The first publisher still gets its own answer.
+    assert!(publish_keyed(&rig, "k", "facts.build").await.1);
+}
+
+#[tokio::test]
+async fn a_key_whose_record_cannot_be_written_is_answered_and_kept_in_memory() {
+    let rig = Rig::new();
+    rig.broker.fail_system_appends();
+    let (first, repeat) = publish_keyed(&rig, "k", "facts.build").await;
+    assert!(!repeat);
+    let (again, repeat) = publish_keyed(&rig, "k", "facts.build").await;
+    assert!(repeat);
+    assert_eq!(again, first);
+    assert_eq!(rig.read(&"facts.build".parse().unwrap()).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_publish_that_was_refused_does_not_use_up_its_key() {
+    let rig = Rig::new();
+    rig.broker.refuse("facts.build");
+    assert!(rig.engine.publish(keyed("k", "facts.build")).await.is_err());
+    rig.broker.heal();
+    assert!(!publish_keyed(&rig, "k", "facts.build").await.1);
 }
 
 // ---- extending a lease -----------------------------------------------------

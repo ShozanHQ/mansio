@@ -219,12 +219,17 @@ pub(crate) async fn alerts_publish(
         &now,
         Origin::Message,
     )?;
-    let published = state
+    let (published, repeat) = state
         .engine
-        .publish(envelope)
+        .publish_once(envelope)
         .await
         .map_err(|error| error.logged(&tenant, &Topic::Alerts))?;
-    Ok((StatusCode::CREATED, Json(published)))
+    let status = if repeat {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((status, Json(published)))
 }
 
 /// `POST /v1/tenants/{tenant}/alerts/{alert}/ack`: acknowledge an alert, once.

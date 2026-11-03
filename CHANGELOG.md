@@ -7,6 +7,17 @@ All notable changes to mansio are listed here. The format follows
 
 ### Added
 
+- A publish with an `idempotencykey` that the tenant's topic has already seen
+  inside a window answers 200 with the first envelope and offset and publishes
+  nothing (a first publish is still 201). The window
+  (`MANSIO_IDEMPOTENCY_WINDOW_SECONDS`, default 86400) and the most keys a
+  tenant remembers (`MANSIO_IDEMPOTENCY_MAX_KEYS`, default 10000, the oldest
+  forgotten first) are settings, served by `GET /v1/settings`. The keys are kept
+  in a new log of the server's own state, so they survive a restart; a key holds
+  only where the first publish landed and a repeat reads the envelope back from
+  the topic, so memory does not grow with message size. Applies to
+  the messages route and `alerts_publish`; `presence` and `work_publish` are not
+  deduplicated.
 - Revoking a principal, or the sweep removing an expired agent credential, ends
   every live lease the principal holds: each is recorded as `expired` with the
   reason `revoked` and the item is retried after its backoff. A credential can

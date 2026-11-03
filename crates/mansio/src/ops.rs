@@ -164,7 +164,7 @@ const ENVELOPE: [Param; 8] = [
     optional(
         "idempotency_key",
         Kind::Text,
-        "A key consumers can deduplicate on.",
+        "A key that makes a publish safe to send again: a second publish to the topic with the same key inside the window answers 200 with the first and publishes nothing.",
     ),
     optional(
         "id",
