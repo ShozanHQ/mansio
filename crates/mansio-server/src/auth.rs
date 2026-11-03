@@ -70,6 +70,7 @@ struct Scoped {
     tenant: TenantId,
     grants: Vec<Grant>,
     credential: Credential,
+    expires_at: Option<i64>,
 }
 
 impl Actor {
@@ -88,6 +89,7 @@ impl Actor {
         tenant: TenantId,
         grants: Vec<Grant>,
         credential: Credential,
+        expires_at: Option<i64>,
     ) -> Self {
         Self {
             principal,
@@ -96,6 +98,7 @@ impl Actor {
                 tenant,
                 grants,
                 credential,
+                expires_at,
             })),
         }
     }
@@ -120,6 +123,16 @@ impl Actor {
         match &self.access {
             Access::Admin => None,
             Access::Scoped(scoped) => Some(scoped.id),
+        }
+    }
+
+    /// When the credential stops working, in milliseconds since the Unix
+    /// epoch. The admin's, and a credential that does not expire, have none.
+    #[must_use]
+    pub fn expires_at(&self) -> Option<i64> {
+        match &self.access {
+            Access::Admin => None,
+            Access::Scoped(scoped) => scoped.expires_at,
         }
     }
 
@@ -254,6 +267,7 @@ mod tests {
             "acme".parse().unwrap(),
             grants,
             Credential::new("tok3n"),
+            None,
         )
     }
 

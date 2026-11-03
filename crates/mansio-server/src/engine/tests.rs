@@ -386,6 +386,7 @@ impl Rig {
                     lease_id: lease,
                 },
                 seconds.map(Duration::from_secs),
+                None,
             )
             .await
     }
@@ -2236,6 +2237,133 @@ async fn the_holder_extends_its_lease_and_the_new_end_is_recorded() {
 }
 
 #[tokio::test]
+async fn an_extension_never_runs_past_the_end_of_the_holders_credential() {
+    let rig = Rig::new();
+    let item = rig.publish_item("job").await;
+    let claim = rig.pull_as("one", "worker").await.unwrap();
+    let credential_ends = secs_after_start(30);
+    let extend = |seconds: u64, not_after: Option<i64>| {
+        let (engine, item, lease) = (rig.engine.clone(), item.clone(), claim.lease_id);
+        async move {
+            engine
+                .work_extend(
+                    &tenant(),
+                    &queue(),
+                    &item,
+                    Holder {
+                        principal: &agent("one"),
+                        consumer: &taken_as(&lease),
+                        lease_id: &lease,
+                    },
+                    Some(Duration::from_secs(seconds)),
+                    not_after,
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    // Within the credential's life it is as asked.
+    let extended = extend(20, Some(credential_ends)).await;
+    assert_eq!(ends_at(&extended.envelope), secs_after_start(20));
+    // Asking for more is capped at the credential's end, not the lease max.
+    let extended = extend(100, Some(credential_ends)).await;
+    assert_eq!(ends_at(&extended.envelope), credential_ends);
+    // Without an expiry only the lease max caps it.
+    let extended = extend(100, None).await;
+    assert_eq!(ends_at(&extended.envelope), secs_after_start(100));
+    // An end that is already behind the lease never shortens it.
+    let extended = extend(5, Some(credential_ends)).await;
+    assert_eq!(ends_at(&extended.envelope), secs_after_start(100));
+}
+
+#[tokio::test]
+async fn ending_a_holders_leases_records_them_expired_as_revoked_and_retries_the_items() {
+    let rig = Rig::new();
+    let first = rig.publish_item("one").await;
+    let second = rig.publish_item("two").await;
+    let third = rig.publish_item("three").await;
+    let a = rig.pull_as("gone", "w-a").await.unwrap();
+    let b = rig.pull_as("gone", "w-b").await.unwrap();
+    let kept = rig.pull_as("other", "w-c").await.unwrap();
+    // One of them asked for a long extension.
+    rig.extend("gone", &first, &a.lease_id, Some(100))
+        .await
+        .unwrap();
+
+    let ended = rig
+        .engine
+        .end_leases_of(&tenant(), &agent("gone"))
+        .await
+        .unwrap();
+    assert_eq!(ended, 2);
+
+    let facts = rig.read(&Topic::facts_work()).await;
+    let expired: Vec<&Envelope> = facts
+        .iter()
+        .filter(|fact| fact.event_type.as_str() == "mansio.work.expired")
+        .collect();
+    assert_eq!(expired.len(), 2);
+    for fact in &expired {
+        let fact = data(fact);
+        assert_eq!(fact["reason"], "revoked");
+        assert_eq!(fact["holder"], "agent:gone");
+        assert_eq!(fact["next"], "retry");
+    }
+
+    // The other principal's lease stands, and the revoked holder cannot use
+    // its own any more.
+    assert!(matches!(
+        rig.ack("gone", &first, &a.lease_id).await,
+        Err(ApiError::Conflict(_))
+    ));
+    assert!(matches!(
+        rig.extend("gone", &second, &b.lease_id, None).await,
+        Err(ApiError::Conflict(_))
+    ));
+    rig.ack("other", &third, &kept.lease_id).await.unwrap();
+
+    // Nothing is claimable until the backoff is over, and then both are.
+    assert!(rig.pull("two").await.is_none());
+    rig.pass(3).await;
+    let again = rig.pull("two").await.unwrap();
+    assert_eq!(again.item.attempt, Some(2));
+    let more = rig.pull("two").await.unwrap();
+    assert_eq!(more.item.attempt, Some(2));
+    assert!(rig.pull("two").await.is_none());
+
+    // Nothing is left to end.
+    assert_eq!(
+        rig.engine
+            .end_leases_of(&tenant(), &agent("gone"))
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_lease_that_ran_out_is_left_to_the_timer_when_its_holder_is_revoked() {
+    let rig = Rig::new();
+    rig.publish_item("job").await;
+    rig.pull_as("gone", "worker").await.unwrap();
+    rig.clock.advance(Duration::from_secs(11));
+    let ended = rig
+        .engine
+        .end_leases_of(&tenant(), &agent("gone"))
+        .await
+        .unwrap();
+    assert_eq!(ended, 0);
+    rig.engine.tick().await;
+    let facts = rig.read(&Topic::facts_work()).await;
+    let expired = facts
+        .iter()
+        .find(|fact| fact.event_type.as_str() == "mansio.work.expired")
+        .unwrap();
+    assert!(data(expired).get("reason").is_none());
+}
+
+#[tokio::test]
 async fn anyone_but_the_holder_is_refused_an_extension_as_for_an_ack_and_nothing_changes() {
     let rig = Rig::new();
     let item = rig.publish_item("job").await;
@@ -2266,6 +2394,7 @@ async fn anyone_but_the_holder_is_refused_an_extension_as_for_an_ack_and_nothing
                 consumer: &other,
                 lease_id: &claim.lease_id,
             },
+            None,
             None,
         )
         .await;

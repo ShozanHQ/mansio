@@ -61,6 +61,10 @@ fn timestamp(millis: i64) -> Result<Timestamp, ApiError> {
     })
 }
 
+/// The reason on an `expired` fact for a lease ended because its holder's
+/// credential was revoked or expired.
+const REVOKED: &str = "revoked";
+
 /// One thing the timer has to do. The order is the order to do them in.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Task {
@@ -686,7 +690,10 @@ impl Engine {
     /// The lease runs to `seconds` from now, or to the lease setting from now
     /// if there are none. It is never shortened, and it never runs past
     /// `MANSIO_LEASE_MAX_SECONDS` after the claim: an extension that asks for
-    /// more is capped there. Whatever the end comes to is recorded as an
+    /// more is capped there. `not_after`, the expiry of the holder's own
+    /// credential in milliseconds since the Unix epoch, caps it too: a
+    /// credential cannot hold a lease past its own end. Whatever the end
+    /// comes to is recorded as an
     /// `extended` fact, even when it is the end the lease already had, so a
     /// request that is sent again is answered the same way.
     ///
@@ -703,6 +710,7 @@ impl Engine {
         item: &ItemId,
         holder: Holder<'_>,
         seconds: Option<Duration>,
+        not_after: Option<i64>,
     ) -> Result<Published, ApiError> {
         let mut held = self.lock(tenant).await?;
         let now = self.clock.now_millis();
@@ -716,6 +724,7 @@ impl Engine {
                     now,
                     seconds.unwrap_or(self.settings.lease),
                     self.settings.lease_max,
+                    not_after,
                 ),
                 ..lease.clone()
             };
@@ -964,7 +973,7 @@ impl Engine {
         now: i64,
     ) -> Result<(), ApiError> {
         match task {
-            Task::Expire(queue, id) => self.expire(held, tenant, queue, id, now).await,
+            Task::Expire(queue, id) => self.expire(held, tenant, queue, id, now, None).await,
             Task::Advance(queue, id) => self.advance(held, tenant, queue, id, now).await,
             Task::Resurface(alert) => self.resurface(held, tenant, *alert, now).await,
         }
@@ -999,7 +1008,57 @@ impl Engine {
         Ok(())
     }
 
-    /// A lease ran out: record it, and start the backoff.
+    /// End every live lease `holder` has in a tenant, because its credential
+    /// was revoked or expired: each is recorded as `expired` with reason
+    /// `revoked`, and the item is retried after its backoff as for any other
+    /// expiry. A lease that has already run out is left to the timer. Returns
+    /// how many were ended.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tenant's state cannot be loaded. A lease that
+    /// cannot be ended is logged and left for the timer, which ends it when
+    /// it runs out.
+    pub(crate) async fn end_leases_of(
+        &self,
+        tenant: &TenantId,
+        holder: &Principal,
+    ) -> Result<usize, ApiError> {
+        let mut held = self.lock(tenant).await?;
+        let now = self.clock.now_millis();
+        let mut leases: Vec<(Segment, ItemId, i64)> = Vec::new();
+        for (queue, items) in &held.queues {
+            for (id, item) in items.iter() {
+                if let Phase::Leased(lease) = &item.phase
+                    && lease.holder == *holder
+                    && lease.expires_at > now
+                {
+                    leases.push((queue.clone(), id.clone(), lease.claimed_at));
+                }
+            }
+        }
+        // The oldest claim first, as the timer ends the oldest lease first.
+        leases.sort_by(|a, b| (a.2, &a.0, &a.1).cmp(&(b.2, &b.0, &b.1)));
+        let mut ended = 0;
+        for (queue, id, _) in leases {
+            match self
+                .expire(&mut held, tenant, &queue, &id, now, Some(REVOKED))
+                .await
+            {
+                Ok(()) => ended += 1,
+                Err(error) => {
+                    warn!(%tenant, %queue, %id, ?error, "a revoked holder's lease could not be ended");
+                    if !held.loaded {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(ended)
+    }
+
+    /// A lease ran out, or its holder's credential ended (`reason`): record
+    /// it, and start the backoff.
     async fn expire(
         &self,
         held: &mut TenantState,
@@ -1007,6 +1066,7 @@ impl Engine {
         queue: &Segment,
         id: &ItemId,
         now: i64,
+        reason: Option<&str>,
     ) -> Result<(), ApiError> {
         let (fact, next, due) = {
             let Some(item) = held.queues.get(queue).and_then(|q| q.get(id)) else {
@@ -1019,6 +1079,7 @@ impl Engine {
             let mut data = lease_fact(queue, item, lease);
             data.next = Some(next);
             data.retry_at = retry_at.map(timestamp).transpose()?;
+            data.reason = reason.map(str::to_owned);
             let fact = self.facts.work(
                 tenant,
                 WorkEvent::Expired,
@@ -1126,10 +1187,18 @@ fn open_item<'a>(
 }
 
 /// Where an extension at `now` ends `lease`: `wanted` from now, but not
-/// before the lease already ends and not after `max` from the claim.
-fn extended_expiry(lease: &Lease, now: i64, wanted: Duration, max: Duration) -> i64 {
+/// before the lease already ends, not after `max` from the claim and not
+/// after `not_after`, the end of the holder's credential.
+fn extended_expiry(
+    lease: &Lease,
+    now: i64,
+    wanted: Duration,
+    max: Duration,
+    not_after: Option<i64>,
+) -> i64 {
     let asked = now.saturating_add(millis(wanted));
     let ceiling = lease.claimed_at.saturating_add(millis(max));
+    let ceiling = not_after.map_or(ceiling, |end| ceiling.min(end));
     asked.min(ceiling).max(lease.expires_at)
 }
 

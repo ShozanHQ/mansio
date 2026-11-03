@@ -131,6 +131,7 @@ pub(crate) async fn work_extend(
             &item,
             holder(&actor, &request.consumer, &request.lease_id),
             request.seconds.map(Duration::from_secs),
+            actor.expires_at(),
         )
         .await
         .map_err(|error| error.logged(&tenant, &Topic::Work(queue.clone())))?;
