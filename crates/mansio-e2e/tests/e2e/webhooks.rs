@@ -34,7 +34,10 @@ async fn a_delivery_that_fails_twice_arrives_on_the_third_attempt_with_a_valid_s
     let receiver = Receiver::start(&target, [Reply::Status(500), Reply::Hang]).await?;
     let created = target.webhook("facts.build", &receiver.url).await?;
     let secret = created["secret"].as_str().context("the secret")?.to_owned();
-    assert!(secret.starts_with("whsec_"), "{secret}");
+    assert!(
+        secret.starts_with("whsec_"),
+        "the created secret has no whsec_ prefix"
+    );
     let id = created["webhook"]["id"]
         .as_str()
         .context("the id")?
@@ -516,10 +519,14 @@ async fn a_webhook_starts_at_the_first_message_by_default_or_at_the_next_when_as
         (&first, Some("first")),
         (&next, Some("next")),
     ] {
-        let (status, made) = target
+        let (status, _) = target
             .create_webhook_at("facts.build", &receiver.url, start)
             .await?;
-        assert_eq!(status, StatusCode::CREATED, "{start:?}: {made}");
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "create with start {start:?} failed"
+        );
     }
     for n in 2..4 {
         sent.push(target.publish("facts.build", &event(n)).await?.envelope.id);
@@ -542,10 +549,14 @@ async fn a_webhook_starts_at_the_first_message_by_default_or_at_the_next_when_as
     assert_eq!(ids(&next)?, all[2..], "next skips what the topic held");
 
     for bad in ["last", "", "NEXT", "0"] {
-        let (status, response) = target
+        let (status, _) = target
             .create_webhook_at("facts.build", &next.url, Some(bad))
             .await?;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?}: {response}");
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "create with start {bad:?} was not refused"
+        );
     }
     assert_eq!(target.webhooks().await?.len(), 3, "the refused made none");
     target.delete_webhooks().await?;
@@ -582,14 +593,20 @@ async fn a_rotated_secret_signs_beside_the_old_for_the_grace_and_alone_after() -
     let rotated = target.rotate_webhook(&id).await?;
     let rotated_at = std::time::Instant::now();
     let new = rotated["secret"].as_str().context("the secret")?.to_owned();
-    assert!(new.starts_with("whsec_"), "{new}");
-    assert_ne!(new, old);
+    assert!(
+        new.starts_with("whsec_"),
+        "the rotated secret has no whsec_ prefix"
+    );
+    assert!(new != old, "the rotated secret is the same as the old one");
     assert_eq!(rotated["webhook"]["id"], json!(id));
     assert!(rotated["webhook"].get("secret").is_none());
     let valid_until = serde_json::from_value(rotated["previous_secret_valid_until"].clone())?;
     let valid_until = crate::harness::millis(&valid_until)?;
     let listed = serde_json::to_string(&target.webhooks().await?)?;
-    assert!(!listed.contains(&new) && !listed.contains(&old), "{listed}");
+    assert!(
+        !listed.contains(&new) && !listed.contains(&old),
+        "a secret is in the webhooks list"
+    );
 
     // Inside the grace: both signatures, the new one first, and each is the
     // HMAC of the body under its own secret.
@@ -622,8 +639,12 @@ async fn a_rotated_secret_signs_beside_the_old_for_the_grace_and_alone_after() -
         assert_eq!(data["webhook_id"], json!(id));
         assert_eq!(data["topic"], "facts.build");
         let text = serde_json::to_string(fact)?;
-        for secret in [old.as_str(), new.as_str(), "whsec_", receiver.url.as_str()] {
-            assert!(!text.contains(secret), "{secret} is in {text}");
+        let searched = [old.as_str(), new.as_str(), "whsec_", receiver.url.as_str()];
+        for (n, secret) in searched.into_iter().enumerate() {
+            assert!(
+                !text.contains(secret),
+                "searched item {n} is in a webhook fact"
+            );
         }
     }
     let data = |n: usize| -> anyhow::Result<Value> {
@@ -647,7 +668,10 @@ async fn a_rotated_secret_signs_beside_the_old_for_the_grace_and_alone_after() -
             .filter(|record| record.event_type.as_str().starts_with("mansio.webhook."))
             .map(serde_json::to_string)
             .collect::<Result<String, _>>()?;
-        assert!(!sunk.contains(&old) && !sunk.contains(&new), "{sunk}");
+        assert!(
+            !sunk.contains(&old) && !sunk.contains(&new),
+            "a secret is in the sink"
+        );
     }
     Ok(())
 }

@@ -999,7 +999,10 @@ async fn the_commands_do_what_their_operations_do() -> anyhow::Result<()> {
             .as_str()
             .is_some_and(|s| s.starts_with("whsec_"))
     );
-    assert_ne!(rotated["secret"], made["secret"]);
+    assert!(
+        rotated["secret"] != made["secret"],
+        "the rotated secret is the same as the old one"
+    );
     assert!(rotated["previous_secret_valid_until"].is_string());
     // A start position is first or next.
     refused(

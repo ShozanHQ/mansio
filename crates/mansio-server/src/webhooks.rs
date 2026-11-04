@@ -1386,7 +1386,10 @@ mod tests {
         let id = created.webhook.webhook.id;
         let old = created.secret;
         let rotated = rig.webhooks.rotate(&admin(), id).await.unwrap();
-        assert_ne!(rotated.secret.expose(), old.expose());
+        assert!(
+            rotated.secret.expose() != old.expose(),
+            "the rotated secret is the same as the old one"
+        );
         assert!(rotated.secret.expose().starts_with("whsec_"));
 
         let now = rig.clock.now_millis();
@@ -1484,7 +1487,7 @@ mod tests {
         assert!(values[1]["data"]["previous_secret_valid_until"].is_string());
 
         let everything = serde_json::to_string(&values).unwrap();
-        for secret in [
+        let searched = [
             created.secret.expose(),
             rotated.secret.expose(),
             "whsec_",
@@ -1492,8 +1495,12 @@ mod tests {
             "path-secret",
             "query-secret",
             "fragment-secret",
-        ] {
-            assert!(!everything.contains(secret), "{secret} is in {everything}");
+        ];
+        for (n, secret) in searched.into_iter().enumerate() {
+            assert!(
+                !everything.contains(secret),
+                "searched item {n} is in a webhook fact"
+            );
         }
         rig.webhooks.shutdown().await;
     }
@@ -1546,7 +1553,11 @@ mod tests {
                 .delivery
                 .post(&created.webhook.webhook, b"{}")
                 .await;
-            assert_eq!(refused, Err(destination::REFUSED.to_owned()), "{url}");
+            assert_eq!(
+                refused,
+                Err(destination::REFUSED.to_owned()),
+                "a destination case was not refused"
+            );
             assert!(!destination::REFUSED.contains("127.0.0.1"));
             rig.webhooks.shutdown().await;
         }

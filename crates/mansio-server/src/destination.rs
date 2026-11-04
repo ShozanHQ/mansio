@@ -174,7 +174,10 @@ mod tests {
             "http://0x7f.1/",
             "http://[::ffff:127.0.0.1]/",
         ] {
-            assert!(literal_is_internal(url), "{url}");
+            assert!(
+                literal_is_internal(url),
+                "a literal destination case was not internal"
+            );
         }
         for url in [
             "https://example.com/hook",
@@ -182,7 +185,10 @@ mod tests {
             "https://93.184.216.34/",
             "not a url",
         ] {
-            assert!(!literal_is_internal(url), "{url}");
+            assert!(
+                !literal_is_internal(url),
+                "a literal destination case was internal"
+            );
         }
     }
 
