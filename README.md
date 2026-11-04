@@ -110,6 +110,22 @@ MANSIO_BROKER=memory MANSIO_TOKEN=dev MANSIO_SINK_PATH= cargo run -p mansio-serv
 An empty `MANSIO_SINK_PATH` turns the file sink off; otherwise every durable
 publish is also appended to `mansio-sink.jsonl`.
 
+### What the file sink guarantees
+
+- Each record is one complete line of CloudEvents JSON, written in a single
+  call. If a write fails, the file is cut back to the end of the last whole
+  line, so the next record never joins half of one.
+- The record is synced to disk (`sync_data`) before the publish goes on, so a
+  record the server acknowledged survives a crash of the process or the
+  machine.
+- On start, if the file ends in a line with no newline (a write cut short by a
+  crash), the server refuses to start. The message names the file and the byte
+  offset where the torn line begins; truncate the file to that offset, or
+  remove the line, and start again. The server never repairs the file itself.
+- `MANSIO_SINK_SYNC=false` turns the sync off, for development. Lines are still
+  written whole, but a crash or power loss can lose the most recent records.
+  Leave it on in production.
+
 ## The guarantee
 
 Work is never dropped and never done twice, for consumers that are not always
@@ -807,6 +823,7 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_CREDENTIAL_RECHECK_SECONDS` | `30` | The longest a credential is trusted without asking the broker again, so the longest a revocation the server did not see itself takes to apply. Also how long the server waits after a registry that could not be loaded before it tries again. |
 | `MANSIO_CREDENTIAL_SWEEP_SECONDS` | `60` | How often expired credentials are revoked. |
 | `MANSIO_SINK_PATH` | `mansio-sink.jsonl` (`/data/sink.jsonl` in the image) | JSON Lines file that every durable publish is appended to before it is published. Empty turns the sink off. |
+| `MANSIO_SINK_SYNC` | `true` | `true` or `false`. Whether the sink syncs each record to disk before the publish goes on. `false` is for development: a crash can lose recent records. |
 | `MANSIO_MAX_BODY_BYTES` | `1048576` | Largest request body. |
 | `MANSIO_POLL_DEFAULT_COUNT` | `100` | Envelopes a poll returns when `count` is not given. |
 | `MANSIO_POLL_MAX_COUNT` | `1000` | The most a poll may ask for. Also how many messages the server reads at a time when it rebuilds its state on start. |

@@ -250,7 +250,7 @@ impl LocalServer {
             PRINCIPAL.parse()?,
         );
         let server = Server::new(Arc::new(Yielding(broker.clone())), auth)
-            .with_sink(Arc::new(FileSink::open(sink).await?))
+            .with_sink(Arc::new(FileSink::open(sink, true).await?))
             .with_limits(settings.limits)
             .with_work_settings(settings.work)?
             .with_credential_settings(settings.credentials)

@@ -59,9 +59,9 @@ async fn serve() -> anyhow::Result<()> {
     };
     let sink: Arc<dyn Sink> = match &settings.sink_path {
         Some(path) => Arc::new(
-            FileSink::open(path)
+            FileSink::open(path, settings.sink_sync)
                 .await
-                .with_context(|| format!("opening the sink file {}", path.display()))?,
+                .context("opening the sink file")?,
         ),
         None => Arc::new(NoSink),
     };
