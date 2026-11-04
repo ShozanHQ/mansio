@@ -15,6 +15,7 @@ mod events;
 mod ha;
 mod harness;
 mod idempotency;
+mod metrics;
 mod ordering;
 mod oversized;
 mod passes;
