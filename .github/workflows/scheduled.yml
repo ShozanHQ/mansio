@@ -1,9 +1,10 @@
 name: scheduled
 
-# Two checks that no change to the repository triggers. A new advisory can
-# fail cargo-deny against a lockfile that has not changed, and Iggy's next
-# build can break the end-to-end suite before mansio has moved. Both run on
-# the default branch, and by hand from the Actions tab.
+# Three checks that no change to the repository triggers. A new advisory can
+# fail cargo-deny against a lockfile that has not changed, Iggy's next build
+# can break the end-to-end suite before mansio has moved, and a fuzzer given
+# more time than a pull request gets can find what a short run did not. All
+# run on the default branch, and by hand from the Actions tab.
 
 on:
   schedule:
@@ -11,6 +12,8 @@ on:
     - cron: "17 5 * * *"
     # Mondays, 05:43 UTC: the end-to-end suite against Iggy's edge build.
     - cron: "43 5 * * 1"
+    # Sundays, 06:11 UTC: five minutes of fuzzing per target.
+    - cron: "11 6 * * 0"
   workflow_dispatch:
 
 permissions:
@@ -21,6 +24,19 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # Every fuzz target for five minutes (fuzz.yml). It reports and never blocks;
+  # a crash opens an issue labelled fuzz.
+  fuzz:
+    name: fuzz, weekly
+    if: github.event_name != 'schedule' || github.event.schedule == '11 6 * * 0'
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    uses: ./.github/workflows/fuzz.yml
+    with:
+      seconds: 300
+
   # The deny job of ci.yml, against today's advisory database.
   deny:
     # Not named as the required check of ci.yml, so as not to be taken for it.

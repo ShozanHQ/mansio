@@ -1,0 +1,1 @@
+{"op":"created","v":1,"webhook":{"id":"0192f1c2-7d3e-4a4b-8c5d-6e7f8091a2b0","tenant":"acme","topic":"facts.build","url":"http://127.0.0.1:9000/hook","created_at":"2026-10-26T12:00:00Z"},"secret":"whsec_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}

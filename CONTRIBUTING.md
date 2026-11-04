@@ -53,6 +53,38 @@ The first time you contribute, the workflow runs on your pull request wait for
 a maintainer's approval before they start; that is GitHub's rule for
 first-time contributors, not a sign that something is wrong.
 
+## Fuzzing
+
+Every decoder of untrusted input has a [cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+target in `fuzz/`: the envelope (`envelope`), each request body of the HTTP API
+(`body_*`) and each record replayed from the broker on start (`record_*`:
+principals, cursors, webhooks, idempotency keys, owners, snapshots, and the
+work and alert facts). A panic or an unbounded allocation in any of them takes
+the server down for every tenant. The targets call `mansio_server::fuzz`, which
+the `fuzzing` feature of `mansio-server` turns on and no build that ships does.
+
+```sh
+cargo install cargo-fuzz --locked
+cargo +nightly fuzz run body_publish -- -max_total_time=180 -max_len=1048576
+```
+
+- **Seeds** are in `fuzz/corpus/<target>/`, taken from the bodies the end-to-end
+  tests send (`crates/mansio-e2e`) and, for a record, the shape the server
+  writes. A name that starts with `ok` is an input the target must accept, and
+  `cargo test -p mansio-server --features fuzzing fuzz::` fails when one is
+  refused, so a seed that drifts from the format does not quietly fuzz nothing.
+- **A crash** is fixed with its input added to `fuzz/regressions/<target>/`.
+  The same test replays it, in the `check` job, so it stays fixed.
+- **In CI** `fuzz.yml` runs every target for three minutes on a pull request
+  that touches `fuzz/`, the source of `mansio-core`, `mansio-server` or
+  `mansio-iggy`, or a lockfile, and
+  `scheduled.yml` runs it for five minutes every week. It reports in the run's
+  summary and as an issue labelled `fuzz`, and never blocks a merge.
+- **A new decoder** of input from outside gets a function in
+  `crates/mansio-server/src/fuzz.rs`, a line in `TARGETS`, a file in
+  `fuzz/fuzz_targets/`, a `[[bin]]` in `fuzz/Cargo.toml`, a seed, and a line in
+  the matrix of `fuzz.yml`. A test fails if one of them is missing.
+
 ## The code
 
 - Follow the Rust profile in [ARCHITECTURE.md](ARCHITECTURE.md#rust-profile):

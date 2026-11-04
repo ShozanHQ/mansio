@@ -35,6 +35,10 @@ jobs:
         run: cargo build --workspace --locked
       - name: Test
         run: cargo test --workspace --locked
+      # Replays fuzz/corpus and fuzz/regressions through the fuzz targets, so a
+      # crash that was fixed stays fixed. The fuzzing itself is fuzz.yml.
+      - name: Test the fuzz targets on their seeds and regressions
+        run: 'cargo test -p mansio-server --features fuzzing --locked fuzz::'
 
   deny:
     name: deny
@@ -45,6 +49,12 @@ jobs:
           persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
+          command: check
+          arguments: --all-features --locked
+      # fuzz/ is its own workspace with its own lockfile (fuzz.yml).
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: fuzz/Cargo.toml
           command: check
           arguments: --all-features --locked
 
