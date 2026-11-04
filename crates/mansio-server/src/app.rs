@@ -15,8 +15,8 @@ use axum::{Json, Router};
 use bytes::Bytes;
 use mansio_core::api::{EffectiveSettings, Polled, Published};
 use mansio_core::{
-    Action, Broker, Envelope, EventId, NoSink, ParseError, Principal, Sink, TenantId, Timestamp,
-    Topic,
+    Action, Broker, Data, Envelope, EventId, NoSink, ParseError, Principal, Sink, TenantId,
+    Timestamp, Topic,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -344,6 +344,7 @@ impl Server {
             )
             .route("/v1/webhooks/{id}", delete(webhooks_api::webhooks_delete))
             .fallback(not_found)
+            .method_not_allowed_fallback(method_not_allowed)
             .layer(DefaultBodyLimit::max(max_body))
             .with_state(Arc::new(state));
         Parts {
@@ -484,6 +485,7 @@ async fn settings(
         tick_millis: u64::try_from(work.tick.as_millis()).unwrap_or(u64::MAX),
         idempotency_window_seconds: seconds(work.idempotency_window),
         idempotency_max_keys: u64::try_from(work.idempotency_max_keys).unwrap_or(u64::MAX),
+        recovery_log_seconds: seconds(work.recovery_log),
         max_body_bytes: u64::try_from(limits.max_body_bytes).unwrap_or(u64::MAX),
         poll_default_count: limits.poll_default_count,
         poll_max_count: limits.poll_max_count,
@@ -499,6 +501,10 @@ async fn settings(
         webhook_timeout_seconds: seconds(webhooks.timeout),
         webhook_url_max_bytes: u64::try_from(webhooks.url_max_bytes).unwrap_or(u64::MAX),
     })
+}
+
+async fn method_not_allowed() -> ApiError {
+    ApiError::MethodNotAllowed
 }
 
 async fn not_found() -> ApiError {
@@ -610,7 +616,20 @@ pub(crate) fn build_envelope(
         principal.name.to_string().into(),
     );
 
-    Envelope::from_json_value(Value::Object(attributes)).map_err(|e| bad(e.to_string()))
+    // `data` is read again from the body as text, so its numbers are kept
+    // exactly as sent; the attributes above have already turned them into
+    // numbers.
+    #[derive(Deserialize)]
+    struct DataOnly {
+        data: Option<Data>,
+    }
+    let DataOnly { data } = serde_json::from_slice(body).map_err(|e| bad(e.to_string()))?;
+    attributes.remove("data");
+
+    let mut envelope =
+        Envelope::from_json_value(Value::Object(attributes)).map_err(|e| bad(e.to_string()))?;
+    envelope.data = data;
+    Ok(envelope)
 }
 
 async fn publish(
@@ -703,6 +722,24 @@ mod tests {
 
     const TOKEN: &str = "test-token";
 
+    #[test]
+    fn a_built_envelope_keeps_the_numbers_in_data_as_sent() {
+        let data = r#"{"big":123456789012345678901234567890,"exp":1e2,"long":0.1234567890123456789012345678901234567890}"#;
+        let body = format!(r#"{{"source":"s","type":"t","data":{data}}}"#);
+        let envelope = build_envelope(
+            body.as_bytes(),
+            &"acme".parse().unwrap(),
+            &"facts.build".parse().unwrap(),
+            &"service:mansio".parse().unwrap(),
+            &Timestamp::from_unix_millis(1_792_000_000_000).unwrap(),
+            Origin::Message,
+        )
+        .unwrap();
+        assert_eq!(envelope.data.as_ref().unwrap().as_str(), data);
+        let stored = String::from_utf8(envelope.to_json_vec().unwrap()).unwrap();
+        assert!(stored.contains(&format!(r#""data":{data}"#)), "{stored}");
+    }
+
     fn router() -> Router {
         let auth = Auth::new(
             SecretString::from(TOKEN.to_owned()),
@@ -746,6 +783,24 @@ mod tests {
             .unwrap()
             .error
             .code
+    }
+
+    #[tokio::test]
+    async fn a_wrong_method_is_a_405_in_the_error_shape() {
+        let _serial = serial().await;
+        let router = router();
+        for (method, uri) in [
+            (Method::DELETE, URI),
+            (Method::POST, "/healthz"),
+            (Method::PUT, "/v1/settings"),
+            (Method::GET, "/v1/webhooks/x"),
+        ] {
+            for token in [Some(TOKEN), None] {
+                let (status, body) = send(&router, method.clone(), uri, token, "").await;
+                assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method} {uri}");
+                assert_eq!(error_code(&body), "method_not_allowed");
+            }
+        }
     }
 
     #[tokio::test]
@@ -1168,6 +1223,7 @@ mod tests {
         assert_eq!(settings.tick_millis, 500);
         assert_eq!(settings.idempotency_window_seconds, 86_400);
         assert_eq!(settings.idempotency_max_keys, 10_000);
+        assert_eq!(settings.recovery_log_seconds, 60);
         assert_eq!(settings.max_body_bytes, 2048);
         assert_eq!(settings.poll_default_count, 3);
         assert_eq!(settings.poll_max_count, 5);

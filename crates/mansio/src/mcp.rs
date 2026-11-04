@@ -106,8 +106,36 @@ fn outcome(text: String, is_error: bool) -> Value {
     json!({"content": [{"type": "text", "text": text}], "isError": is_error})
 }
 
-/// Run a tool.
-async fn call(client: &Client, params: &Value) -> Result<Value, (i64, String)> {
+/// Where a tool call keeps its `data` argument, read as text.
+#[derive(serde::Deserialize)]
+struct RawMessage {
+    params: Option<RawParams>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawParams {
+    arguments: Option<RawArguments>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawArguments {
+    data: Option<Box<serde_json::value::RawValue>>,
+}
+
+/// The `data` argument of a tool call as it was written, so that a number in
+/// it is never read into a type that rewrites it.
+fn exact_data(message: &str) -> Option<String> {
+    let message: RawMessage = serde_json::from_str(message).ok()?;
+    let data = message.params?.arguments?.data?;
+    Some(data.get().to_owned())
+}
+
+/// Run a tool. `exact` is its `data` argument as written, when there is one.
+async fn call(
+    client: &Client,
+    params: &Value,
+    exact: Option<String>,
+) -> Result<Value, (i64, String)> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -116,19 +144,25 @@ async fn call(client: &Client, params: &Value) -> Result<Value, (i64, String)> {
         .into_iter()
         .find(|op| op.is_tool() && op.name() == name)
         .ok_or_else(|| (INVALID_PARAMS, format!("there is no tool {name}")))?;
-    let arguments = match params.get("arguments") {
+    let mut arguments = match params.get("arguments") {
         None | Some(Value::Null) => Map::new(),
         Some(Value::Object(arguments)) => arguments.clone(),
         Some(_) => {
             return Err((INVALID_PARAMS, "arguments must be an object".to_owned()));
         }
     };
+    // `data` travels as its JSON text (see `ops::Kind::Json`).
+    if let Some(text) = exact {
+        arguments.insert("data".to_owned(), Value::String(text));
+    } else if let Some(data) = arguments.get_mut("data").filter(|data| !data.is_null()) {
+        *data = Value::String(data.to_string());
+    }
     Ok(match ops::run(client, op, &arguments).await {
         Ok(lines) if lines.is_empty() => outcome("no output".to_owned(), false),
         Ok(lines) => outcome(
             lines
                 .iter()
-                .map(Value::to_string)
+                .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join("\n"),
             false,
@@ -138,7 +172,13 @@ async fn call(client: &Client, params: &Value) -> Result<Value, (i64, String)> {
 }
 
 /// Answer one message, or `None` if it needs no answer.
-pub async fn handle(client: &Client, message: Value) -> Option<Value> {
+#[cfg(test)]
+async fn handle(client: &Client, message: Value) -> Option<Value> {
+    handle_exact(client, message, None).await
+}
+
+/// [`handle`], with the `data` argument of a tool call as it was written.
+async fn handle_exact(client: &Client, message: Value, exact: Option<String>) -> Option<Value> {
     let Some(object) = message.as_object() else {
         return Some(failure(
             &Value::Null,
@@ -173,7 +213,7 @@ pub async fn handle(client: &Client, message: Value) -> Option<Value> {
         }
         "ping" => reply(id, json!({})),
         "tools/list" => reply(id, json!({"tools": tools()})),
-        "tools/call" => match call(client, &params).await {
+        "tools/call" => match call(client, &params, exact).await {
             Ok(result) => reply(id, result),
             Err((code, message)) => failure(id, code, &message),
         },
@@ -204,13 +244,16 @@ pub async fn answer_line(client: &Client, line: &[u8]) -> Option<String> {
             .to_string(),
         ),
         Ok(Value::Array(batch)) => {
+            let raw: Vec<Box<serde_json::value::RawValue>> =
+                serde_json::from_str(text).unwrap_or_default();
             let mut answers = Vec::new();
-            for message in batch {
-                answers.extend(handle(client, message).await);
+            for (at, message) in batch.into_iter().enumerate() {
+                let exact = raw.get(at).and_then(|raw| exact_data(raw.get()));
+                answers.extend(handle_exact(client, message, exact).await);
             }
             (!answers.is_empty()).then(|| Value::Array(answers).to_string())
         }
-        Ok(message) => handle(client, message)
+        Ok(message) => handle_exact(client, message, exact_data(text))
             .await
             .map(|answer| answer.to_string()),
         Err(error) => parse_error(error.to_string()),
@@ -314,6 +357,17 @@ mod tests {
         assert!(none.is_none());
         let answer = ask(json!({"jsonrpc": "2.0", "id": 2, "method": "ping"})).await;
         assert_eq!(answer["result"], json!({}));
+    }
+
+    #[test]
+    fn a_tool_calls_data_is_read_as_the_text_it_was_written_as() {
+        let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"publish","arguments":{"data":{"big":123456789012345678901234567890,"exp":1e2},"type":"t"}}}"#;
+        assert_eq!(
+            exact_data(call).as_deref(),
+            Some(r#"{"big":123456789012345678901234567890,"exp":1e2}"#)
+        );
+        assert_eq!(exact_data(r#"{"method":"ping"}"#), None);
+        assert_eq!(exact_data(r#"{"params":{"arguments":"nope"}}"#), None);
     }
 
     #[tokio::test]

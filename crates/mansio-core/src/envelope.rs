@@ -12,6 +12,7 @@ use std::str::FromStr;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
+use serde_json::value::RawValue;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -123,6 +124,100 @@ impl FromStr for DataContentType {
 impl fmt::Display for DataContentType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(Self::JSON)
+    }
+}
+
+/// The `data` of an envelope: JSON kept as the text it arrived as, so every
+/// number comes back exactly as published (an integer wider than 64 bits,
+/// `1e2`, a long decimal). Parsing it into a [`Value`] is an explicit step
+/// that gives up that exactness.
+#[derive(Debug, Clone)]
+pub struct Data {
+    raw: Box<RawValue>,
+}
+
+impl Data {
+    fn from_raw(raw: Box<RawValue>) -> Self {
+        Self { raw }
+    }
+
+    /// Data from any serializable value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the value does not serialize to JSON.
+    pub fn new<T: Serialize + ?Sized>(value: &T) -> Result<Self, serde_json::Error> {
+        serde_json::value::to_raw_value(value).map(Self::from_raw)
+    }
+
+    /// The JSON text, exactly as published.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.raw.get()
+    }
+
+    /// Read the data as a typed value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data does not fit `T`.
+    pub fn parse<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
+        serde_json::from_str(self.as_str())
+    }
+}
+
+impl PartialEq for Data {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for Data {}
+
+impl Serialize for Data {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.raw.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Data {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Box::<RawValue>::deserialize(deserializer)?;
+        RawValue::from_string(compact_json(raw.get()))
+            .map(Self::from_raw)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Remove the whitespace outside strings from valid JSON text, so the record
+/// stays on one line. Every number and string is left as written.
+#[must_use]
+pub fn compact_json(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let (mut in_string, mut escaped) = (false, false);
+    for c in text.chars() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else if c == '"' {
+            in_string = true;
+            out.push(c);
+        } else if !matches!(c, ' ' | '\t' | '\n' | '\r') {
+            out.push(c);
+        }
+    }
+    out
+}
+
+impl fmt::Display for Data {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -379,7 +474,7 @@ pub struct Envelope {
     /// The content type of `data`.
     pub datacontenttype: Option<DataContentType>,
     /// The payload.
-    pub data: Option<Value>,
+    pub data: Option<Data>,
     /// The tenant, which is the Iggy stream.
     pub tenant: TenantId,
     /// The topic it was published to.
@@ -468,7 +563,9 @@ impl Envelope {
     ///
     /// # Errors
     ///
-    /// As [`Envelope::from_json_slice`].
+    /// As [`Envelope::from_json_slice`]. A [`Value`] has already turned its
+    /// numbers into `f64`, `u64` or `i64`, so `data` read from one is only as
+    /// exact as that; use [`Envelope::from_json_slice`] to keep it as sent.
     pub fn from_json_value(value: Value) -> Result<Self, EnvelopeError> {
         Ok(serde_json::from_value(value)?)
     }
@@ -510,7 +607,7 @@ struct Wire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     datacontenttype: Option<DataContentType>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    data: Option<Value>,
+    data: Option<Data>,
     tenant: TenantId,
     topic: Topic,
     principalkind: PrincipalKind,
@@ -626,6 +723,16 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn data_is_compacted_to_one_line_and_numbers_stay() {
+        let text = "{\"data\": {\n  \"a\": 123456789012345678901234567890,\n  \"b\": 1e2,\n  \"s\": \" x\\\" \\n y \"\n}}";
+        let m: std::collections::BTreeMap<String, Data> = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            m["data"].as_str(),
+            "{\"a\":123456789012345678901234567890,\"b\":1e2,\"s\":\" x\\\" \\n y \"}"
+        );
+    }
+
     const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const HASH_B: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -683,6 +790,17 @@ mod tests {
 
         let bytes = envelope.to_json_vec().unwrap();
         assert_eq!(Envelope::from_json_slice(&bytes).unwrap(), envelope);
+    }
+
+    #[test]
+    fn numbers_in_data_keep_the_text_they_were_published_with() {
+        let data = r#"{"big":123456789012345678901234567890,"exp":1e2,"long":0.1234567890123456789012345678901234567890}"#;
+        let text = format!(
+            r#"{{"specversion":"1.0","id":"0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3","source":"s","type":"t","data":{data},"tenant":"acme","topic":"facts.build","principalkind":"service","principalname":"mansio"}}"#
+        );
+        let envelope = Envelope::from_json_slice(text.as_bytes()).unwrap();
+        let out = String::from_utf8(envelope.to_json_vec().unwrap()).unwrap();
+        assert!(out.contains(&format!(r#""data":{data}"#)), "{out}");
     }
 
     #[test]

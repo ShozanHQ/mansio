@@ -21,6 +21,8 @@ pub enum ApiError {
     Forbidden(String),
     /// 404: no such route, tenant, topic, item or alert.
     NotFound(String),
+    /// 405: the route exists and not for this method.
+    MethodNotAllowed,
     /// 409: the request is well formed but the state it acts on does not
     /// allow it, for example an alert already acknowledged.
     Conflict(String),
@@ -44,6 +46,7 @@ impl ApiError {
             ApiError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
+            ApiError::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::BadGateway(_) => StatusCode::BAD_GATEWAY,
             ApiError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -58,6 +61,7 @@ impl ApiError {
             ApiError::PayloadTooLarge(_) => "payload_too_large",
             ApiError::Forbidden(_) => "forbidden",
             ApiError::NotFound(_) => "not_found",
+            ApiError::MethodNotAllowed => "method_not_allowed",
             ApiError::Conflict(_) => "conflict",
             ApiError::BadGateway(_) => "broker_refused",
             ApiError::Unavailable(_) => "unavailable",
@@ -104,6 +108,7 @@ impl ApiError {
             | ApiError::BadGateway(m)
             | ApiError::Unavailable(m) => m.clone(),
             ApiError::Unauthorized => "missing or invalid bearer token".to_owned(),
+            ApiError::MethodNotAllowed => "method not allowed for this route".to_owned(),
             ApiError::Internal => "internal error".to_owned(),
         }
     }

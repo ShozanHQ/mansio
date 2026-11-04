@@ -1113,6 +1113,24 @@ impl Mcp {
         Ok(answer)
     }
 
+    /// A tool call whose arguments are JSON text sent as written, so the
+    /// numbers in it are not rewritten on the way.
+    fn call_text(&mut self, id: u64, tool: &str, arguments: &str) -> anyhow::Result<String> {
+        let line = format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{tool}","arguments":{arguments}}}}}"#
+        );
+        let stdin = self.stdin.as_mut().context("stdin is closed")?;
+        writeln!(stdin, "{line}")?;
+        stdin.flush()?;
+        let answer = self.receive()?;
+        let result = answer.get("result").with_context(|| format!("{answer}"))?;
+        ensure!(result["isError"] != json!(true), "{answer}");
+        Ok(result["content"][0]["text"]
+            .as_str()
+            .context("a text result")?
+            .to_owned())
+    }
+
     /// A tool call, which must have been answered with a result.
     fn call(&mut self, id: u64, tool: &str, arguments: Value) -> anyhow::Result<(bool, String)> {
         let answer = self.request(
@@ -1146,7 +1164,10 @@ async fn the_mcp_server_lists_the_tools_and_pulls_and_acks_work_over_stdio() -> 
         .issue(
             "agent",
             "mcp-agent",
-            &json!([{"topic": "work.builds", "verbs": ["claim"]}]),
+            &json!([
+                {"topic": "work.builds", "verbs": ["claim"]},
+                {"topic": "facts.numbers", "verbs": ["publish", "subscribe"]}
+            ]),
             None,
         )
         .await?;
@@ -1185,6 +1206,24 @@ async fn the_mcp_server_lists_the_tools_and_pulls_and_acks_work_over_stdio() -> 
         let empty = mcp.call(6, "work_pull", args)?;
         let twice = mcp.call(7, "work_ack", ack_args)?;
         let bad = mcp.call(8, "work_pull", json!({"tenant": t}))?;
+        // Numbers in `data` go in and come out as written.
+        const DATA: &str = r#"{"big":123456789012345678901234567890,"exp":1e2,"long":0.1234567890123456789012345678901234567890}"#;
+        mcp.call_text(
+            10,
+            "publish",
+            &format!(
+                r#"{{"tenant":"{t}","topic":"facts.numbers","type":"e2e.numbers","source":"e2e","data":{DATA}}}"#
+            ),
+        )?;
+        let polled = mcp.call_text(
+            11,
+            "poll",
+            &format!(r#"{{"tenant":"{t}","topic":"facts.numbers","offset":0,"count":10}}"#),
+        )?;
+        ensure!(
+            polled.contains(&format!(r#""data":{DATA}"#)),
+            "numbers changed over MCP: {polled}"
+        );
         let status = mcp.finish()?;
         Ok((
             init, listed, pulled, again, extended, acked, empty, twice, bad, status,

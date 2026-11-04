@@ -8,7 +8,7 @@ use std::io::IsTerminal;
 use std::sync::Arc;
 
 use anyhow::Context;
-use mansio_core::{Broker, MemoryBroker, NoSink, Sink};
+use mansio_core::{Broker, BrokerError, MemoryBroker, NoSink, Sink};
 use mansio_iggy::{IggyBroker, Provisioned, provision_admin};
 use mansio_server::{Auth, Backend, FileSink, Server, Settings};
 use tokio::net::TcpListener;
@@ -50,11 +50,11 @@ async fn serve() -> anyhow::Result<()> {
 
     let broker_name = settings.broker.name();
     let broker: Arc<dyn Broker> = match settings.broker {
-        Backend::Iggy(iggy) => Arc::new(
-            IggyBroker::connect(iggy)
-                .await
-                .context("connecting to Iggy")?,
-        ),
+        Backend::Iggy(iggy) => {
+            let user = iggy.username.clone();
+            let connected = IggyBroker::connect(iggy).await;
+            Arc::new(connected.map_err(|error| connect_error(error, &user))?)
+        }
         Backend::Memory => Arc::new(MemoryBroker::new()),
     };
     let sink: Arc<dyn Sink> = match &settings.sink_path {
@@ -94,6 +94,19 @@ async fn serve() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The error that ends a start which could not connect to Iggy. Iggy refusing
+/// the credentials names the two settings that make them, since a wrong
+/// password is a setting to correct and not a broker to wait for.
+fn connect_error(error: BrokerError, user: &str) -> anyhow::Error {
+    match error {
+        BrokerError::Unauthenticated(why) => anyhow::anyhow!(
+            "Iggy refused the sign-in of user {user:?} ({why}): check MANSIO_IGGY_PASSWORD, \
+             and MANSIO_IGGY_USERNAME, against the user `provision-admin` made"
+        ),
+        other => anyhow::Error::new(other).context("connecting to Iggy"),
+    }
+}
+
 /// Completes on Ctrl-C, or on SIGTERM where there is one.
 async fn shutdown_signal() {
     let ctrl_c = async {
@@ -113,5 +126,32 @@ async fn shutdown_signal() {
     tokio::select! {
         () = ctrl_c => {},
         () = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refused_password_names_the_variable_to_correct() {
+        let message = connect_error(
+            BrokerError::Unauthenticated("Invalid credentials".into()),
+            "mansio",
+        )
+        .to_string();
+        assert!(message.contains("MANSIO_IGGY_PASSWORD"), "{message}");
+        assert!(message.contains("mansio"), "{message}");
+        assert!(!message.contains("broker unavailable"), "{message}");
+    }
+
+    #[test]
+    fn a_broker_that_cannot_be_reached_is_still_reported_as_unreachable() {
+        let message = format!(
+            "{:#}",
+            connect_error(BrokerError::Unavailable("no answer".into()), "mansio")
+        );
+        assert!(message.contains("connecting to Iggy"), "{message}");
+        assert!(message.contains("broker unavailable"), "{message}");
     }
 }

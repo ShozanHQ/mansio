@@ -7,7 +7,7 @@ use mansio_core::EventId;
 use reqwest::StatusCode;
 use serde_json::json;
 
-use crate::harness::{PRINCIPAL, SLACK, Target, millis};
+use crate::harness::{DataValue, PRINCIPAL, SLACK, Target, millis};
 
 fn alert() -> serde_json::Value {
     json!({
@@ -33,9 +33,9 @@ async fn an_alert_is_acknowledged_once_and_the_ack_names_the_principal() -> anyh
         vec![published.envelope.clone()]
     );
 
-    let (status, body) = target.alert_ack(&id).await?;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let acked: mansio_core::api::Published = serde_json::from_value(body)?;
+    let (status, body) = target.alert_ack_bytes(&id).await?;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let acked: mansio_core::api::Published = serde_json::from_slice(&body)?;
     assert_eq!(
         acked.envelope.event_type.as_str(),
         "mansio.alert.acknowledged"
@@ -46,7 +46,7 @@ async fn an_alert_is_acknowledged_once_and_the_ack_names_the_principal() -> anyh
         acked.envelope.subject.as_ref().map(|s| s.to_string()),
         Some(id.clone())
     );
-    let data = acked.envelope.data.as_ref().context("data")?;
+    let data = acked.envelope.data.as_ref().context("data")?.value();
     assert_eq!(data["alert_id"], json!(id));
     assert_eq!(data["acknowledged_by"], PRINCIPAL);
     assert!(data["acknowledged_at"].is_string());
@@ -127,7 +127,7 @@ async fn an_unacknowledged_alert_is_surfaced_again_each_interval_until_acknowled
             Some(id.to_string())
         );
         assert_eq!(
-            fact.data.as_ref().context("data")?["alert_id"],
+            fact.data.as_ref().context("data")?.value()["alert_id"],
             json!(id.to_string())
         );
     }

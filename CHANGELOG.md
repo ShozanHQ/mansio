@@ -13,6 +13,10 @@ All notable changes to mansio are listed here. The format follows
   topic. A CI e2e checks that a heartbeat is gone after retention and a roll.
   A segment size applies when a topic is created, so existing
   `presence` topics keep their 1 GiB segments until they are recreated.
+- `MANSIO_RECOVERY_LOG_SECONDS` (default 60) is a setting, served by
+  `GET /v1/settings`. A start in which the broker will not list its tenants
+  asks again after a wait that doubles from one tick up to it, and logs the
+  failure at most once per interval, where it asked and logged every tick.
 - `MANSIO_SINK_SYNC` (default `true`) is a setting. The file sink calls `sync_data` after every record before
   `record` returns; `false` skips it, for development only.
 - A publish with an `idempotencykey` that the tenant's topic has already seen
@@ -153,6 +157,18 @@ All notable changes to mansio are listed here. The format follows
   `lease_max_seconds`.
 
 ### Changed
+
+- A wrong `MANSIO_IGGY_PASSWORD` at startup ends the server with a message that
+  names `MANSIO_IGGY_PASSWORD` and `MANSIO_IGGY_USERNAME`, not `broker
+  unavailable: Invalid credentials`.
+- Iggy's `InvalidMessagePayloadLength` is a refusal (502), like
+  `TooBigMessagePayload`, so a client does not retry a payload Iggy cannot
+  take. The e2e job raises `MANSIO_MAX_BODY_BYTES` and checks a payload over
+  Iggy's cap is answered 502.
+- An envelope's `data` comes back exactly as published: an integer wider than
+  64 bits, `1e2` and a long decimal keep their digits, through the HTTP API, the
+  CLI and the MCP tools, on the memory and Iggy backends. Only the whitespace
+  outside strings is removed, so a record stays on one line.
 
 - The file sink writes each record as one whole line and syncs it to disk
   before `record` returns (set `MANSIO_SINK_SYNC=false` to skip the sync). A

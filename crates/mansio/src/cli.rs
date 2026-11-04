@@ -45,6 +45,13 @@ fn parse_json(text: &str) -> Result<Value, String> {
     serde_json::from_str(text).map_err(|e| format!("not valid JSON: {e}"))
 }
 
+/// JSON kept as the text it was written as (see [`Kind::Json`]).
+fn parse_json_text(text: &str) -> Result<Value, String> {
+    serde_json::value::RawValue::from_string(mansio_core::compact_json(text.trim()))
+        .map(|raw| Value::String(raw.get().to_owned()))
+        .map_err(|e| format!("not valid JSON: {e}"))
+}
+
 fn leaf(op: Op, name: &'static str) -> Command {
     let mut command = Command::new(name).about(op.about());
     for param in op.params() {
@@ -56,7 +63,8 @@ fn leaf(op: Op, name: &'static str) -> Command {
         arg = match param.kind {
             Kind::Text => arg,
             Kind::Int => arg.value_parser(value_parser!(u64)),
-            Kind::Json | Kind::Scopes => arg.value_parser(parse_json),
+            Kind::Json => arg.value_parser(parse_json_text),
+            Kind::Scopes => arg.value_parser(parse_json),
         };
         command = command.arg(arg);
     }
@@ -208,7 +216,7 @@ mod tests {
                 "topic": "facts.build",
                 "type": "build.done",
                 "source": "ci",
-                "data": {"ok": true},
+                "data": r#"{"ok":true}"#,
                 "correlation_id": "c1",
             })
         );

@@ -68,6 +68,7 @@ fn local_work_settings() -> WorkSettings {
         tick: Duration::from_millis(100),
         idempotency_window: Duration::from_secs(4),
         idempotency_max_keys: 20,
+        recovery_log: Duration::from_secs(60),
     }
 }
 
@@ -467,12 +468,21 @@ impl Target {
 
     pub async fn poll(&self, topic: &str, query: &str) -> anyhow::Result<Polled> {
         let uri = format!("{}?{query}", self.messages_uri(topic));
-        let (status, response) = self.authed(Method::GET, &uri, None).await?;
+        let (status, bytes) = self.get_bytes(&uri).await?;
         ensure!(
             status == StatusCode::OK,
-            "poll answered {status}: {response}"
+            "poll answered {status}: {}",
+            String::from_utf8_lossy(&bytes)
         );
-        Ok(serde_json::from_value(response)?)
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    /// A GET with the right token, answering the body as it came, so `data`
+    /// is not rewritten by a trip through a `Value`.
+    async fn get_bytes(&self, uri: &str) -> anyhow::Result<(StatusCode, Vec<u8>)> {
+        let response = self.http.get(uri).bearer_auth(&self.token).send().await?;
+        let status = response.status();
+        Ok((status, response.bytes().await?.to_vec()))
     }
 
     /// Everything in a topic, in order. A topic nobody has published to is
@@ -483,15 +493,16 @@ impl Target {
         loop {
             let query = format!("offset={offset}&count={}", self.settings.poll_max_count);
             let uri = format!("{}?{query}", self.messages_uri(topic));
-            let (status, response) = self.authed(Method::GET, &uri, None).await?;
+            let (status, bytes) = self.get_bytes(&uri).await?;
             if status == StatusCode::NOT_FOUND {
                 return Ok(all);
             }
             ensure!(
                 status == StatusCode::OK,
-                "poll answered {status}: {response}"
+                "poll answered {status}: {}",
+                String::from_utf8_lossy(&bytes)
             );
-            let page: Polled = serde_json::from_value(response)?;
+            let page: Polled = serde_json::from_slice(&bytes)?;
             let Some(last) = page.messages.last() else {
                 return Ok(all);
             };
@@ -666,6 +677,15 @@ impl Target {
     pub async fn alert_ack(&self, alert: &str) -> anyhow::Result<(StatusCode, Value)> {
         let uri = self.tenant_uri(&format!("alerts/{alert}/ack"));
         self.authed(Method::POST, &uri, None).await
+    }
+
+    /// `alert_ack`, answered with the bytes as the server wrote them, so that
+    /// `data` is not passed through a `Value`.
+    pub async fn alert_ack_bytes(&self, alert: &str) -> anyhow::Result<(StatusCode, Vec<u8>)> {
+        let uri = self.tenant_uri(&format!("alerts/{alert}/ack"));
+        let response = self.http.post(uri).bearer_auth(&self.token).send().await?;
+        let status = response.status();
+        Ok((status, response.bytes().await?.to_vec()))
     }
 
     /// What the sink recorded for this tenant, in order, or `None` if the
@@ -1422,9 +1442,27 @@ pub fn extended_to(fact: &Published) -> anyhow::Result<i64> {
         .envelope
         .data
         .as_ref()
-        .and_then(|data| data.get("expires_at"))
+        .and_then(|data| data.value().get("expires_at").cloned())
         .context("an extended fact says where the lease ends")?;
     millis(&serde_json::from_value(ends.clone())?)
+}
+
+/// An envelope's `data` read as a `Value` to look at a member. Numbers read
+/// this way are only as exact as a `Value` is; compare `Data::as_str` to
+/// check what was published.
+pub trait DataValue {
+    /// The data as a `Value`.
+    fn value(&self) -> Value;
+}
+
+impl DataValue for mansio_core::Data {
+    #[expect(
+        clippy::expect_used,
+        reason = "Data is valid JSON by construction, and a test helper fails loudly"
+    )]
+    fn value(&self) -> Value {
+        self.parse().expect("data is JSON")
+    }
 }
 
 /// A work item body with a type and a payload.

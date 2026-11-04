@@ -235,6 +235,9 @@ pub struct EffectiveSettings {
     pub idempotency_window_seconds: u64,
     /// `MANSIO_IDEMPOTENCY_MAX_KEYS`: the most keys a tenant remembers.
     pub idempotency_max_keys: u64,
+    /// `MANSIO_RECOVERY_LOG_SECONDS`: how often a recovery that keeps failing
+    /// is logged.
+    pub recovery_log_seconds: u64,
     /// `MANSIO_MAX_BODY_BYTES`.
     pub max_body_bytes: u64,
     /// `MANSIO_POLL_DEFAULT_COUNT`.

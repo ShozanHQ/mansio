@@ -9,7 +9,7 @@ use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use tokio::task::JoinSet;
 
-use crate::harness::{PRINCIPAL, SLACK, Target, extended_to, item_of, job, millis};
+use crate::harness::{DataValue, PRINCIPAL, SLACK, Target, extended_to, item_of, job, millis};
 use crate::{only_line, run_cli};
 
 const QUEUE: &str = "builds";
@@ -99,7 +99,7 @@ async fn an_unacked_claim_expires_and_the_item_is_claimed_again_with_the_attempt
     assert_eq!(expired.item_id, first.item.item_id);
     assert_eq!(expired.attempt, Some(1));
     // The fact says which lease it was and not what its id is.
-    let data = expired.data.as_ref().context("data")?;
+    let data = expired.data.as_ref().context("data")?.value();
     assert_eq!(data["lease"], first.lease_id.fingerprint().to_string());
     assert!(data.get("lease_id").is_none(), "{data}");
     for fact in &facts {
@@ -109,7 +109,7 @@ async fn an_unacked_claim_expires_and_the_item_is_claimed_again_with_the_attempt
         }
     }
     assert_eq!(
-        facts[2].data.as_ref().context("data")?["message_id"],
+        facts[2].data.as_ref().context("data")?.value()["message_id"],
         second.item.id.to_string()
     );
     // The queue holds both messages; the first is not claimable again.
@@ -136,7 +136,7 @@ async fn fail_republishes_after_the_backoff_and_after_the_cap_the_item_is_on_dea
             .await?;
         assert_eq!(failed.envelope.event_type.as_str(), "mansio.work.failed");
         assert_eq!(failed.envelope.principal.to_string(), PRINCIPAL);
-        let data = failed.envelope.data.as_ref().context("data")?;
+        let data = failed.envelope.data.as_ref().context("data")?.value();
         assert_eq!(data["reason"], format!("attempt {attempt} broke"));
         assert_eq!(data["next"], "retry");
 
@@ -167,7 +167,7 @@ async fn fail_republishes_after_the_backoff_and_after_the_cap_the_item_is_on_dea
     assert_eq!(claim.item.attempt, Some(max));
     let failed = target.fail_claim(QUEUE, &claim, "the last straw").await?;
     assert_eq!(
-        failed.envelope.data.as_ref().context("data")?["next"],
+        failed.envelope.data.as_ref().context("data")?.value()["next"],
         "dead"
     );
 
@@ -446,6 +446,7 @@ async fn the_settings_are_served_and_need_the_token() -> anyhow::Result<()> {
     assert!(settings.tick_millis >= 1);
     assert!(settings.idempotency_window_seconds >= 1);
     assert!(settings.idempotency_max_keys >= 1);
+    assert!(settings.recovery_log_seconds >= 1);
     assert!(settings.poll_max_count >= settings.poll_default_count);
     assert!(settings.agent_credential_ttl_seconds >= 1);
     assert!(settings.credential_recheck_seconds >= 1);
@@ -472,6 +473,7 @@ async fn the_settings_are_served_and_need_the_token() -> anyhow::Result<()> {
         "tick_millis",
         "idempotency_window_seconds",
         "idempotency_max_keys",
+        "recovery_log_seconds",
         "agent_credential_ttl_seconds",
         "credential_recheck_seconds",
         "credential_sweep_seconds",
@@ -600,7 +602,7 @@ async fn the_holder_extends_its_lease_and_anyone_else_is_refused_as_for_an_ack()
     );
     let fact = &facts[1];
     assert_eq!(fact.item_id, claim.item.item_id);
-    let data = fact.data.as_ref().context("data")?;
+    let data = fact.data.as_ref().context("data")?.value();
     assert_eq!(data["lease"], claim.lease_id.fingerprint().to_string());
     assert_eq!(data["holder"], PRINCIPAL);
     assert_eq!(data["consumer"], "worker");

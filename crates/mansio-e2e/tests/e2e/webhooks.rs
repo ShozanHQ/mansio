@@ -8,7 +8,7 @@ use mansio_core::Envelope;
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
-use crate::harness::{Outcome, SLACK, Target};
+use crate::harness::{DataValue, Outcome, SLACK, Target};
 use crate::receiver::{Receiver, Reply, check_signed};
 
 fn event(n: u32) -> Value {
@@ -179,7 +179,7 @@ async fn a_delivery_that_fails_every_attempt_is_recorded_and_the_webhook_moves_o
         Some(id.clone())
     );
     assert_eq!(fact.principal.to_string(), "service:mansio-engine");
-    let data = fact.data.as_ref().context("data")?;
+    let data = fact.data.as_ref().context("data")?.value();
     assert_eq!(data["webhook_id"], json!(id));
     assert_eq!(data["topic"], "facts.build");
     assert_eq!(data["offset"], 0);

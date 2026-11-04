@@ -119,7 +119,9 @@ pub async fn watch(client: &Client, args: WatchArgs) -> anyhow::Result<()> {
     let mut next = match &args.consumer {
         Some(consumer) => {
             let state = consumer_state(client, &args.tenant, &args.topic, consumer).await?;
-            state["next"].as_u64().unwrap_or(0)
+            serde_json::from_str::<serde_json::Value>(state.get())?["next"]
+                .as_u64()
+                .unwrap_or(0)
         }
         None => args.from,
     };

@@ -877,8 +877,8 @@ mod tests {
                             .envelope
                             .data
                             .as_ref()
-                            .and_then(|d| d["reason"].as_str())
-                            .map(str::to_owned);
+                            .and_then(|d| d.parse::<serde_json::Value>().ok())
+                            .and_then(|d| d["reason"].as_str().map(str::to_owned));
                         (s.envelope.event_type.as_str().to_owned(), reason)
                     })
                     .collect(),
@@ -1096,7 +1096,10 @@ mod tests {
             .map(|s| s.envelope)
             .filter(|fact| fact.event_type.as_str() == "mansio.work.expired")
             .map(|fact| {
-                let data = fact.data.unwrap_or_default();
+                let data = fact
+                    .data
+                    .and_then(|data| data.parse::<serde_json::Value>().ok())
+                    .unwrap_or_default();
                 (
                     data["holder"].as_str().unwrap_or_default().to_owned(),
                     data["reason"].as_str().map(str::to_owned),

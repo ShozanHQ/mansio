@@ -365,12 +365,22 @@ consumers still deduplicate on `id`. ARCHITECTURE.md has the whole rule.
 
 A refusal is `{"error":{"code":"...","message":"..."}}` with status 400, 401
 (no valid credential), 403 (a valid credential that may not do this, or a lease
-that is not yours), 404, 409, 413, 502 or 503. A 502 is a refusal the broker
-named before it stored anything: nothing was stored. A 503 is every other
+that is not yours), 404, 405 (the route does not take that method), 409, 413,
+500 (a fault in the server; the message is generic and the detail is in the
+log), 502 or 503. A 502 is a refusal the broker
+named before it stored anything: nothing was stored. That includes a payload
+above Iggy's cap (see `MANSIO_MAX_BODY_BYTES`). A 503 is every other
 failure of the broker or the sink, including an answer from Iggy that does not
 say whether it applied the request, so a write that gets a 503 may have been
 stored: send it again with the same `id`. A 502 or 503 is also logged at `warn`
 with the tenant, the topic and what the broker or the sink said.
+
+Length limits are in bytes, and a value over its limit is a 400. Free-text
+attributes are not empty and hold no control characters: `source` and `subject`
+at most 1024; `type`, `correlationid`, `causationid`, `idempotencykey`, `itemid`
+and `recordid` at most 256. A tenant id and each part of a topic name are at
+most 63 (`[a-z0-9][a-z0-9_-]{0,62}`), a principal kind at most 32 and a
+principal or consumer name at most 128. `scope` is at most 128 characters from `[a-z0-9._*:-]`. In `budget` (`<amount> <unit>`) the amount is at most 24 characters and the unit at most 32.
 
 `GET /v1/settings` answers with the settings the server runs with, none of
 them secret: the work, credential, stream and webhook settings below and the
@@ -824,7 +834,7 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_CREDENTIAL_SWEEP_SECONDS` | `60` | How often expired credentials are revoked. |
 | `MANSIO_SINK_PATH` | `mansio-sink.jsonl` (`/data/sink.jsonl` in the image) | JSON Lines file that every durable publish is appended to before it is published. Empty turns the sink off. |
 | `MANSIO_SINK_SYNC` | `true` | `true` or `false`. Whether the sink syncs each record to disk before the publish goes on. `false` is for development: a crash can lose recent records. |
-| `MANSIO_MAX_BODY_BYTES` | `1048576` | Largest request body. |
+| `MANSIO_MAX_BODY_BYTES` | `1048576` | Largest request body; a larger one is a 413. Iggy has a cap of its own on a message payload, 64 000 000 bytes (the stored envelope, not the body's `data` alone), and a body over it is refused by Iggy as a 502, which a client does not retry. A value above about 64 000 000 lets a body reach that refusal; a value below it makes this setting the limit. Raise it only when messages are that large: Iggy holds a whole message in memory. |
 | `MANSIO_POLL_DEFAULT_COUNT` | `100` | Envelopes a poll returns when `count` is not given. |
 | `MANSIO_POLL_MAX_COUNT` | `1000` | The most a poll may ask for. Also how many messages the server reads at a time when it rebuilds its state on start. |
 | `MANSIO_LEASE_SECONDS` | `300` | How long a claim holds, and how long an extension without `seconds` runs from now. Past it the item expires and, after its backoff, is claimed again. At most `315360000` (ten years). |
@@ -832,6 +842,7 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_MAX_ATTEMPTS` | `5` | Attempts an item gets. A failure or expiry of the last one sends it to `dead`. |
 | `MANSIO_BACKOFF_BASE_SECONDS` | `5` | The wait before an item is republished after its first failure. It doubles with each attempt. |
 | `MANSIO_BACKOFF_CAP_SECONDS` | `300` | The longest that wait gets. At least the base. |
+| `MANSIO_RECOVERY_LOG_SECONDS` | `60` | While the broker will not list its tenants at startup (for example an Iggy user that may not list streams), the server asks again after a wait that doubles from one tick up to this many seconds, and logs the failure at most once per this interval. At least 1. |
 | `MANSIO_ALERT_RESURFACE_SECONDS` | `3600` | How long an alert may go unacknowledged before it is surfaced again, and again after each further interval. |
 | `MANSIO_TICK_MILLIS` | `500` | How often the timer looks for leases to expire, items to republish and alerts to surface again. |
 | `MANSIO_IDEMPOTENCY_WINDOW_SECONDS` | `86400` | How long a publish's `idempotencykey` is remembered. A second publish to the same tenant and topic with the same key inside the window is answered 200 with the first envelope and offset and publishes nothing. At least `1`, at most `315360000` (ten years). |
@@ -846,7 +857,7 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_WEBHOOK_URL_MAX_BYTES` | `2048` | The longest address a webhook may have. |
 | `MANSIO_IGGY_ADDRESS` | `127.0.0.1:8090` | Iggy's TCP address, `host:port`. |
 | `MANSIO_IGGY_USERNAME` | `mansio` | The Iggy user mansio-server acts as. It manages users and streams and reads and writes topics; it is not Iggy's root user. |
-| `MANSIO_IGGY_PASSWORD` | none, required with `iggy` | Its password. |
+| `MANSIO_IGGY_PASSWORD` | none, required with `iggy` | Its password. If Iggy refuses it at startup, the server exits with a message that names this variable and `MANSIO_IGGY_USERNAME`. |
 | `MANSIO_IGGY_CONNECT_TIMEOUT_SECONDS` | `60` | How long startup waits for Iggy. |
 | `MANSIO_IGGY_LOCATE_WINDOW` | `100` | How many recent messages to search, by message id, when Iggy accepts a publish without saying where it landed. 0 turns the search off. A message that is not found is still answered with 201, without an offset. |
 | `MANSIO_IGGY_SEGMENT_SIZE_BYTES` | `0` | The segment size Iggy gives the topics mansio creates, except `presence` (next row). 0 leaves it to Iggy, which uses 1 GiB. Otherwise a multiple of 512 from 1048576 (1 MiB) to 1073741824. Iggy applies retention to whole segments that have filled and rolled, never to the one it is writing, so this is how coarsely the `MANSIO_RETENTION_*` settings trim a topic. Applied when a topic is created. |

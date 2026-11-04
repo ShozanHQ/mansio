@@ -15,6 +15,7 @@ mod events;
 mod harness;
 mod idempotency;
 mod ordering;
+mod oversized;
 mod passes;
 mod receiver;
 mod restart;
@@ -96,6 +97,74 @@ async fn a_published_envelope_is_polled_back_with_every_field_intact() -> anyhow
     assert_eq!(message.envelope.id.to_string(), id);
     assert_eq!(message.envelope, published.envelope);
     assert_eq!(serde_json::to_value(&message.envelope)?, expected);
+    Ok(())
+}
+
+/// The raw text of the first `data` member in a JSON document, an object read
+/// to its matching closing brace (braces inside strings do not count).
+fn raw_data(text: &str) -> anyhow::Result<&str> {
+    let start = text.find("\"data\":").context("the document has no data")? + "\"data\":".len();
+    let rest = &text[start..];
+    ensure!(rest.starts_with('{'), "data is not an object");
+    let (mut depth, mut in_string, mut escaped) = (0_u32, false, false);
+    for (at, c) in rest.char_indices() {
+        match (in_string, escaped, c) {
+            (true, true, _) => escaped = false,
+            (true, false, '\\') => escaped = true,
+            (true, false, '"') => in_string = false,
+            (true, false, _) => {}
+            (false, _, '"') => in_string = true,
+            (false, _, '{') => depth += 1,
+            (false, _, '}') => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(&rest[..=at]);
+                }
+            }
+            _ => {}
+        }
+    }
+    bail!("data is not closed")
+}
+
+#[tokio::test]
+async fn numbers_in_data_come_back_exactly_as_published() -> anyhow::Result<()> {
+    const DATA: &str = r#"{"big":123456789012345678901234567890,"exp":1e2,"long":0.1234567890123456789012345678901234567890}"#;
+    let target = Target::start().await?;
+    let id = EventId::generate().to_string();
+    let body = format!(
+        r#"{{"id":"{id}","source":"e2e","type":"e2e.numbers","datacontenttype":"application/json","data":{DATA}}}"#
+    );
+
+    let response = target
+        .http
+        .post(target.messages_uri("facts.numbers"))
+        .bearer_auth(&target.token)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await?;
+    ensure!(
+        response.status() == StatusCode::CREATED,
+        "publish answered {}",
+        response.status()
+    );
+    let published = response.text().await?;
+    assert_eq!(raw_data(&published)?, DATA);
+
+    let response = target
+        .http
+        .get(format!("{}?offset=0", target.messages_uri("facts.numbers")))
+        .bearer_auth(&target.token)
+        .send()
+        .await?;
+    ensure!(
+        response.status() == StatusCode::OK,
+        "poll answered {}",
+        response.status()
+    );
+    let polled = response.text().await?;
+    assert_eq!(raw_data(&polled)?, DATA);
     Ok(())
 }
 
@@ -224,6 +293,33 @@ async fn a_request_without_the_token_is_refused() -> anyhow::Result<()> {
         .call(Method::GET, &format!("{}/healthz", target.base), None, None)
         .await?;
     assert_eq!(status, StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_wrong_method_is_refused_in_the_error_shape() -> anyhow::Result<()> {
+    let target = Target::start().await?;
+    let messages = target.messages_uri("alerts");
+    let routes = [
+        (Method::DELETE, messages),
+        (Method::GET, format!("{}/v1/principals/x", target.base)),
+        (Method::POST, format!("{}/healthz", target.base)),
+        (Method::PUT, format!("{}/v1/settings", target.base)),
+        (Method::POST, format!("{}/v1/events", target.base)),
+        (Method::GET, format!("{}/v1/webhooks/x", target.base)),
+    ];
+    for (method, uri) in routes {
+        for token in [Some(target.token.as_str()), None] {
+            let (status, response) = target.call(method.clone(), &uri, token, None).await?;
+            assert_eq!(
+                status,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {uri}: {response}"
+            );
+            assert_eq!(response["error"]["code"], "method_not_allowed");
+            assert!(response["error"]["message"].is_string(), "{response}");
+        }
+    }
     Ok(())
 }
 
@@ -358,6 +454,104 @@ async fn the_cli_publishes_then_polls() -> anyhow::Result<()> {
     )
     .await?;
     assert_eq!(only_line(&polled)?, published);
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_cli_keeps_numbers_in_data_exactly_as_published() -> anyhow::Result<()> {
+    const DATA: &str = r#"{"big":123456789012345678901234567890,"exp":1e2,"long":0.1234567890123456789012345678901234567890}"#;
+    let target = Target::start().await?;
+    let args = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+
+    let published = run_cli(
+        &target,
+        args(&[
+            "publish",
+            "--tenant",
+            &target.tenant,
+            "--topic",
+            "facts.numbers",
+            "--type",
+            "e2e.numbers",
+            "--source",
+            "e2e",
+            "--data",
+            DATA,
+        ]),
+    )
+    .await?;
+    ensure!(
+        published.status.success(),
+        "mansio failed: {}",
+        String::from_utf8_lossy(&published.stderr)
+    );
+    assert_eq!(raw_data(&String::from_utf8(published.stdout)?)?, DATA);
+
+    let polled = run_cli(
+        &target,
+        args(&[
+            "poll",
+            "--tenant",
+            &target.tenant,
+            "--topic",
+            "facts.numbers",
+            "--offset",
+            "0",
+            "--count",
+            "10",
+        ]),
+    )
+    .await?;
+    ensure!(
+        polled.status.success(),
+        "mansio failed: {}",
+        String::from_utf8_lossy(&polled.stderr)
+    );
+    assert_eq!(raw_data(&String::from_utf8(polled.stdout)?)?, DATA);
+    Ok(())
+}
+
+#[tokio::test]
+async fn multi_line_data_is_kept_on_one_line_with_its_numbers() -> anyhow::Result<()> {
+    const COMPACT: &str = r#"{"big":123456789012345678901234567890,"exp":1e2,"s":"a b"}"#;
+    let target = Target::start().await?;
+    let id = EventId::generate().to_string();
+    let body = format!(
+        "{{\"id\":\"{id}\",\"source\":\"e2e\",\"type\":\"e2e.numbers\",\"data\":{{\n  \"big\": 123456789012345678901234567890,\n  \"exp\": 1e2,\n  \"s\": \"a b\"\n}}}}"
+    );
+    let response = target
+        .http
+        .post(target.messages_uri("facts.numbers"))
+        .bearer_auth(&target.token)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await?;
+    ensure!(response.status() == StatusCode::CREATED, "publish refused");
+    assert_eq!(raw_data(&response.text().await?)?, COMPACT);
+
+    // The sink is JSON Lines: a record that spanned lines would not parse.
+    if let Some(records) = target.sink_records()? {
+        assert_eq!(records.len(), 1);
+    }
+
+    // The CLI prints one object per line.
+    let words = [
+        "poll",
+        "--tenant",
+        &target.tenant,
+        "--topic",
+        "facts.numbers",
+        "--offset",
+        "0",
+        "--count",
+        "10",
+    ];
+    let polled = run_cli(&target, words.iter().map(|w| (*w).to_owned()).collect()).await?;
+    ensure!(polled.status.success(), "mansio poll failed");
+    let out = String::from_utf8(polled.stdout)?;
+    assert_eq!(out.trim_end().lines().count(), 1, "{out}");
+    assert_eq!(raw_data(&out)?, COMPACT);
     Ok(())
 }
 
