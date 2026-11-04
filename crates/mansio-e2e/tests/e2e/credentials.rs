@@ -13,7 +13,7 @@ use mansio_core::{Envelope, EventId, Timestamp};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
-use crate::harness::{Outcome, SLACK, Target, job, millis};
+use crate::harness::{DataValue, Outcome, SLACK, Target, job, millis};
 
 const ONE_MINUTE: Duration = Duration::from_secs(60);
 
@@ -43,8 +43,7 @@ fn principal_facts(facts: &[Envelope]) -> Vec<(String, String, Option<String>)> 
                     .unwrap_or_default(),
                 fact.data
                     .as_ref()
-                    .and_then(|data| data["reason"].as_str())
-                    .map(str::to_owned),
+                    .and_then(|data| data.value()["reason"].as_str().map(str::to_owned)),
             )
         })
         .collect()
@@ -1023,7 +1022,7 @@ async fn the_facts_about_a_credential_name_no_secret_and_the_sink_has_them_first
     assert_eq!(created.event_type.as_str(), "mansio.principal.created");
     assert_eq!(created.principal.to_string(), "service:mansio");
     assert_eq!(created.tenant.as_str(), target.tenant);
-    let data = created.data.as_ref().context("data")?;
+    let data = created.data.as_ref().context("data")?.value();
     assert_eq!(data["principal"]["id"], json!(agent.id));
     assert_eq!(data["principal"]["kind"], "agent");
     assert_eq!(data["principal"]["name"], "builder-1");
@@ -1201,7 +1200,7 @@ async fn revoking_a_principal_ends_its_leases_and_the_item_is_retried_after_the_
         ["claimed", "extended", "expired", "retried", "claimed"]
     );
     let facts = target.read("facts.work").await?;
-    let expired = facts[2].data.as_ref().context("data")?;
+    let expired = facts[2].data.as_ref().context("data")?.value();
     assert_eq!(expired["reason"], "revoked");
     assert_eq!(expired["holder"], "agent:builder-1");
     assert_eq!(expired["next"], "retry");

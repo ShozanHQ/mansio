@@ -7,6 +7,7 @@
 //! `--lease-id` is `lease_id`. What an operation prints is JSON, one object
 //! per line.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
@@ -17,9 +18,10 @@ use mansio_core::{
     WebhookId,
 };
 use reqwest::Method;
+use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 
-use crate::client::{Client, Replay};
+use crate::client::{Client, Json, Replay};
 
 /// What an operation does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,7 +72,9 @@ pub enum Kind {
     Text,
     /// A whole number, zero or more.
     Int,
-    /// Any JSON value. On the command line it is written as JSON.
+    /// Any JSON value. On the command line it is written as JSON. In the
+    /// arguments of a call it is a `Value::String` holding the JSON text, so
+    /// that a number in it is never read into a type that rewrites it.
     Json,
     /// The scopes of a principal: a list of `{"topic", "verbs"}`. On the
     /// command line it is written as JSON.
@@ -540,7 +544,12 @@ fn kind_ok(param: &Param, value: &Value) -> anyhow::Result<()> {
             Value::String(text) if text.trim().parse::<u64>().is_ok() => Ok(()),
             _ => bail!("{name} must be a whole number, zero or more"),
         },
-        Kind::Json => Ok(()),
+        Kind::Json => match value {
+            Value::String(text) => RawValue::from_string(text.clone())
+                .map(drop)
+                .map_err(|reason| anyhow::anyhow!("{name} must be JSON: {reason}")),
+            _ => bail!("{name} must be JSON text"),
+        },
         Kind::Scopes => match serde_json::from_value::<Vec<Grant>>(value.clone()) {
             Ok(_) => Ok(()),
             Err(reason) => bail!("{name} must be a list of {{\"topic\", \"verbs\"}}: {reason}"),
@@ -563,58 +572,56 @@ pub struct WatchArgs {
     pub limit: Option<u64>,
 }
 
-/// The attributes of an envelope that a client sets.
-fn envelope_body(args: &Args<'_>) -> anyhow::Result<Value> {
-    let mut body = Map::new();
-    let mut put = |name: &str, value: String| {
-        body.insert(name.to_owned(), Value::String(value));
+/// The attributes of an envelope that a client sets, as JSON text. `data`
+/// travels as the text it was given in (see [`Kind::Json`]), so its numbers
+/// are sent exactly as written.
+fn envelope_body(args: &Args<'_>) -> anyhow::Result<Vec<u8>> {
+    let mut body: BTreeMap<&str, Json> = BTreeMap::new();
+    let mut put = |name: &'static str, value: String| -> anyhow::Result<()> {
+        body.insert(name, serde_json::value::to_raw_value(&value)?);
+        Ok(())
     };
-    put("source", args.parse::<Source>("source")?.to_string());
-    put("type", args.parse::<EventType>("type")?.to_string());
+    put("source", args.parse::<Source>("source")?.to_string())?;
+    put("type", args.parse::<EventType>("type")?.to_string())?;
     if let Some(subject) = args.parse_opt::<Subject>("subject")? {
-        put("subject", subject.to_string());
+        put("subject", subject.to_string())?;
     }
     if let Some(id) = args.parse_opt::<CorrelationId>("correlation_id")? {
-        put("correlationid", id.to_string());
+        put("correlationid", id.to_string())?;
     }
     if let Some(id) = args.parse_opt::<CausationId>("causation_id")? {
-        put("causationid", id.to_string());
+        put("causationid", id.to_string())?;
     }
     if let Some(key) = args.parse_opt::<IdempotencyKey>("idempotency_key")? {
-        put("idempotencykey", key.to_string());
+        put("idempotencykey", key.to_string())?;
     }
     if let Some(id) = args.parse_opt::<EventId>("id")? {
-        put("id", id.to_string());
+        put("id", id.to_string())?;
     }
-    if let Some(data) = args.get("data") {
-        body.insert(
-            "datacontenttype".to_owned(),
-            Value::String("application/json".to_owned()),
-        );
-        body.insert("data".to_owned(), data.clone());
+    if let Some(text) = args.text("data") {
+        put("datacontenttype", "application/json".to_owned())?;
+        body.insert("data", RawValue::from_string(text.to_owned())?);
     }
-    Ok(Value::Object(body))
+    Ok(serde_json::to_vec(&body)?)
 }
 
 /// What the server answered, or the failure of an answer with nothing in it.
-fn answered(reply: Option<Value>, what: &str) -> anyhow::Result<Value> {
+fn answered(reply: Option<Json>, what: &str) -> anyhow::Result<Json> {
     reply.with_context(|| format!("the server answered {what} with nothing"))
 }
 
 /// A member of an answer.
-fn member(mut answer: Value, name: &str) -> anyhow::Result<Value> {
-    answer
-        .get_mut(name)
-        .map(Value::take)
+fn member(answer: &RawValue, name: &str) -> anyhow::Result<Json> {
+    serde_json::from_str::<BTreeMap<String, Json>>(answer.get())
+        .ok()
+        .and_then(|mut members| members.remove(name))
         .with_context(|| format!("the server's answer has no {name}"))
 }
 
 /// The items of a list in an answer.
-fn items(answer: Value, name: &str) -> anyhow::Result<Vec<Value>> {
-    match member(answer, name)? {
-        Value::Array(items) => Ok(items),
-        _ => bail!("the server's {name} is not a list"),
-    }
+fn items(answer: &RawValue, name: &str) -> anyhow::Result<Vec<Json>> {
+    serde_json::from_str(member(answer, name)?.get())
+        .map_err(|_| anyhow::anyhow!("the server's {name} is not a list"))
 }
 
 /// Read a topic from `offset`, with each message's offset. `watch` needs them
@@ -629,7 +636,7 @@ pub async fn read_messages(
     topic: &Topic,
     offset: u64,
     count: Option<u64>,
-) -> anyhow::Result<Vec<(u64, Value)>> {
+) -> anyhow::Result<Vec<(u64, Json)>> {
     let mut query = vec![("offset", offset.to_string())];
     if let Some(count) = count {
         query.push(("count", count.to_string()));
@@ -650,14 +657,14 @@ pub async fn read_messages(
             Replay::Safe,
         )
         .await?;
-    items(answered(reply, "poll")?, "messages")?
+    items(&answered(reply, "poll")?, "messages")?
         .into_iter()
         .map(|message| {
-            let at = message
-                .get("offset")
-                .and_then(Value::as_u64)
+            let at = serde_json::from_str::<Value>(member(&message, "offset")?.get())
+                .ok()
+                .and_then(|offset| offset.as_u64())
                 .context("a message in the answer has no offset")?;
-            Ok((at, member(message, "envelope")?))
+            Ok((at, member(&message, "envelope")?))
         })
         .collect()
 }
@@ -672,7 +679,7 @@ pub async fn consumer_state(
     tenant: &TenantId,
     topic: &Topic,
     consumer: &ConsumerName,
-) -> anyhow::Result<Value> {
+) -> anyhow::Result<Json> {
     let reply = client
         .call(
             Method::GET,
@@ -704,7 +711,7 @@ pub async fn consumer_commit(
     topic: &Topic,
     consumer: &ConsumerName,
     offset: u64,
-) -> anyhow::Result<Value> {
+) -> anyhow::Result<Json> {
     let reply = client
         .call(
             Method::POST,
@@ -738,7 +745,7 @@ pub async fn run(
     client: &Client,
     op: Op,
     values: &Map<String, Value>,
-) -> anyhow::Result<Vec<Value>> {
+) -> anyhow::Result<Vec<Json>> {
     let args = Args::check(op, values)?;
     match op {
         Op::Watch => bail!("watch streams, and is not run as a single call"),
@@ -746,7 +753,7 @@ pub async fn run(
             let tenant: TenantId = args.parse("tenant")?;
             let topic: Topic = args.parse("topic")?;
             let reply = client
-                .call(
+                .call_bytes(
                     Method::POST,
                     &[
                         "v1",
@@ -757,11 +764,11 @@ pub async fn run(
                         "messages",
                     ],
                     &[],
-                    Some(&envelope_body(&args)?),
+                    Some(envelope_body(&args)?),
                     Replay::Unsafe,
                 )
                 .await?;
-            Ok(vec![member(answered(reply, "publish")?, "envelope")?])
+            Ok(vec![member(&answered(reply, "publish")?, "envelope")?])
         }
         Op::Poll => {
             let tenant: TenantId = args.parse("tenant")?;
@@ -780,7 +787,7 @@ pub async fn run(
             let tenant: TenantId = args.parse("tenant")?;
             let queue: Segment = args.parse("queue")?;
             let reply = client
-                .call(
+                .call_bytes(
                     Method::POST,
                     &[
                         "v1",
@@ -791,11 +798,11 @@ pub async fn run(
                         "items",
                     ],
                     &[],
-                    Some(&envelope_body(&args)?),
+                    Some(envelope_body(&args)?),
                     Replay::Unsafe,
                 )
                 .await?;
-            Ok(vec![member(answered(reply, "work_publish")?, "envelope")?])
+            Ok(vec![member(&answered(reply, "work_publish")?, "envelope")?])
         }
         Op::WorkPull => work_pull(client, &args).await,
         // An extension done twice leaves the lease running to the later of the
@@ -818,16 +825,16 @@ pub async fn run(
         Op::AlertsPublish => {
             let tenant: TenantId = args.parse("tenant")?;
             let reply = client
-                .call(
+                .call_bytes(
                     Method::POST,
                     &["v1", "tenants", tenant.as_str(), "alerts"],
                     &[],
-                    Some(&envelope_body(&args)?),
+                    Some(envelope_body(&args)?),
                     Replay::Unsafe,
                 )
                 .await?;
             Ok(vec![member(
-                answered(reply, "alerts_publish")?,
+                &answered(reply, "alerts_publish")?,
                 "envelope",
             )?])
         }
@@ -850,7 +857,7 @@ pub async fn run(
                     Replay::Unsafe,
                 )
                 .await?;
-            Ok(vec![member(answered(reply, "alerts_ack")?, "envelope")?])
+            Ok(vec![member(&answered(reply, "alerts_ack")?, "envelope")?])
         }
         Op::PrincipalsCreate => {
             let request = CreatePrincipal {
@@ -889,7 +896,7 @@ pub async fn run(
                     Replay::Safe,
                 )
                 .await?;
-            items(answered(reply, "principals_list")?, "principals")
+            items(&answered(reply, "principals_list")?, "principals")
         }
         Op::PrincipalsRevoke => {
             let id: PrincipalId = args.parse("id")?;
@@ -933,7 +940,7 @@ pub async fn run(
             let reply = client
                 .call(Method::GET, &["v1", "webhooks"], &query, None, Replay::Safe)
                 .await?;
-            items(answered(reply, "webhooks_list")?, "webhooks")
+            items(&answered(reply, "webhooks_list")?, "webhooks")
         }
         Op::WebhooksDelete => {
             let id: WebhookId = args.parse("id")?;
@@ -980,7 +987,7 @@ async fn lease_call(
     verb: &str,
     extra: &[(&str, Value)],
     replay: Replay,
-) -> anyhow::Result<Vec<Value>> {
+) -> anyhow::Result<Vec<Json>> {
     let tenant: TenantId = args.parse("tenant")?;
     let queue: Segment = args.parse("queue")?;
     let item = args.text("item").context("item is required")?;
@@ -1008,13 +1015,13 @@ async fn lease_call(
             replay,
         )
         .await?;
-    Ok(vec![member(answered(reply, &op.name())?, "envelope")?])
+    Ok(vec![member(&answered(reply, &op.name())?, "envelope")?])
 }
 
 /// `work_pull`, looking again every poll interval until an item is claimed or
 /// `wait` seconds have passed. A pull is safe to repeat: a consumer that holds
 /// a lease is given it again, so a lost answer costs nothing.
-async fn work_pull(client: &Client, args: &Args<'_>) -> anyhow::Result<Vec<Value>> {
+async fn work_pull(client: &Client, args: &Args<'_>) -> anyhow::Result<Vec<Json>> {
     let tenant: TenantId = args.parse("tenant")?;
     let queue: Segment = args.parse("queue")?;
     let consumer: ConsumerName = args.parse("consumer")?;
@@ -1307,7 +1314,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(printed, [json!({"type": "mansio.work.extended"})]);
+        assert_eq!(printed.len(), 1);
+        assert_eq!(printed[0].get(), r#"{"type":"mansio.work.extended"}"#);
         let seen = seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 2, "one lost, one answered");
         for request in &seen {
@@ -1346,22 +1354,29 @@ mod tests {
             "topic": "facts.build",
             "type": "build.done",
             "source": "ci",
-            "data": {"ok": true},
+            "data": r#"{"big":123456789012345678901234567890,"exp":1e2,"long":0.1234567890123456789012345678901234567890}"#,
             "correlation_id": "c1",
             "id": "0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3",
         }));
         let args = Args::check(Op::Publish, &values).unwrap();
+        // The numbers of `data` go out as written.
         assert_eq!(
-            envelope_body(&args).unwrap(),
-            json!({
-                "source": "ci",
-                "type": "build.done",
-                "correlationid": "c1",
-                "id": "0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3",
-                "datacontenttype": "application/json",
-                "data": {"ok": true}
-            })
+            String::from_utf8(envelope_body(&args).unwrap()).unwrap(),
+            concat!(
+                r#"{"correlationid":"c1","data":{"big":123456789012345678901234567890,"exp":1e2,"long":0.1234567890123456789012345678901234567890},"#,
+                r#""datacontenttype":"application/json","id":"0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3","#,
+                r#""source":"ci","type":"build.done"}"#
+            )
         );
+    }
+
+    #[test]
+    fn data_that_is_not_json_is_refused() {
+        let values = object(json!({
+            "tenant": "acme", "topic": "facts.build", "type": "t", "source": "s",
+            "data": "{not json",
+        }));
+        assert!(Args::check(Op::Publish, &values).is_err());
     }
 
     #[test]

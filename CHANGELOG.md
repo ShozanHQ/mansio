@@ -146,6 +146,11 @@ All notable changes to mansio are listed here. The format follows
 
 ### Changed
 
+- An envelope's `data` comes back exactly as published: an integer wider than
+  64 bits, `1e2` and a long decimal keep their digits, through the HTTP API, the
+  CLI and the MCP tools, on the memory and Iggy backends. Only the whitespace
+  outside strings is removed, so a record stays on one line.
+
 - A `work_pull` by a consumer that holds a live lease on the queue returns that
   lease again instead of claiming another item, so a claim whose answer was
   lost can be asked for again. A server restarted since the claim cannot say

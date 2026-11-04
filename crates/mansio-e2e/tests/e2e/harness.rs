@@ -678,6 +678,15 @@ impl Target {
         self.authed(Method::POST, &uri, None).await
     }
 
+    /// `alert_ack`, answered with the bytes as the server wrote them, so that
+    /// `data` is not passed through a `Value`.
+    pub async fn alert_ack_bytes(&self, alert: &str) -> anyhow::Result<(StatusCode, Vec<u8>)> {
+        let uri = self.tenant_uri(&format!("alerts/{alert}/ack"));
+        let response = self.http.post(uri).bearer_auth(&self.token).send().await?;
+        let status = response.status();
+        Ok((status, response.bytes().await?.to_vec()))
+    }
+
     /// What the sink recorded for this tenant, in order, or `None` if the
     /// sink cannot be read from here.
     pub fn sink_records(&self) -> anyhow::Result<Option<Vec<Envelope>>> {
@@ -1432,9 +1441,27 @@ pub fn extended_to(fact: &Published) -> anyhow::Result<i64> {
         .envelope
         .data
         .as_ref()
-        .and_then(|data| data.get("expires_at"))
+        .and_then(|data| data.value().get("expires_at").cloned())
         .context("an extended fact says where the lease ends")?;
     millis(&serde_json::from_value(ends.clone())?)
+}
+
+/// An envelope's `data` read as a `Value` to look at a member. Numbers read
+/// this way are only as exact as a `Value` is; compare `Data::as_str` to
+/// check what was published.
+pub trait DataValue {
+    /// The data as a `Value`.
+    fn value(&self) -> Value;
+}
+
+impl DataValue for mansio_core::Data {
+    #[expect(
+        clippy::expect_used,
+        reason = "Data is valid JSON by construction, and a test helper fails loudly"
+    )]
+    fn value(&self) -> Value {
+        self.parse().expect("data is JSON")
+    }
 }
 
 /// A work item body with a type and a payload.

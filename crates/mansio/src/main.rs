@@ -17,7 +17,7 @@ use cli::Chosen;
 use client::Client;
 
 #[expect(clippy::print_stdout, reason = "the CLI prints its results to stdout")]
-fn print(lines: &[serde_json::Value]) {
+fn print(lines: &[client::Json]) {
     for line in lines {
         println!("{line}");
     }

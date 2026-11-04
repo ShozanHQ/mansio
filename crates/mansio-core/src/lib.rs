@@ -24,6 +24,7 @@ pub use broker::{
 pub use credential::{Credential, CredentialDigest};
 pub use envelope::{
     ApprovalState, Budget, Data, DataContentType, Envelope, Hash, Record, Scope, Timestamp,
+    compact_json,
 };
 pub use error::{BrokerError, EnvelopeError, ParseError, SinkError};
 pub use id::{

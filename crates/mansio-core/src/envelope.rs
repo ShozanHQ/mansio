@@ -8,7 +8,6 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::str::FromStr;
-use std::sync::OnceLock;
 
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -135,16 +134,11 @@ impl fmt::Display for DataContentType {
 #[derive(Debug, Clone)]
 pub struct Data {
     raw: Box<RawValue>,
-    /// The same JSON as a [`Value`], made the first time it is indexed.
-    parsed: OnceLock<Value>,
 }
 
 impl Data {
     fn from_raw(raw: Box<RawValue>) -> Self {
-        Self {
-            raw,
-            parsed: OnceLock::new(),
-        }
+        Self { raw }
     }
 
     /// Data from any serializable value.
@@ -188,24 +182,42 @@ impl Serialize for Data {
 
 impl<'de> Deserialize<'de> for Data {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Box::<RawValue>::deserialize(deserializer).map(Self::from_raw)
+        let raw = Box::<RawValue>::deserialize(deserializer)?;
+        RawValue::from_string(compact_json(raw.get()))
+            .map(Self::from_raw)
+            .map_err(serde::de::Error::custom)
     }
+}
+
+/// Remove the whitespace outside strings from valid JSON text, so the record
+/// stays on one line. Every number and string is left as written.
+#[must_use]
+pub fn compact_json(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let (mut in_string, mut escaped) = (false, false);
+    for c in text.chars() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else if c == '"' {
+            in_string = true;
+            out.push(c);
+        } else if !matches!(c, ' ' | '\t' | '\n' | '\r') {
+            out.push(c);
+        }
+    }
+    out
 }
 
 impl fmt::Display for Data {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-/// The data read as a [`Value`], for looking at a member: numbers read this
-/// way are only as exact as a `Value` is. [`Data::as_str`] is what was sent.
-impl std::ops::Deref for Data {
-    type Target = Value;
-
-    fn deref(&self) -> &Value {
-        self.parsed
-            .get_or_init(|| serde_json::from_str(self.as_str()).unwrap_or(Value::Null))
     }
 }
 
@@ -710,6 +722,16 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn data_is_compacted_to_one_line_and_numbers_stay() {
+        let text = "{\"data\": {\n  \"a\": 123456789012345678901234567890,\n  \"b\": 1e2,\n  \"s\": \" x\\\" \\n y \"\n}}";
+        let m: std::collections::BTreeMap<String, Data> = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            m["data"].as_str(),
+            "{\"a\":123456789012345678901234567890,\"b\":1e2,\"s\":\" x\\\" \\n y \"}"
+        );
+    }
 
     const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const HASH_B: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";

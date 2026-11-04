@@ -14,6 +14,11 @@ use anyhow::{Context, bail};
 use reqwest::{Method, StatusCode, Url};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
+use serde_json::value::RawValue;
+
+/// An answer, or a part of one, as the JSON text it arrived as: a number in
+/// an envelope's `data` is never parsed, so it is printed as it was published.
+pub type Json = Box<RawValue>;
 
 /// The default server address: a local `mansio-server`.
 pub const DEFAULT_URL: &str = "http://127.0.0.1:7070";
@@ -143,7 +148,25 @@ impl Client {
         query: &[(&str, String)],
         body: Option<&Value>,
         replay: Replay,
-    ) -> anyhow::Result<Option<Value>> {
+    ) -> anyhow::Result<Option<Json>> {
+        let body = body.map(serde_json::to_vec).transpose()?;
+        self.call_bytes(method, segments, query, body, replay).await
+    }
+
+    /// [`Client::call`] with a body that is already JSON text, as one that
+    /// carries an envelope's `data` is.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::call`].
+    pub async fn call_bytes(
+        &self,
+        method: Method,
+        segments: &[&str],
+        query: &[(&str, String)],
+        body: Option<Vec<u8>>,
+        replay: Replay,
+    ) -> anyhow::Result<Option<Json>> {
         let url = self.url(segments)?;
         let mut attempt = 0_u32;
         loop {
@@ -152,8 +175,10 @@ impl Client {
                 .request(method.clone(), url.clone())
                 .bearer_auth(self.token.expose_secret())
                 .query(query);
-            if let Some(body) = body {
-                request = request.json(body);
+            if let Some(body) = &body {
+                request = request
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body.clone());
             }
             match send(request).await {
                 Ok((status, bytes)) => return answer(status, &bytes),
@@ -185,7 +210,7 @@ fn may_retry(error: &reqwest::Error, replay: Replay) -> bool {
 }
 
 /// The body of a successful answer, or the server's reason for refusing.
-fn answer(status: StatusCode, bytes: &[u8]) -> anyhow::Result<Option<Value>> {
+fn answer(status: StatusCode, bytes: &[u8]) -> anyhow::Result<Option<Json>> {
     if status == StatusCode::NO_CONTENT {
         return Ok(None);
     }
@@ -216,6 +241,14 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    /// An answer is kept as the text it came as, not read into numbers.
+    #[test]
+    fn an_answer_keeps_its_numbers_as_written() {
+        const TEXT: &str = r#"{"big":123456789012345678901234567890,"exp":1e2,"long":0.1234567890123456789012345678901234567890}"#;
+        let read = answer(StatusCode::OK, TEXT.as_bytes()).unwrap().unwrap();
+        assert_eq!(read.get(), TEXT);
+    }
 
     fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
         let map: std::collections::HashMap<String, String> = pairs
@@ -314,10 +347,10 @@ mod tests {
             refusal(StatusCode::BAD_GATEWAY, b"<html>"),
             "refused (502 Bad Gateway)"
         );
-        assert_eq!(answer(StatusCode::NO_CONTENT, b"").unwrap(), None);
+        assert!(answer(StatusCode::NO_CONTENT, b"").unwrap().is_none());
         assert_eq!(
-            answer(StatusCode::OK, b"{\"a\":1}").unwrap(),
-            Some(json!({"a": 1}))
+            answer(StatusCode::OK, b"{\"a\":1}").unwrap().unwrap().get(),
+            r#"{"a":1}"#
         );
         assert!(answer(StatusCode::OK, b"nope").is_err());
         assert!(answer(StatusCode::NOT_FOUND, b"").is_err());
@@ -371,7 +404,7 @@ mod tests {
             .call(Method::GET, &["v1", "x"], &[], None, Replay::Safe)
             .await
             .unwrap();
-        assert_eq!(answer, Some(json!({"ok": true})));
+        assert_eq!(answer.unwrap().get(), r#"{"ok":true}"#);
         assert_eq!(seen.load(Ordering::SeqCst), 3, "two lost, one answered");
     }
 
@@ -453,6 +486,6 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(answered, Some(json!({})));
+        assert_eq!(answered.unwrap().get(), "{}");
     }
 }
