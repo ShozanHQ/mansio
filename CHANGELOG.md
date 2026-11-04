@@ -7,6 +7,11 @@ All notable changes to mansio are listed here. The format follows
 
 ### Added
 
+- `MANSIO_IGGY_PRESENCE_SEGMENT_SIZE_BYTES` (default 1 MiB): `presence` topics
+  get a small segment, so their retention holds on a quiet server. The README
+  says retention is a minimum, bounded by segment size, for every kind of
+  topic. A CI e2e checks that a heartbeat is gone after retention and a roll. A segment size applies when a topic is created, so existing
+  `presence` topics keep their 1 GiB segments until they are recreated.
 - `MANSIO_SINK_SYNC` (default `true`) is a setting. The file sink calls `sync_data` after every record before
   `record` returns; `false` skips it, for development only.
 - A publish with an `idempotencykey` that the tenant's topic has already seen
