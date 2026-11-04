@@ -10,9 +10,9 @@ use std::sync::Arc;
 use anyhow::Context;
 use mansio_core::{Broker, BrokerError, MemoryBroker, NoSink, Sink};
 use mansio_iggy::{IggyBroker, Provisioned, provision_admin};
-use mansio_server::{Auth, Backend, FileSink, Server, Settings};
+use mansio_server::{Auth, Backend, FileSink, Server, Settings, retention_warning};
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -51,6 +51,9 @@ async fn serve() -> anyhow::Result<()> {
     let broker_name = settings.broker.name();
     let broker: Arc<dyn Broker> = match settings.broker {
         Backend::Iggy(iggy) => {
+            if let Some(warning) = retention_warning(&iggy.retention) {
+                warn!("{warning}");
+            }
             let user = iggy.username.clone();
             let connected = IggyBroker::connect(iggy).await;
             Arc::new(connected.map_err(|error| connect_error(error, &user))?)
@@ -77,7 +80,11 @@ async fn serve() -> anyhow::Result<()> {
         "mansio-server started"
     );
 
-    Server::new(broker, Auth::new(settings.token, settings.token_principal))
+    let mut server = Server::new(broker, Auth::new(settings.token, settings.token_principal));
+    if let Some(dir) = &settings.snapshot_dir {
+        server = server.with_snapshot_dir(dir);
+    }
+    server
         .with_sink(sink)
         .with_limits(settings.limits)
         .with_work_settings(settings.work)

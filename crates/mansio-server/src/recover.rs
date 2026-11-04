@@ -24,7 +24,7 @@ use tracing::warn;
 
 use crate::error::ApiError;
 use crate::facts::Facts;
-use crate::state::{Lease, Phase, Queue, Then};
+use crate::state::{Item, Lease, Phase, Queue, Then};
 use crate::tail::Tail;
 
 /// Everything the engine reads from a tenant's topics, each in publish order.
@@ -35,6 +35,9 @@ pub(crate) struct Logs {
     pub(crate) dead: Vec<Stored>,
     pub(crate) alerts: Vec<Stored>,
     pub(crate) facts_alert: Vec<Stored>,
+    /// For each topic read, the offset after the last message read: where a
+    /// reader that has all of it goes on from.
+    pub(crate) ends: HashMap<Topic, u64>,
 }
 
 /// The state rebuilt from the logs.
@@ -47,18 +50,42 @@ pub(crate) struct Rebuilt {
     pub(crate) acknowledged_alerts: HashSet<EventId>,
 }
 
-/// Read, in pages of `page`, every topic the engine replays.
+impl Logs {
+    /// How many messages were read.
+    pub(crate) fn len(&self) -> usize {
+        self.work.values().map(Vec::len).sum::<usize>()
+            + self.facts_work.len()
+            + self.dead.len()
+            + self.alerts.len()
+            + self.facts_alert.len()
+    }
+}
+
+/// Whether the engine replays the topic.
+pub(crate) fn is_replayed(topic: &Topic) -> bool {
+    match topic {
+        Topic::Work(_) | Topic::Dead | Topic::Alerts => true,
+        Topic::Facts(_) => *topic == Topic::facts_work() || *topic == Topic::facts_alert(),
+        Topic::Presence => false,
+    }
+}
+
+/// Read, in pages of `page`, every topic the engine replays, each from its
+/// offset in `from` or from the start if it has none.
 pub(crate) async fn read_logs(
     broker: &Arc<dyn Broker>,
     tenant: &TenantId,
     topics: &[Topic],
     page: u32,
+    from: &HashMap<Topic, u64>,
 ) -> Result<Logs, BrokerError> {
     let mut logs = Logs::default();
-    for topic in topics {
+    for topic in topics.iter().filter(|topic| is_replayed(topic)) {
+        let start = from.get(topic).copied().unwrap_or(0);
+        let (messages, end) = read_all(broker, tenant, topic, start, page).await?;
+        logs.ends.insert(topic.clone(), end);
         let target = match topic {
             Topic::Work(queue) => {
-                let messages = read_all(broker, tenant, topic, page).await?;
                 logs.work.insert(queue.clone(), messages);
                 continue;
             }
@@ -68,21 +95,28 @@ pub(crate) async fn read_logs(
             Topic::Facts(_) if *topic == Topic::facts_alert() => &mut logs.facts_alert,
             Topic::Facts(_) | Topic::Presence => continue,
         };
-        *target = read_all(broker, tenant, topic, page).await?;
+        *target = messages;
     }
     Ok(logs)
 }
 
-/// Every message of the topic, in order, read page by page by the reader the
-/// event streams and webhooks use, which steps over a message that cannot be
-/// read.
+/// Every message of the topic from `from` on, in order, read page by page by
+/// the reader the event streams and webhooks use, which steps over a message
+/// that cannot be read, and the offset after the last.
 async fn read_all(
     broker: &Arc<dyn Broker>,
     tenant: &TenantId,
     topic: &Topic,
+    from: u64,
     page: u32,
-) -> Result<Vec<Stored>, BrokerError> {
-    let mut tail = Tail::new(Arc::clone(broker), tenant.clone(), topic.clone(), 0, page);
+) -> Result<(Vec<Stored>, u64), BrokerError> {
+    let mut tail = Tail::new(
+        Arc::clone(broker),
+        tenant.clone(),
+        topic.clone(),
+        from,
+        page,
+    );
     let mut all = Vec::new();
     loop {
         let before = tail.next();
@@ -96,7 +130,44 @@ async fn read_all(
         }
         all.extend(batch);
     }
-    Ok(all)
+    Ok((all, tail.next()))
+}
+
+/// Whether the broker holds a message at or after `offset - 1` in each topic
+/// the snapshot says it covers up to `offset`. A topic that ends before that
+/// is not the one the snapshot was made from, and what the snapshot says about
+/// it cannot be trusted.
+///
+/// # Errors
+///
+/// Returns the first topic that fails the check, with why, or the broker's
+/// error as text.
+pub(crate) async fn check_offsets(
+    broker: &Arc<dyn Broker>,
+    tenant: &TenantId,
+    offsets: &HashMap<Topic, u64>,
+) -> Result<(), String> {
+    for (topic, next) in offsets {
+        if *next == 0 {
+            continue;
+        }
+        match broker
+            .poll(&Caller::Admin, tenant, topic, next.saturating_sub(1), 1)
+            .await
+        {
+            Ok(found) if found.is_empty() => {
+                return Err(format!(
+                    "{topic} ends before offset {next}, which the snapshot covers"
+                ));
+            }
+            Ok(_) | Err(BrokerError::Corrupt(_)) => {}
+            Err(BrokerError::NotFound(_)) => {
+                return Err(format!("{topic} is gone, and the snapshot covers it"));
+            }
+            Err(error) => return Err(format!("{topic} could not be read: {error}")),
+        }
+    }
+    Ok(())
 }
 
 /// A recorded transition of a work item.
@@ -166,14 +237,21 @@ fn newest_versions(messages: &[Stored]) -> Vec<(ItemId, &Stored)> {
 /// holder and the lease are those of the last `claimed` or `extended`, and so
 /// is the end of the lease, which each extension moved later. The lease began
 /// at the first `claimed`: a second one is the same lease given a new id by a
-/// restarted server.
-fn lease_of(recorded: &[&Fact], now: i64) -> Option<Lease> {
+/// restarted server. `prior` is the lease the item held in a snapshot, whose
+/// facts are not among `recorded`: it says when the lease began.
+fn lease_of(recorded: &[&Fact], prior: Option<&Lease>, now: i64) -> Option<Lease> {
     let held = |fact: &&&Fact| matches!(fact.event, WorkEvent::Claimed | WorkEvent::Extended);
     let latest = recorded.iter().rev().find(held)?;
-    let first = recorded
-        .iter()
-        .find(|fact| fact.event == WorkEvent::Claimed)
-        .unwrap_or(latest);
+    let claimed_at = prior.map_or_else(
+        || {
+            recorded
+                .iter()
+                .find(|fact| fact.event == WorkEvent::Claimed)
+                .unwrap_or(latest)
+                .at
+        },
+        |lease| lease.claimed_at,
+    );
     let data = &latest.data;
     Some(Lease {
         fingerprint: data.lease?,
@@ -184,7 +262,7 @@ fn lease_of(recorded: &[&Fact], now: i64) -> Option<Lease> {
             .expires_at
             .as_ref()
             .map_or(now, |at| millis(Some(at), now)),
-        claimed_at: first.at,
+        claimed_at,
     })
 }
 
@@ -205,6 +283,7 @@ impl Replay<'_> {
         item: &ItemId,
         newest: &Stored,
         recorded: &[&Fact],
+        prior: Option<&Lease>,
     ) -> Result<Option<Phase>, ApiError> {
         let message = &newest.envelope;
         let attempt = message.attempt.unwrap_or(1);
@@ -221,7 +300,7 @@ impl Replay<'_> {
             WorkEvent::Retried => Phase::Ready,
             WorkEvent::Acked | WorkEvent::Dead => return Ok(None),
             WorkEvent::Claimed | WorkEvent::Extended => {
-                lease_of(recorded, self.now).map_or(Phase::Ready, Phase::Leased)
+                lease_of(recorded, prior, self.now).map_or(Phase::Ready, Phase::Leased)
             }
             WorkEvent::Failed | WorkEvent::Expired => match last.data.next {
                 Some(Next::Dead) => self.dead_phase(queue, item, message, last.at)?,
@@ -282,7 +361,13 @@ impl Replay<'_> {
     }
 }
 
-/// Rebuild the state from the logs.
+/// Rebuild the state from the logs, or bring `base`, the state a snapshot
+/// holds, up to date with the messages after the snapshot.
+///
+/// With a `base`, `logs` hold only what came after it. A work message in them
+/// is a new item or a new version of one the base holds, and a fact is about
+/// an item the base holds or one the new messages made. Either way the item
+/// ends up where a rebuild from offset 0 would put it.
 ///
 /// # Errors
 ///
@@ -292,6 +377,7 @@ pub(crate) fn replay(
     logs: &Logs,
     facts: &Facts,
     now: i64,
+    base: Option<Rebuilt>,
 ) -> Result<Rebuilt, ApiError> {
     let recorded = work_facts(&logs.facts_work, now);
     let context = Replay {
@@ -305,26 +391,89 @@ pub(crate) fn replay(
         now,
     };
 
-    let mut rebuilt = Rebuilt::default();
+    let mut rebuilt = base.unwrap_or_default();
+    let mut handled: HashSet<(Segment, ItemId)> = HashSet::new();
     for (name, messages) in &logs.work {
-        let mut queue = Queue::default();
+        let queue = rebuilt.queues.entry(name.clone()).or_default();
         for (item, newest) in newest_versions(messages) {
             let attempt = newest.envelope.attempt.unwrap_or(1);
+            let held = queue.get(&item).map(Item::attempt);
+            if held.is_some_and(|held| held >= attempt) || (held.is_none() && queue.knows(&item)) {
+                // Finished, or the version the base holds: the facts say
+                // where it stands.
+                continue;
+            }
             let about_this_attempt: Vec<&Fact> = recorded
                 .get(&(name.clone(), item.clone()))
                 .into_iter()
                 .flatten()
                 .filter(|fact| fact.data.attempt == attempt)
                 .collect();
-            match context.phase(name, &item, newest, &about_this_attempt)? {
-                Some(phase) => queue.insert(item, newest.envelope.clone(), phase),
+            match context.phase(name, &item, newest, &about_this_attempt, None)? {
+                Some(phase) => queue.insert(item.clone(), newest.envelope.clone(), phase),
                 None => queue.finish(&item),
             }
+            handled.insert((name.clone(), item));
         }
-        rebuilt.queues.insert(name.clone(), queue);
+    }
+
+    // What the facts after the base say about the items it holds.
+    for ((name, item), about_item) in &recorded {
+        if handled.contains(&(name.clone(), item.clone())) {
+            continue;
+        }
+        let Some(queue) = rebuilt.queues.get_mut(name) else {
+            continue;
+        };
+        let Some(known) = queue.get(item) else {
+            continue;
+        };
+        let about_this_attempt: Vec<&Fact> = about_item
+            .iter()
+            .filter(|fact| fact.data.attempt == known.attempt())
+            .collect();
+        if about_this_attempt.is_empty() {
+            continue;
+        }
+        let prior = match &known.phase {
+            Phase::Leased(lease) => Some(lease.clone()),
+            _ => None,
+        };
+        let current = Stored {
+            offset: 0,
+            envelope: known.message.clone(),
+        };
+        match context.phase(name, item, &current, &about_this_attempt, prior.as_ref())? {
+            Some(phase) => queue.set_phase(item, phase),
+            None => queue.finish(item),
+        }
+    }
+
+    // An item that failed past the cap waits for its copy on `dead`, which
+    // may have come after the base.
+    for (name, queue) in &mut rebuilt.queues {
+        let waiting: Vec<(ItemId, Envelope, i64)> = queue
+            .iter()
+            .filter_map(|(id, item)| match item.phase {
+                Phase::Backoff {
+                    due,
+                    next: Next::Dead,
+                } => Some((id.clone(), item.message.clone(), due)),
+                _ => None,
+            })
+            .collect();
+        for (id, message, due) in waiting {
+            let phase = context.dead_phase(name, &id, &message, due)?;
+            if matches!(phase, Phase::Owed { .. }) {
+                queue.set_phase(&id, phase);
+            }
+        }
     }
 
     for alert in &logs.alerts {
+        if rebuilt.acknowledged_alerts.contains(&alert.envelope.id) {
+            continue;
+        }
         // The first copy of an alert is the alert. The time it carries is the
         // producer's, so one from the future counts from now.
         rebuilt
