@@ -3,7 +3,17 @@
 All notable changes to mansio are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## [Unreleased]
+
+### Added
+
+- A release pipeline: release-plz opens the release pull request, merging it
+  publishes the crates through crates.io trusted publishing and creates a
+  signed `vX.Y.Z` tag, and the release carries `mansio` archives for macOS,
+  Linux and Windows and a multi-arch `ghcr.io/shozanhq/mansio-server` image.
+  Every archive and the image have a build provenance attestation; the image is
+  signed with cosign and carries a CycloneDX SBOM. See "Verify a release" in the
+  README.
 
 ### Changed
 

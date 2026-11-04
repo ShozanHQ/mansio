@@ -1,0 +1,30 @@
+# release-plz: opens the release pull request (version bumps and CHANGELOG.md)
+# and publishes the crates. See .github/workflows/release.yml.
+#
+# release-plz neither tags nor creates the GitHub release. The release workflow
+# creates the tag itself, as an annotated tag through the API, which GitHub
+# signs; cargo-dist's archives and the image go on the release it creates.
+
+[workspace]
+# One changelog at the root, written by the `mansio` package below.
+changelog_update = false
+git_tag_enable = false
+git_release_enable = false
+# Used to find the commit of the last release. The tag is made by the workflow.
+git_tag_name = "v{{ version }}"
+# Fail the release pull request on a breaking change that the bump does not allow.
+semver_check = true
+pr_name = "chore: release v{{ version }}"
+
+[changelog]
+# The history is not in the conventional commit style (a squash commit's title
+# is the pull request's title), so every commit is listed, under one heading.
+conventional_commits = false
+filter_unconventional = false
+commit_parsers = [{ message = ".*", group = "Changed" }]
+
+[[package]]
+name = "mansio"
+changelog_update = true
+changelog_path = "./CHANGELOG.md"
+changelog_include = ["mansio-core", "mansio-iggy", "mansio-server"]

@@ -37,5 +37,9 @@ tracing-subscriber.workspace = true
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 
+# The server ships as an image, not as an archive.
+[package.metadata.dist]
+dist = false
+
 [lints]
 workspace = true
