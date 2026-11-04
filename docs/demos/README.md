@@ -14,8 +14,10 @@ which links prose to code.
 - Every row of "What shipped" links the code it describes with a reference: a
   path from the repository root in double square brackets, such as
   `[[crates/mansio-server/src/app.rs]]`, with an optional `#symbol` (only for a
-  symbol you found in that file) or `#L12-L30` line range. Pin a line range to
-  the commit you read it at, with `<sha>:` before the path, since lines move.
+  symbol you found in that file) or `#L12-L30` line range. Pin a line range
+  with `<sha>:` before the path, since lines move. The commit must be one that
+  changed the file, such as the last one (`git log -1 --format=%h -- <path>`);
+  the viewer shows the file as of that commit and refuses any other commit.
 - A design change, such as a new flow across services or a changed data path,
   gets a `services` or `mermaid diff` fence in its step. A bump or a fix does
   not.
