@@ -26,6 +26,7 @@ fn settings() -> WorkSettings {
         idempotency_max_keys: 3,
         recovery_log: Duration::from_secs(30),
         snapshot_interval: Duration::from_secs(60),
+        owner_ttl: Duration::ZERO,
     }
 }
 
@@ -3322,4 +3323,205 @@ async fn an_engine_without_a_store_keeps_no_snapshot_and_still_restarts() {
     rig.pass(1_000).await;
     let (picture, _) = restarted(&rig, None).await;
     assert_eq!(picture, rig.picture().await);
+}
+
+// ---- servers that share a broker ---------------------------------------------
+
+const OWNER_TTL: Duration = Duration::from_secs(8);
+
+/// Two servers on one broker, sink and clock, each told to share tenants.
+fn sharing_pair() -> (Rig, Rig) {
+    let broker: Arc<FlakyBroker> = Arc::default();
+    let sink: Arc<LogSink> = Arc::default();
+    let clock = Arc::new(ManualClock::new(START));
+    let server = || Rig {
+        broker: broker.clone(),
+        sink: sink.clone(),
+        clock: clock.clone(),
+        engine: Arc::new(Engine::new(
+            broker.clone(),
+            sink.clone(),
+            clock.clone(),
+            WorkSettings {
+                owner_ttl: OWNER_TTL,
+                ..settings()
+            },
+            3,
+        )),
+        pulls: AtomicU64::new(0),
+    };
+    (server(), server())
+}
+
+fn is_unavailable<T>(result: &Result<T, ApiError>) -> bool {
+    matches!(result, Err(ApiError::Unavailable(_)))
+}
+
+/// A pull by `who` under the consumer name, with whatever the engine answers.
+async fn raw_pull(rig: &Rig, who: &str, name: String) -> Result<Option<Claimed>, ApiError> {
+    rig.engine
+        .work_pull(&tenant(), &queue(), &agent(who), &consumer(&name))
+        .await
+}
+
+/// What the timer of a server does in `seconds` of the clock's time.
+async fn run_for(rig: &Rig, seconds: u64) {
+    for _ in 0..seconds {
+        rig.clock.advance(Duration::from_secs(1));
+        rig.engine.keep_ownership().await;
+        rig.engine.tick().await;
+    }
+}
+
+#[tokio::test]
+async fn a_tenant_is_served_by_one_server_and_no_item_is_claimed_by_two() {
+    let (a, b) = sharing_pair();
+    let first = a.publish_item("job").await;
+    for n in 0..9 {
+        a.publish_item(&format!("job-{n}")).await;
+    }
+
+    // The other server refuses anything for the tenant.
+    let refused = b
+        .engine
+        .work_publish(item_envelope(EventId::generate(), "elsewhere"))
+        .await;
+    assert!(is_unavailable(&refused), "{refused:?}");
+
+    // Pulls on both servers at once, under names of their own.
+    let mut claimed = Vec::new();
+    let mut refusals = 0;
+    for round in 0..8 {
+        let ((a1, a2, a3), (b1, b2, b3)) = tokio::join!(
+            async {
+                tokio::join!(
+                    raw_pull(&a, "x", format!("a{round}x1")),
+                    raw_pull(&a, "x", format!("a{round}x2")),
+                    raw_pull(&a, "x", format!("a{round}x3")),
+                )
+            },
+            async {
+                tokio::join!(
+                    raw_pull(&b, "y", format!("b{round}x1")),
+                    raw_pull(&b, "y", format!("b{round}x2")),
+                    raw_pull(&b, "y", format!("b{round}x3")),
+                )
+            }
+        );
+        for result in [a1, a2, a3] {
+            if let Some(claim) = result.unwrap() {
+                claimed.push(claim.item.item_id.unwrap());
+            }
+        }
+        for result in [b1, b2, b3] {
+            assert!(is_unavailable(&result), "{result:?}");
+            refusals += 1;
+        }
+    }
+    assert_eq!(refusals, 24);
+    let unique: HashSet<_> = claimed.iter().collect();
+    assert_eq!(unique.len(), claimed.len(), "an item was claimed twice");
+    assert_eq!(claimed.len(), 10, "every item was claimed");
+    assert!(claimed.contains(&first.to_string().parse().unwrap()));
+    assert_eq!(
+        a.transitions()
+            .await
+            .iter()
+            .filter(|t| *t == "claimed")
+            .count(),
+        10
+    );
+}
+
+#[tokio::test]
+async fn the_other_server_takes_a_tenant_over_when_its_server_stops_and_no_item_is_dropped() {
+    let (a, b) = sharing_pair();
+    for n in 0..4 {
+        a.publish_item(&format!("job-{n}")).await;
+    }
+    let done = a.pull("worker").await.unwrap();
+    a.ack(
+        "worker",
+        done.item.item_id.as_ref().unwrap(),
+        &done.lease_id,
+    )
+    .await
+    .unwrap();
+    // One is leased when the server stops, which is the end of it: it neither
+    // ticks nor gives anything up.
+    let held = a.pull("worker").await.unwrap();
+    let held_id = held.item.item_id.clone().unwrap();
+    drop(a);
+
+    // Until the time is up, the tenant is not the other's.
+    run_for(&b, 4).await;
+    let early = b
+        .engine
+        .work_pull(&tenant(), &queue(), &agent("y"), &consumer("early"))
+        .await;
+    assert!(is_unavailable(&early), "{early:?}");
+
+    // Within the ttl and an interval after that, it is.
+    let mut seconds = 4;
+    let mut again = Vec::new();
+    loop {
+        run_for(&b, 1).await;
+        seconds += 1;
+        assert!(seconds <= 8 + 2 + 10 + 2 + 5, "the items did not come back");
+        let name = consumer(&format!("late{seconds}"));
+        if let Ok(Some(claim)) = b
+            .engine
+            .work_pull(&tenant(), &queue(), &agent("y"), &name)
+            .await
+        {
+            let id = claim.item.item_id.clone().unwrap();
+            TAKEN_AS
+                .lock()
+                .unwrap()
+                .insert(claim.lease_id, claim.consumer.clone());
+            b.ack("y", &id, &claim.lease_id).await.unwrap();
+            again.push(id);
+        }
+        if again.len() == 3 {
+            break;
+        }
+    }
+    // The leased one came back after its lease, and nothing came back twice.
+    let unique: HashSet<_> = again.iter().collect();
+    assert_eq!(unique.len(), 3);
+    assert!(again.contains(&held_id));
+    assert!(!again.contains(done.item.item_id.as_ref().unwrap()));
+    let transitions = b.transitions().await;
+    assert_eq!(
+        transitions.iter().filter(|t| *t == "acked").count(),
+        4,
+        "{transitions:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_server_that_stops_in_order_gives_its_tenants_up_at_once() {
+    let (a, b) = sharing_pair();
+    a.publish_item("job").await;
+    let waiting = b
+        .engine
+        .work_pull(&tenant(), &queue(), &agent("y"), &consumer("w"))
+        .await;
+    assert!(is_unavailable(&waiting), "{waiting:?}");
+
+    a.engine.release_ownership().await;
+    // One round later, which is a quarter of the ttl, not the whole of it.
+    run_for(&b, 2).await;
+    let claim = b
+        .engine
+        .work_pull(&tenant(), &queue(), &agent("y"), &consumer("w"))
+        .await
+        .unwrap();
+    assert!(claim.is_some());
+    // The server that gave the tenant up no longer writes to it.
+    let late = a
+        .engine
+        .work_publish(item_envelope(EventId::generate(), "late"))
+        .await;
+    assert!(is_unavailable(&late), "{late:?}");
 }

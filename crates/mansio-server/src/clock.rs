@@ -1,7 +1,8 @@
 //! The clock the engine reads, so tests can move time by hand.
 
 use std::fmt::Debug;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// A source of the current time, in milliseconds since the Unix epoch.
 ///
@@ -11,6 +12,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub trait Clock: Send + Sync + Debug {
     /// Milliseconds since the Unix epoch.
     fn now_millis(&self) -> i64;
+
+    /// Milliseconds since some fixed point of this process, that never goes
+    /// back and is not moved when the system clock is set. For measuring how
+    /// long something has lasted, which is what the fence between servers does.
+    fn monotonic_millis(&self) -> i64;
 }
 
 /// The system clock.
@@ -25,6 +31,12 @@ impl Clock for SystemClock {
             .map_or(0, |since| {
                 i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
             })
+    }
+
+    fn monotonic_millis(&self) -> i64 {
+        static START: OnceLock<Instant> = OnceLock::new();
+        let start = START.get_or_init(Instant::now);
+        i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX)
     }
 }
 
@@ -70,6 +82,10 @@ pub(crate) mod manual {
         fn now_millis(&self) -> i64 {
             self.now.fetch_add(self.per_read, Ordering::SeqCst)
         }
+
+        fn monotonic_millis(&self) -> i64 {
+            self.now_millis()
+        }
     }
 }
 
@@ -80,5 +96,11 @@ mod tests {
     #[test]
     fn the_system_clock_is_after_2026() {
         assert!(SystemClock.now_millis() > 1_767_225_600_000);
+    }
+
+    #[test]
+    fn the_monotonic_clock_never_goes_back() {
+        let first = SystemClock.monotonic_millis();
+        assert!(SystemClock.monotonic_millis() >= first);
     }
 }

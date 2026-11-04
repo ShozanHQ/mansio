@@ -241,6 +241,10 @@ pub struct EffectiveSettings {
     /// `MANSIO_SNAPSHOT_INTERVAL_SECONDS`: how often the state of a tenant
     /// that has changed is written to a snapshot. 0 means never.
     pub snapshot_interval_seconds: u64,
+    /// `MANSIO_OWNER_TTL_SECONDS`: how long a tenant stays with a server
+    /// that has stopped renewing it before another server takes it over.
+    /// 0 means servers do not share a broker.
+    pub owner_ttl_seconds: u64,
     /// `MANSIO_MAX_BODY_BYTES`.
     pub max_body_bytes: u64,
     /// `MANSIO_POLL_DEFAULT_COUNT`.
@@ -256,6 +260,9 @@ pub struct EffectiveSettings {
     /// `MANSIO_CREDENTIAL_SWEEP_SECONDS`: how often expired principals are
     /// removed.
     pub credential_sweep_seconds: u64,
+    /// `MANSIO_CREDENTIAL_FOLLOW_MILLIS`: the soonest the principals log is
+    /// read again for a token the registry does not know.
+    pub credential_follow_millis: u64,
     /// `MANSIO_STREAM_POLL_MILLIS`: how often a stream or a webhook looks
     /// for new messages.
     pub stream_poll_millis: u64,

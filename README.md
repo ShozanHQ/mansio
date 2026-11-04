@@ -693,11 +693,39 @@ lines. The timestamp is the moment of that attempt.
   same fact.
 - The address is at most `MANSIO_WEBHOOK_URL_MAX_BYTES`.
 
-### One server per broker
+### More than one server per broker
 
 The lock that makes a claim atomic, and the state behind it, are in one
-mansio-server's memory. Run one mansio-server per broker; two on the same
-broker could give the same item to two consumers.
+mansio-server's memory. So by default, run one mansio-server per broker: two on
+the same broker could give the same item to two consumers.
+
+To run several for availability, set `MANSIO_OWNER_TTL_SECONDS` to the same
+value (3 or more) on every one of them. Each tenant then has one owner at a
+time, and only its owner serves it: the others answer `503` `unavailable` for
+that tenant, and a client sends the request again, as it does for any 503, or a
+load balancer in front of the servers sends it to the next. A tenant goes to
+whichever server asks for it first; the others stand by.
+
+When the owner stops, another server takes its tenants within
+`MANSIO_OWNER_TTL_SECONDS` and a quarter of it (a kill or a crash), or at once
+(a stop in order, `SIGTERM`). Nothing is lost: the new owner rebuilds the
+tenant from the broker as a restart does, so a lease the old owner gave is held
+until it ends and the item is then retried, and every item that was waiting is
+claimable. Try it with `docker compose --profile ha up --build --wait`, which
+adds a second server on port 7071 (set the variable for both).
+
+Credentials follow the broker: a server reads new records of the principals log
+at every sweep (`MANSIO_CREDENTIAL_SWEEP_SECONDS`) and, at most once per
+`MANSIO_CREDENTIAL_FOLLOW_MILLIS`, when it is shown a token it does not know, so a credential issued through one
+server works on the other, including after the first dies.
+
+Still per server: webhooks and consumer positions are read when a server
+starts, so a webhook or a named consumer made through one server is known to
+another only after that restarts, a position committed on one is not seen by
+the other, and each server delivers the webhooks it holds (a server that holds
+webhooks logs a warning at start when this setting is on). The bootstrap
+`MANSIO_TOKEN` works on all of them. Iggy's own clustering is separate: mansio
+uses one Iggy.
 
 ### Credentials
 
@@ -839,7 +867,8 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_TOKEN_PRINCIPAL` | `service:mansio` | The `kind:name` the admin token stands for. |
 | `MANSIO_AGENT_CREDENTIAL_TTL_SECONDS` | `3600` | How long an agent credential lasts when the request does not say. |
 | `MANSIO_CREDENTIAL_RECHECK_SECONDS` | `30` | The longest a credential is trusted without asking the broker again, so the longest a revocation the server did not see itself takes to apply. Also how long the server waits after a registry that could not be loaded before it tries again. |
-| `MANSIO_CREDENTIAL_SWEEP_SECONDS` | `60` | How often expired credentials are revoked. |
+| `MANSIO_CREDENTIAL_SWEEP_SECONDS` | `60` | How often expired credentials are revoked. With servers sharing a broker, only a tenant's owner revokes its principals; a revoke asked of another server answers 503. |
+| `MANSIO_CREDENTIAL_FOLLOW_MILLIS` | `1000` | The soonest the principals log is read again for a token the registry does not know, so that tokens never issued cannot make the server read it at every request. Also how long a broker user no record owns is left before it is deleted, when servers share a broker. |
 | `MANSIO_SINK_PATH` | `mansio-sink.jsonl` (`/data/sink.jsonl` in the image) | JSON Lines file that every durable publish is appended to before it is published. Empty turns the sink off. |
 | `MANSIO_SINK_SYNC` | `true` | `true` or `false`. Whether the sink syncs each record to disk before the publish goes on. `false` is for development: a crash can lose recent records. |
 | `MANSIO_MAX_BODY_BYTES` | `1048576` | Largest request body; a larger one is a 413. Iggy has a cap of its own on a message payload, 64 000 000 bytes (the stored envelope, not the body's `data` alone), and a body over it is refused by Iggy as a 502, which a client does not retry. A value above about 64 000 000 lets a body reach that refusal; a value below it makes this setting the limit. Raise it only when messages are that large: Iggy holds a whole message in memory. |
@@ -853,6 +882,7 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_RECOVERY_LOG_SECONDS` | `60` | While the broker will not list its tenants at startup (for example an Iggy user that may not list streams), the server asks again after a wait that doubles from one tick up to this many seconds, and logs the failure at most once per this interval. At least 1. |
 | `MANSIO_SNAPSHOT_INTERVAL_SECONDS` | `300` | How often the state of a tenant that has changed is written to a snapshot, which the next start reads instead of replaying every topic from offset 0 (see "Snapshots" in ARCHITECTURE.md). 0 writes none. |
 | `MANSIO_SNAPSHOT_DIR` | `mansio-snapshots` | The directory of the snapshots, one file per tenant; `/data/snapshots` in the container image. Empty keeps none. A snapshot that cannot be read is ignored with a warning and the start replays from offset 0. |
+| `MANSIO_OWNER_TTL_SECONDS` | `0` | Set on every mansio-server that shares a broker, to the same value (3 or more; 30 or more for a cluster that stays up for months, because every owner appends a record each quarter of it, about 11,500 a day per tenant at 30, and a starting server reads them all), to run more than one: a tenant is served by one of them, and another takes it over this long (and a quarter more) after its server stops renewing it. `0` serves every tenant and must be the only server on its broker (see [More than one server per broker](#more-than-one-server-per-broker)). |
 | `MANSIO_ALERT_RESURFACE_SECONDS` | `3600` | How long an alert may go unacknowledged before it is surfaced again, and again after each further interval. |
 | `MANSIO_TICK_MILLIS` | `500` | How often the timer looks for leases to expire, items to republish and alerts to surface again. |
 | `MANSIO_IDEMPOTENCY_WINDOW_SECONDS` | `86400` | How long a publish's `idempotencykey` is remembered. A second publish to the same tenant and topic with the same key inside the window is answered 200 with the first envelope and offset and publishes nothing. At least `1`, at most `315360000` (ten years). |

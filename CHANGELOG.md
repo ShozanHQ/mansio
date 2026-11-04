@@ -26,6 +26,24 @@ All notable changes to mansio are listed here. The format follows
 
 ### Added
 
+- More than one mansio-server can share a broker without leasing an item twice.
+  With `MANSIO_OWNER_TTL_SECONDS` (default 0, which keeps one server per
+  broker; `owner_ttl_seconds` in `GET /v1/settings`) set to the same value on
+  each, a tenant has one owner at a time, decided in a new `owners` log in the
+  broker's system stream: a claim made against the owner's last renewal, so the
+  first in the log wins and a stale one is refused. The other servers answer
+  `503` for that tenant. When the owner stops, another takes its tenants within
+  the ttl and a quarter more, or at once if it stops in order, and rebuilds
+  their state from the broker, so no item is lost. `docker compose --profile ha`
+  adds a second server, and CI runs two containers on one Iggy. The ownership
+  times are measured on a monotonic clock. Each server tails the principals log
+  (at every sweep, and when shown a token it does not know, at most once per
+  `MANSIO_CREDENTIAL_FOLLOW_MILLIS`, default 1000, `credential_follow_millis`
+  in `GET /v1/settings`), so a credential issued through one works on the
+  other, also after the first dies. Only a tenant's owner revokes its
+  principals: a revoke asked of another server answers `503`, and its sweep
+  leaves them to the owner. Webhooks and consumer positions are still per
+  server.
 - The engine writes a snapshot of each tenant's state (open items, leases,
   items owed a fact, ids of finished items, unacknowledged alerts, and the
   ids of acknowledged ones) with the offset of each topic it covers, and a
