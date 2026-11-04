@@ -71,7 +71,7 @@ Iggy is offset-based: it has no per-message claim, acknowledgement, redelivery o
 - **Fail** (`work_fail`) by the holder, or an expired lease, republishes the item to the same queue as a new message with the same `itemid`, `attempt` plus one and the message before as `causationid`, after a backoff of `MANSIO_BACKOFF_BASE_SECONDS * 2^(attempt-1)` capped at `MANSIO_BACKOFF_CAP_SECONDS`. When `attempt` plus one would pass `MANSIO_MAX_ATTEMPTS`, the item is published to `dead` at once instead, and nowhere else. Republished and dead messages are published by `service:mansio-engine`.
 - Every transition (`claimed`, `extended`, `acked`, `failed`, `expired`, `retried`, `dead`) is an envelope on `facts.work` with the item id as `subject` and the item id and attempt as attributes; `data` names the queue, message id, attempt, and as they apply the lease (its fingerprint), holder, consumer, expiry, reason and what happens next (`next`, `retry_at`). It is recorded in the sink first and then published.
 
-A timer (`MANSIO_TICK_MILLIS`) drives expiries, republishes and the surfacing of alerts. It reads the clock through a trait, so tests move time by hand.
+A timer (`MANSIO_TICK_MILLIS`) drives expiries, republishes and the surfacing of alerts. It reads the clock through a trait, so tests move time by hand. It finds what is due through a per-queue due-time index (leases, backoffs and owed facts) and an alert index ordered by when each alert was last surfaced, so a tick touches only what is due, not every open item.
 
 ### State
 

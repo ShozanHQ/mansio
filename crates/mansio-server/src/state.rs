@@ -124,6 +124,60 @@ impl Finished {
     }
 }
 
+/// The due-time index of one queue: which items hold a lease, wait out a
+/// backoff or owe a fact, ordered by when each is due. The timer reads the
+/// front of each set instead of looking through every open item.
+#[derive(Debug, Default)]
+struct Timers {
+    /// `(expires_at, id)` of every item in [`Phase::Leased`].
+    leases: BTreeSet<(i64, ItemId)>,
+    /// `(due, id)` of every item in [`Phase::Backoff`].
+    backoffs: BTreeSet<(i64, ItemId)>,
+    /// Every item in [`Phase::Owed`], which is due at once.
+    owed: BTreeSet<ItemId>,
+}
+
+impl Timers {
+    fn add(&mut self, id: &ItemId, phase: &Phase) {
+        match phase {
+            Phase::Leased(lease) => {
+                self.leases.insert((lease.expires_at, id.clone()));
+            }
+            Phase::Backoff { due, .. } => {
+                self.backoffs.insert((*due, id.clone()));
+            }
+            Phase::Owed { .. } => {
+                self.owed.insert(id.clone());
+            }
+            Phase::Ready => {}
+        }
+    }
+
+    fn remove(&mut self, id: &ItemId, phase: &Phase) {
+        match phase {
+            Phase::Leased(lease) => {
+                self.leases.remove(&(lease.expires_at, id.clone()));
+            }
+            Phase::Backoff { due, .. } => {
+                self.backoffs.remove(&(*due, id.clone()));
+            }
+            Phase::Owed { .. } => {
+                self.owed.remove(id);
+            }
+            Phase::Ready => {}
+        }
+    }
+}
+
+/// What the timer has to do for one item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Due {
+    /// The lease ran out.
+    Lease,
+    /// The backoff is over, or the item owes a fact.
+    Advance,
+}
+
 /// The items of one queue. Open items are kept whole; an item that is done
 /// (acknowledged, or dead) leaves only its id, so that the id is not used
 /// again.
@@ -136,6 +190,8 @@ pub(crate) struct Queue {
     ready: BTreeSet<(u64, ItemId)>,
     /// The order the next addition gets.
     next_order: u64,
+    /// When each leased, backing-off and owing item is due.
+    timers: Timers,
 }
 
 /// A queue as a snapshot keeps it: the open items in the order they stand in,
@@ -186,6 +242,7 @@ impl Queue {
             if item.phase == Phase::Ready {
                 queue.ready.insert((item.order, id.clone()));
             }
+            queue.timers.add(&id, &item.phase);
             queue.items.insert(id, item);
         }
         queue
@@ -238,6 +295,33 @@ impl Queue {
             .min_by(|a, b| (a.2.expires_at, a.0).cmp(&(b.2.expires_at, b.0)))
     }
 
+    /// What is due at `now`, as `(kind, due time, id)`, pushed onto `out`.
+    /// Returns how many index entries were looked at: the due ones and at
+    /// most one more per index, so the work does not depend on how many items
+    /// are open.
+    pub(crate) fn due(&self, now: i64, out: &mut Vec<(Due, i64, ItemId)>) -> usize {
+        let mut looked = 0;
+        for (at, id) in &self.timers.leases {
+            looked += 1;
+            if *at > now {
+                break;
+            }
+            out.push((Due::Lease, *at, id.clone()));
+        }
+        for (at, id) in &self.timers.backoffs {
+            looked += 1;
+            if *at > now {
+                break;
+            }
+            out.push((Due::Advance, *at, id.clone()));
+        }
+        for id in &self.timers.owed {
+            looked += 1;
+            out.push((Due::Advance, now, id.clone()));
+        }
+        looked
+    }
+
     fn take_order(&mut self) -> u64 {
         let order = self.next_order;
         self.next_order = self.next_order.saturating_add(1);
@@ -251,6 +335,7 @@ impl Queue {
         if phase == Phase::Ready {
             self.ready.insert((order, id.clone()));
         }
+        self.timers.add(&id, &phase);
         self.items.insert(
             id,
             Item {
@@ -264,6 +349,7 @@ impl Queue {
     fn remove(&mut self, id: &ItemId) {
         if let Some(old) = self.items.remove(id) {
             self.ready.remove(&(old.order, id.clone()));
+            self.timers.remove(id, &old.phase);
         }
     }
 
@@ -281,6 +367,8 @@ impl Queue {
         if phase == Phase::Ready {
             self.ready.insert((item.order, id.clone()));
         }
+        self.timers.remove(id, &item.phase);
+        self.timers.add(id, &phase);
         item.phase = phase;
     }
 
@@ -296,6 +384,78 @@ impl Queue {
     }
 }
 
+/// The alerts nobody has acknowledged, each with when it was published or
+/// last surfaced (milliseconds since the Unix epoch), and an index by that
+/// time so that the ones due to surface again are found without looking at
+/// the rest.
+#[derive(Debug, Default)]
+pub(crate) struct Alerts {
+    surfaced: HashMap<EventId, i64>,
+    by_time: BTreeSet<(i64, EventId)>,
+}
+
+impl Alerts {
+    pub(crate) fn get(&self, alert: &EventId) -> Option<&i64> {
+        self.surfaced.get(alert)
+    }
+
+    pub(crate) fn contains_key(&self, alert: &EventId) -> bool {
+        self.surfaced.contains_key(alert)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &EventId> {
+        self.surfaced.keys()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&EventId, &i64)> {
+        self.surfaced.iter()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.surfaced.is_empty()
+    }
+
+    /// Set when the alert was published or last surfaced.
+    pub(crate) fn insert(&mut self, alert: EventId, at: i64) -> Option<i64> {
+        let old = self.surfaced.insert(alert, at);
+        if let Some(old) = old {
+            self.by_time.remove(&(old, alert));
+        }
+        self.by_time.insert((at, alert));
+        old
+    }
+
+    pub(crate) fn remove(&mut self, alert: &EventId) -> Option<i64> {
+        let old = self.surfaced.remove(alert)?;
+        self.by_time.remove(&(old, *alert));
+        Some(old)
+    }
+
+    /// The alerts last surfaced at or before `cutoff`, oldest first, pushed
+    /// onto `out`. Returns how many index entries were looked at: the due
+    /// ones and at most one more.
+    pub(crate) fn surfaced_by(&self, cutoff: i64, out: &mut Vec<(i64, EventId)>) -> usize {
+        let mut looked = 0;
+        for (at, alert) in &self.by_time {
+            looked += 1;
+            if *at > cutoff {
+                break;
+            }
+            out.push((*at, *alert));
+        }
+        looked
+    }
+}
+
+impl From<HashMap<EventId, i64>> for Alerts {
+    fn from(surfaced: HashMap<EventId, i64>) -> Self {
+        let by_time = surfaced.iter().map(|(alert, at)| (*at, *alert)).collect();
+        Self { surfaced, by_time }
+    }
+}
+
 /// Everything the engine holds for one tenant.
 #[derive(Debug, Default)]
 pub(crate) struct TenantState {
@@ -307,7 +467,7 @@ pub(crate) struct TenantState {
     /// Alerts nobody has acknowledged, with when each was published or last
     /// surfaced, in milliseconds since the Unix epoch. The next surfacing is
     /// one interval later.
-    pub(crate) alerts: HashMap<EventId, i64>,
+    pub(crate) alerts: Alerts,
     /// The ids of alerts that were acknowledged, which are all that is kept
     /// of them.
     pub(crate) acknowledged_alerts: HashSet<EventId>,
@@ -577,5 +737,129 @@ mod tests {
             held_lease(&ready, who(&holder, &consumer, &id), 0),
             Err(ApiError::Conflict(_))
         ));
+    }
+
+    fn leased(expires_at: i64) -> Phase {
+        Phase::Leased(Lease {
+            fingerprint: LeaseId::generate().fingerprint(),
+            id: None,
+            holder: "service:test".parse().unwrap(),
+            consumer: "w".parse().unwrap(),
+            expires_at,
+            claimed_at: 0,
+        })
+    }
+
+    /// Covers the indexes (`Queue::due`, `Alerts::surfaced_by`) and the number
+    /// of entries each reports looking at. The engine test of the same name
+    /// drives `Engine::due_counted` over a seeded tenant, and
+    /// `tick_benchmark` times the tick at 1k, 10k and 100k open items.
+    #[test]
+    fn a_tick_with_nothing_due_does_constant_work_at_100k_open_items() {
+        let mut queue = Queue::default();
+        let mut alerts = Alerts::default();
+        let far = 1_000_000;
+        for n in 0..100_000_i64 {
+            let (id, message) = message(u64::try_from(n).unwrap());
+            let phase = match n % 3 {
+                0 => Phase::Ready,
+                1 => leased(far + n),
+                _ => Phase::Backoff {
+                    due: far + n,
+                    next: Next::Retry,
+                },
+            };
+            queue.insert(id, message, phase);
+            alerts.insert(EventId::generate(), far + n);
+        }
+        assert_eq!(queue.len(), 100_000);
+
+        let mut due = Vec::new();
+        let looked = queue.due(0, &mut due);
+        assert!(due.is_empty());
+        // One look at the front of each of the leases and backoffs indexes
+        // (the owed set is empty and costs no look), however many items are
+        // open.
+        assert_eq!(looked, 2);
+        let mut surfaced = Vec::new();
+        assert_eq!(alerts.surfaced_by(0, &mut surfaced), 1);
+        assert!(surfaced.is_empty());
+
+        // With some due, the work is the due items plus one look per index.
+        let looked = queue.due(far + 9, &mut due);
+        assert_eq!(due.len(), 6);
+        assert_eq!(looked, due.len() + 2);
+        assert_eq!(alerts.surfaced_by(far + 9, &mut surfaced), 11);
+        assert_eq!(surfaced.len(), 10);
+    }
+
+    #[test]
+    fn the_due_index_follows_every_change_of_phase() {
+        let mut queue = Queue::default();
+        let (a, message_a) = message(1);
+        let (b, message_b) = message(2);
+        queue.insert(a.clone(), message_a, leased(10));
+        queue.insert(b.clone(), message_b, Phase::Ready);
+        let due = |queue: &Queue, now| {
+            let mut due = Vec::new();
+            queue.due(now, &mut due);
+            due.into_iter()
+                .map(|(kind, at, id)| (kind, at, id.to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert!(due(&queue, 9).is_empty());
+        assert_eq!(due(&queue, 10), [(Due::Lease, 10, a.to_string())]);
+
+        // An extension moves the expiry.
+        queue.set_phase(&a, leased(20));
+        assert!(due(&queue, 10).is_empty());
+        assert_eq!(due(&queue, 20), [(Due::Lease, 20, a.to_string())]);
+
+        queue.set_phase(
+            &a,
+            Phase::Backoff {
+                due: 30,
+                next: Next::Retry,
+            },
+        );
+        assert!(due(&queue, 29).is_empty());
+        assert_eq!(due(&queue, 30), [(Due::Advance, 30, a.to_string())]);
+
+        // An item that owes a fact is due at once.
+        let (_, fact) = message(3);
+        queue.set_phase(
+            &a,
+            Phase::Owed {
+                fact: Box::new(fact),
+                then: Then::Ready,
+            },
+        );
+        assert_eq!(due(&queue, 0), [(Due::Advance, 0, a.to_string())]);
+
+        queue.set_phase(&a, Phase::Ready);
+        assert!(due(&queue, i64::MAX).is_empty());
+        queue.set_phase(&b, leased(5));
+        queue.finish(&b);
+        assert!(due(&queue, i64::MAX).is_empty());
+        queue.insert(a.clone(), message(1).1, leased(7));
+        queue.insert(a.clone(), message(1).1, Phase::Ready);
+        assert!(due(&queue, i64::MAX).is_empty());
+    }
+
+    #[test]
+    fn alerts_are_indexed_by_when_they_were_last_surfaced() {
+        let mut alerts = Alerts::default();
+        let (x, y) = (EventId::generate(), EventId::generate());
+        alerts.insert(x, 5);
+        alerts.insert(y, 8);
+        alerts.insert(x, 12);
+        let mut out = Vec::new();
+        alerts.surfaced_by(10, &mut out);
+        assert_eq!(out, [(8, y)]);
+        assert_eq!(alerts.remove(&y), Some(8));
+        out.clear();
+        alerts.surfaced_by(100, &mut out);
+        assert_eq!(out, [(12, x)]);
+        assert_eq!(alerts.get(&x), Some(&12));
     }
 }
