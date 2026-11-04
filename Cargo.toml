@@ -50,3 +50,8 @@ print_stdout = "deny"
 
 [profile.release]
 overflow-checks = true
+
+# cargo-dist builds with `--profile dist`.
+[profile.dist]
+inherits = "release"
+lto = "thin"
