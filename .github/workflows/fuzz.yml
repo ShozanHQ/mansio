@@ -105,8 +105,11 @@ jobs:
           # An input is at most 1 MiB, the default of the server's
           # MANSIO_MAX_BODY_BYTES setting (settings.rs, max_body_bytes), and
           # a run that holds more than 2 GiB has an unbounded allocation.
+          # cargo fuzz run takes no --locked, so this fails first when
+          # fuzz/Cargo.lock does not match fuzz/Cargo.toml.
+          cargo "+$FUZZ_TOOLCHAIN" fetch --locked --manifest-path fuzz/Cargo.toml
           status=0
-          cargo "+$FUZZ_TOOLCHAIN" fuzz run --locked "$TARGET" -- \
+          cargo "+$FUZZ_TOOLCHAIN" fuzz run "$TARGET" -- \
             "-max_total_time=$SECONDS_PER_TARGET" -max_len=1048576 -rss_limit_mb=2048 || status=$?
           # A crash leaves its input in fuzz/artifacts/<target>/. A non-zero
           # status without one is a build or setup failure, not a crash.

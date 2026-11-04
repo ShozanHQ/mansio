@@ -38,7 +38,7 @@ jobs:
       # Replays fuzz/corpus and fuzz/regressions through the fuzz targets, so a
       # crash that was fixed stays fixed. The fuzzing itself is fuzz.yml.
       - name: Test the fuzz targets on their seeds and regressions
-        run: cargo test -p mansio-server --features fuzzing --locked fuzz::
+        run: 'cargo test -p mansio-server --features fuzzing --locked fuzz::'
 
   deny:
     name: deny
