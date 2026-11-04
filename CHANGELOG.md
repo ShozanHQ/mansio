@@ -7,6 +7,14 @@ All notable changes to mansio are listed here. The format follows
 
 ### Added
 
+- Credential sessions on Iggy are bounded. `MANSIO_IGGY_SESSION_IDLE_SECONDS`
+  (default 300) closes the clients of a credential that has gone unused, and
+  the next request signs in again. `MANSIO_IGGY_SESSION_CLIENTS` (default 2)
+  keeps up to that many clients per credential, so an open event stream and a
+  pull by the same credential do not wait for each other. A recheck of a
+  credential keeps its new client in the pool instead of closing it.
+  `MANSIO_IGGY_SIGNIN_TIMEOUT_SECONDS` (default 10) bounds signing a
+  credential in, in place of the 60 s connect timeout.
 - `MANSIO_SSE_MAX_PER_CREDENTIAL` (default 10) and `MANSIO_SSE_MAX` (default
   1000) limit open event streams: the next `GET /v1/events` gets 429 for a
   credential at its limit and 503 when the server is at its own. Both are in

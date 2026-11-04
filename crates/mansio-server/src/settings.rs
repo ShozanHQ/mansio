@@ -13,11 +13,23 @@ use std::time::Duration;
 use mansio_core::Principal;
 use mansio_iggy::{
     DEFAULT_ADDRESS, DEFAULT_CONNECT_TIMEOUT, DEFAULT_LOCATE_WINDOW, DEFAULT_PRESENCE_RETENTION,
-    DEFAULT_PRESENCE_SEGMENT_SIZE_BYTES, DEFAULT_USERNAME, DurabilityPolicy, IggyConfig,
-    ProvisionConfig, Retention, check_segment_size,
+    DEFAULT_PRESENCE_SEGMENT_SIZE_BYTES, DEFAULT_SESSION_CLIENTS, DEFAULT_SESSION_IDLE,
+    DEFAULT_SIGNIN_TIMEOUT, DEFAULT_USERNAME, DurabilityPolicy, IggyConfig, ProvisionConfig,
+    Retention, check_segment_size,
 };
 use secrecy::SecretString;
 use thiserror::Error;
+
+/// `value`, or the error that names the variable if it is 0.
+fn at_least_one(name: &'static str, value: u64) -> Result<u64, SettingsError> {
+    if value == 0 {
+        return Err(SettingsError::Invalid {
+            name,
+            reason: "must be at least 1".to_owned(),
+        });
+    }
+    Ok(value)
+}
 
 /// Default listen address: loopback only. The container image listens on all
 /// interfaces.
@@ -380,6 +392,10 @@ impl WebhookSettings {
 
 /// Which broker to run on (`MANSIO_BROKER`), with what it needs.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one value is built at startup; boxing would change a public field"
+)]
 pub enum Backend {
     /// Apache Iggy.
     Iggy(IggyConfig),
@@ -643,6 +659,28 @@ impl Settings {
             "MANSIO_IGGY_CONNECT_TIMEOUT_SECONDS",
             DEFAULT_CONNECT_TIMEOUT.as_secs(),
         )?);
+        config.signin_timeout = Duration::from_secs(at_least_one(
+            "MANSIO_IGGY_SIGNIN_TIMEOUT_SECONDS",
+            env.parse(
+                "MANSIO_IGGY_SIGNIN_TIMEOUT_SECONDS",
+                DEFAULT_SIGNIN_TIMEOUT.as_secs(),
+            )?,
+        )?);
+        config.session_idle = Duration::from_secs(at_least_one(
+            "MANSIO_IGGY_SESSION_IDLE_SECONDS",
+            env.parse(
+                "MANSIO_IGGY_SESSION_IDLE_SECONDS",
+                DEFAULT_SESSION_IDLE.as_secs(),
+            )?,
+        )?);
+        config.session_clients = usize::try_from(at_least_one(
+            "MANSIO_IGGY_SESSION_CLIENTS",
+            env.parse(
+                "MANSIO_IGGY_SESSION_CLIENTS",
+                DEFAULT_SESSION_CLIENTS as u64,
+            )?,
+        )?)
+        .unwrap_or(usize::MAX);
         config.idempotency_expiry = idempotency_window;
         config.locate_window = env.parse("MANSIO_IGGY_LOCATE_WINDOW", DEFAULT_LOCATE_WINDOW)?;
         config.segment_size_bytes = env.parse("MANSIO_IGGY_SEGMENT_SIZE_BYTES", 0_u64)?;
@@ -754,6 +792,9 @@ mod tests {
         assert_eq!(iggy.username, "mansio");
         assert_eq!(iggy.password.expose_secret(), "p");
         assert_eq!(iggy.connect_timeout, Duration::from_secs(60));
+        assert_eq!(iggy.signin_timeout, Duration::from_secs(10));
+        assert_eq!(iggy.session_idle, Duration::from_secs(300));
+        assert_eq!(iggy.session_clients, 2);
         assert_eq!(iggy.locate_window, 100);
         assert_eq!(iggy.segment_size_bytes, 0);
         assert_eq!(iggy.presence_segment_size_bytes, 1_048_576);
@@ -1266,6 +1307,9 @@ mod tests {
             ("MANSIO_POLL_DEFAULT_COUNT", "0"),
             ("MANSIO_POLL_DEFAULT_COUNT", "2000"),
             ("MANSIO_IGGY_CONNECT_TIMEOUT_SECONDS", "soon"),
+            ("MANSIO_IGGY_SIGNIN_TIMEOUT_SECONDS", "0"),
+            ("MANSIO_IGGY_SESSION_IDLE_SECONDS", "0"),
+            ("MANSIO_IGGY_SESSION_CLIENTS", "0"),
             ("MANSIO_IGGY_DURABILITY", "fsync"),
             ("MANSIO_IGGY_PRESENCE_DURABILITY", "never"),
         ] {

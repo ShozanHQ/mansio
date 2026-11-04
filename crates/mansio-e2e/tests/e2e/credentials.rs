@@ -1257,6 +1257,56 @@ async fn an_agent_credential_cannot_extend_a_lease_past_its_own_expiry() -> anyh
     Ok(())
 }
 
+/// SHO-10032: a credential with an event stream open still publishes, polls
+/// and pulls promptly. This shows the behaviour through the API; in process
+/// it runs on the memory broker, so that the pool itself (a held client does
+/// not queue the next request) is shown by the `sessions` unit tests in
+/// `mansio-iggy`, which hold a lease and check the next request gets another
+/// client.
+#[tokio::test]
+async fn an_open_event_stream_does_not_hold_up_the_same_credentials_other_requests()
+-> anyhow::Result<()> {
+    let target = Target::start().await?;
+    target.seed(&target.tenant, "facts.build").await?;
+    target.seed_queue("builds").await?;
+    let agent = target
+        .issue(
+            "agent",
+            "builder-1",
+            &scopes(&[
+                ("facts.build", &["publish", "subscribe"]),
+                ("work.builds", &["claim", "publish"]),
+            ]),
+            None,
+        )
+        .await?;
+
+    let uri = format!(
+        "{}/v1/events?tenant={}&topic=facts.build",
+        target.base, target.tenant
+    );
+    let stream = target
+        .http
+        .get(uri)
+        .bearer_auth(&agent.token)
+        .send()
+        .await?;
+    assert_eq!(stream.status(), StatusCode::OK);
+
+    // The stream is open and polling the broker as the credential. Each of
+    // these answers within the slack, not after the stream is closed.
+    let (status, published) = tokio::time::timeout(SLACK, agent.publish("facts.build")).await??;
+    assert_eq!(status, StatusCode::CREATED, "{published}");
+    let (status, polled) = tokio::time::timeout(SLACK, agent.poll("facts.build")).await??;
+    assert_eq!(status, StatusCode::OK, "{polled}");
+    let (status, queued) = tokio::time::timeout(SLACK, agent.work_publish("builds")).await??;
+    assert_eq!(status, StatusCode::CREATED, "{queued}");
+    let (status, claim) = tokio::time::timeout(SLACK, agent.pull("builds")).await??;
+    assert_eq!(status, StatusCode::OK, "{claim}");
+    drop(stream);
+    Ok(())
+}
+
 fn now_millis() -> anyhow::Result<i64> {
     let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
     Ok(i64::try_from(since.as_millis())?)
