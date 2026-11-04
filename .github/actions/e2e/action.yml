@@ -44,6 +44,9 @@ runs:
           # a delivery after 3 attempts, and waits 2 s for an answer.
           echo MANSIO_STREAM_POLL_MILLIS=100
           echo MANSIO_SSE_KEEPALIVE_SECONDS=1
+          # Tests run in parallel with one bootstrap token: leave room for
+          # their streams. The limits are tested on the in-process server.
+          echo MANSIO_SSE_MAX_PER_CREDENTIAL=100
           echo MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS=1
           echo MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS=4
           echo MANSIO_WEBHOOK_MAX_ATTEMPTS=3

@@ -38,6 +38,7 @@ use crate::principals_api;
 use crate::settings::{
     CredentialSettings, Limits, SettingsError, StreamSettings, WebhookSettings, WorkSettings,
 };
+use crate::stream_limits::StreamLimiter;
 use crate::webhooks::Webhooks;
 use crate::webhooks_api;
 use crate::work_api;
@@ -60,6 +61,8 @@ pub struct AppState {
     pub(crate) auth: Auth,
     pub(crate) limits: Limits,
     pub(crate) streams: StreamSettings,
+    /// The open event streams, counted against the limits in `streams`.
+    pub(crate) stream_limiter: Arc<StreamLimiter>,
     /// Becomes true when the server is shutting down, which ends every event
     /// stream.
     pub(crate) ending: watch::Receiver<bool>,
@@ -284,6 +287,10 @@ impl Server {
             auth: self.auth,
             limits: self.limits,
             streams: self.streams,
+            stream_limiter: StreamLimiter::new(
+                self.streams.sse_max_per_credential,
+                self.streams.sse_max,
+            ),
             ending,
         };
         let router = Router::new()
@@ -495,6 +502,9 @@ async fn settings(
         stream_poll_millis: u64::try_from(state.streams.poll.as_millis()).unwrap_or(u64::MAX),
         sse_keepalive_seconds: seconds(state.streams.sse_keepalive),
         shutdown_grace_seconds: seconds(state.streams.shutdown_grace),
+        sse_max_per_credential: u64::try_from(state.streams.sse_max_per_credential)
+            .unwrap_or(u64::MAX),
+        sse_max: u64::try_from(state.streams.sse_max).unwrap_or(u64::MAX),
         webhook_backoff_base_seconds: seconds(webhooks.backoff_base),
         webhook_backoff_cap_seconds: seconds(webhooks.backoff_cap),
         webhook_max_attempts: webhooks.max_attempts,
@@ -1229,6 +1239,8 @@ mod tests {
         assert_eq!(settings.poll_max_count, 5);
         assert_eq!(settings.stream_poll_millis, 500);
         assert_eq!(settings.sse_keepalive_seconds, 15);
+        assert_eq!(settings.sse_max_per_credential, 10);
+        assert_eq!(settings.sse_max, 1000);
         assert_eq!(settings.webhook_backoff_base_seconds, 5);
         assert_eq!(settings.webhook_backoff_cap_seconds, 300);
         assert_eq!(settings.webhook_max_attempts, 8);

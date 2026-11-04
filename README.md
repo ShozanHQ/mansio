@@ -607,6 +607,11 @@ data: {"specversion":"1.0","id":"...","type":"build.finished",...}
   The browser's `EventSource` cannot send an `Authorization` header: use a
   client that can, such as `fetch` with a stream reader.
 - The server looks for new messages every `MANSIO_STREAM_POLL_MILLIS`.
+- Open streams are limited. A credential that holds
+  `MANSIO_SSE_MAX_PER_CREDENTIAL` streams gets 429 for the next one, and past
+  `MANSIO_SSE_MAX` streams in all the server answers 503 to everyone. Both
+  are checked after authorisation and before the first read, and a closed
+  stream gives its place back. Both are in `GET /v1/settings`.
 - When the server is told to stop it ends every event stream first, so a
   connected client does not hold the shutdown up; the client sees the stream
   end and reconnects with `Last-Event-ID` to the next server.
@@ -849,6 +854,8 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_IDEMPOTENCY_MAX_KEYS` | `10000` | The most keys a tenant remembers, in memory and when they are read back after a restart. Past it the key remembered longest ago is forgotten first, even inside its window. A key holds a few hundred bytes (no message body), so this bounds memory. At least `1`. |
 | `MANSIO_STREAM_POLL_MILLIS` | `500` | How often an event stream and a webhook look for new messages once they have caught up. |
 | `MANSIO_SSE_KEEPALIVE_SECONDS` | `15` | How often a quiet event stream sends a comment. |
+| `MANSIO_SSE_MAX_PER_CREDENTIAL` | `10` | The most event streams one credential may hold open at once (the bootstrap token counts as one credential). The next `GET /v1/events` gets 429 `too_many_requests` until one closes. At least `1`. |
+| `MANSIO_SSE_MAX` | `1000` | The most event streams open on the server in all. The next `GET /v1/events`, from anyone, gets 503 `unavailable` until one closes. Each open stream looks at the broker every `MANSIO_STREAM_POLL_MILLIS`, so this bounds that load. At least `1`. |
 | `MANSIO_SHUTDOWN_GRACE_SECONDS` | `10` | On SIGINT or SIGTERM the server ends every event stream, and waits this long for the requests still being served before it stops anyway. |
 | `MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS` | `5` | The wait before a delivery is tried again after its first failed attempt. It doubles with each attempt. |
 | `MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS` | `300` | The longest that wait gets. At least the base. |
