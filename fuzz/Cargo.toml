@@ -17,7 +17,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-mansio-server = { path = "../crates/mansio-server", features = ["fuzzing"] }
+mansio-server = { path = "../crates/mansio-server", version = "0.1.0", features = ["fuzzing"] }
 
 [[bin]]
 name = "envelope"
