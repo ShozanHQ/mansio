@@ -7,10 +7,12 @@ name: release
 #   the rest     when the pushed commit is the merge of that pull request, the
 #                jobs in the `release` environment publish the crates, tag the
 #                commit, build the archives and the image, and attest them. The
-#                environment waits for the owner's approval, once, for all of
-#                them together.
+#                environment waits for the owner's approval twice: for
+#                `publish`, then for `binaries` and `image`, which start after
+#                it.
 #
-# One-time setup, outside the repository:
+# One-time setup, outside the repository, pending until the first release (the
+# README, "Releases", gives the order):
 #   - crates.io: each published crate has this repository, workflow
 #     `release.yml` and environment `release` as a trusted publisher. The first
 #     publish of a new crate cannot use one, so 0.1.0 of each crate is
@@ -19,6 +21,8 @@ name: release
 #     `TAG_SIGNING_KEY`: an SSH private key that signs the release tag. Its
 #     public half is committed as `.github/release-signers`, in the
 #     allowed-signers format (`release@users.noreply.github.com ssh-ed25519 ...`).
+#     The owner makes the key and commits the file; `publish` fails until both
+#     exist.
 #
 # The release pull request is opened with the workflow's token, so GitHub does
 # not start the checks on it: close and reopen it to run them.
@@ -74,9 +78,21 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+      pull-requests: read
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
+      # A title is not enough: any contributor can title a pull request
+      # "chore: release". The merged pull request must be release-plz's own.
+      - name: The commit is the merge of release-plz's pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          prs="$(gh api "repos/$GH_REPO/commits/$SHA/pulls")"
+          n="$(jq '[.[] | select(.merged_at != null and (.head.ref | startswith("release-plz-")) and .user.login == "github-actions[bot]")] | length' <<<"$prs")"
+          [ "$n" -ge 1 ] || { echo "::error::$SHA is not the merge of a release-plz pull request"; exit 1; }
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -213,7 +229,6 @@ jobs:
           persist-credentials: false
       - name: Install the toolchain pinned in rust-toolchain.toml
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # The version is written once, in dist-workspace.toml.
       - name: Install cargo-dist
         run: |
@@ -254,16 +269,28 @@ jobs:
       attestations: write
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
-      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: rustup toolchain install
+      # Before the login: cargo-cyclonedx builds third-party crates, and no
+      # token is in the environment yet.
+      # The SBOM lists the Rust dependencies that went into the binary. It does
+      # not list the packages of the base image.
+      - name: Make the CycloneDX SBOM
+        run: |
+          cargo install cargo-cyclonedx --locked --version 0.5.7
+          cargo cyclonedx --manifest-path crates/mansio-server/Cargo.toml \
+            --format json --spec-version 1.5 --override-filename sbom
+          mv crates/mansio-server/sbom.json "mansio-server-$VERSION.cdx.json"
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
       - name: Log in to ghcr.io
         env:
           ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ github.token }}
         run: echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
       - name: Build and push linux/amd64 and linux/arm64
         id: build
@@ -283,24 +310,12 @@ jobs:
             org.opencontainers.image.version=${{ env.VERSION }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=Apache-2.0
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
       - name: Attest the build provenance of the image
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
-      - name: Install the toolchain pinned in rust-toolchain.toml
-        run: rustup toolchain install
-      # The SBOM lists the Rust dependencies that went into the binary. It does
-      # not list the packages of the base image.
-      - name: Make the CycloneDX SBOM
-        run: |
-          cargo install cargo-cyclonedx --locked --version 0.5.7
-          cargo cyclonedx --manifest-path crates/mansio-server/Cargo.toml \
-            --format json --spec-version 1.5 --override-filename sbom
-          mv crates/mansio-server/sbom.json "mansio-server-$VERSION.cdx.json"
       - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
       # Keyless: the signature and the attestation are made with this run's
       # OIDC identity and recorded in the Rekor transparency log.
@@ -313,6 +328,7 @@ jobs:
       - name: The signature, the SBOM attestation and the provenance verify
         env:
           REF: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           cosign verify "$REF" \
             --certificate-identity "$SIGNER" \

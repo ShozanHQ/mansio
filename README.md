@@ -184,7 +184,8 @@ The SBOM lists the Rust dependencies built into the server. It is also on the
 release as `mansio-server-X.Y.Z.cdx.json`.
 
 The tag is an annotated tag signed with an SSH key that only the `release`
-environment holds. Its public half is `.github/release-signers`, committed with the release setup.
+environment holds. Its public half is `.github/release-signers`, which the owner
+commits at the first release (see "Releases" below).
 In a clone, this prints `Good "git" signature`:
 
 ```sh
@@ -1232,17 +1233,34 @@ pinned release. It reports and never blocks.
 `.github/workflows/release.yml` runs on every push to `main`.
 [release-plz](https://release-plz.dev) keeps a release pull request open with the
 version bumps and the `CHANGELOG.md` (configured in `release-plz.toml`). Merging
-it starts the jobs in the `release` environment, which the owner approves once:
-they publish the crates to crates.io by trusted publishing (the run's OIDC
+it starts the jobs in the `release` environment, which the owner approves twice:
+once for `publish`, then once for `binaries` and `image`, which start after it.
+Only the merge of release-plz's own pull request (head branch `release-plz-*`,
+opened by `github-actions[bot]`) starts them; a pull request titled
+"chore: release" by anyone else does not. The jobs
+publish the crates to crates.io by trusted publishing (the run's OIDC
 identity, no stored token), create the signed `vX.Y.Z` tag, build the `mansio`
 archives with [cargo-dist](https://github.com/axodotdev/cargo-dist)
 (`dist-workspace.toml`), push the image, attest, sign and verify each of them,
-and create the GitHub release. crates.io needs each crate's trusted publisher
-set to this repository, the workflow `release.yml` and the environment
-`release`, and 0.1.0 of each crate published by hand once, since a crate that
-does not exist yet cannot have one. The tag needs a `TAG_SIGNING_KEY` secret
-(an SSH private key) in the `release` environment and its public half committed
-as `.github/release-signers`. Until 0.1.0 is on crates.io the `semver`
+and create the GitHub release. The release builds start from a cold cache.
+
+The first release needs a one-time setup by the owner, which is still pending:
+
+1. Make an SSH signing key. Put the private key in the `release` environment as
+   the secret `TAG_SIGNING_KEY`, and commit the public half as
+   `.github/release-signers` (`release@users.noreply.github.com ssh-ed25519 ...`).
+   `publish` fails until both exist.
+2. Give the `release` environment required reviewers.
+3. While the first release pull request (which carries 0.1.0) is open, publish
+   0.1.0 of each crate by hand from its branch, since a crate that does not
+   exist yet cannot have a trusted publisher. Then set each crate's trusted
+   publisher to this repository, the workflow `release.yml` and the environment
+   `release`.
+4. Merge the release pull request. `release-plz release` finds 0.1.0 already
+   published and skips it, and the workflow tags `v0.1.0`, builds the archives
+   and the image, and creates the release. The examples above use that version.
+
+Until 0.1.0 is on crates.io the `semver`
 check of `ci.yml` is skipped; after it, it compares the library crates with the
 last release on every pull request.
 
