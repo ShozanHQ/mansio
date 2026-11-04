@@ -118,6 +118,9 @@ pub(crate) async fn events_stream(
     let Query(query) = query.map_err(|e| ApiError::BadRequest(e.body_text()))?;
     actor.authorize(Action::Poll, &query.tenant, &query.topic)?;
     let from = start(&query, &headers)?;
+    // Held by the stream until it is dropped; a refused request costs the
+    // broker nothing.
+    let permit = state.stream_limiter.acquire(&actor)?;
     let mut tail = Tail::new(
         Arc::clone(&state.broker),
         query.tenant.clone(),
@@ -148,7 +151,11 @@ pub(crate) async fn events_stream(
         }
     };
     Ok(
-        Sse::new(events(following, event).take_until(ended)).keep_alive(
+        Sse::new(events(following, event).take_until(ended).map(move |item| {
+            let _open = &permit;
+            item
+        }))
+        .keep_alive(
             KeepAlive::new()
                 .interval(state.streams.sse_keepalive)
                 .text("keep-alive"),

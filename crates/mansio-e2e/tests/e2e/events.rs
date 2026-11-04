@@ -497,3 +497,117 @@ async fn a_server_stops_after_the_grace_with_a_request_that_never_ends() -> anyh
     drop(socket);
     Ok(())
 }
+
+/// The in-process server with these stream limits, and a topic to follow.
+async fn limited(sse_max_per_credential: usize, sse_max: usize) -> anyhow::Result<Target> {
+    let defaults = crate::harness::LocalSettings::default();
+    let target = Target::start_with(crate::harness::LocalSettings {
+        streams: mansio_server::StreamSettings {
+            sse_max_per_credential,
+            sse_max,
+            ..defaults.streams
+        },
+        ..defaults
+    })
+    .await?;
+    publish_n(&target, "facts.build", 0, 1).await?;
+    Ok(target)
+}
+
+/// A credential that may read `facts.build`.
+async fn reader(target: &Target, name: &str) -> anyhow::Result<String> {
+    Ok(target
+        .issue(
+            "person",
+            name,
+            &json!([{"topic": "facts.build", "verbs": ["subscribe"]}]),
+            None,
+        )
+        .await?
+        .token)
+}
+
+/// The limits are shown in the settings.
+#[tokio::test]
+async fn the_stream_limits_are_in_the_settings() -> anyhow::Result<()> {
+    let target = limited(2, 5).await?;
+    if !target.is_local() {
+        return Ok(());
+    }
+    assert_eq!(target.settings.sse_max_per_credential, 2);
+    assert_eq!(target.settings.sse_max, 5);
+    Ok(())
+}
+
+/// A credential above `MANSIO_SSE_MAX_PER_CREDENTIAL` open streams gets 429
+/// for the next one. Another credential is not affected, and a place comes
+/// back when a stream is closed.
+#[tokio::test]
+async fn a_credential_above_its_open_streams_gets_429_for_the_next() -> anyhow::Result<()> {
+    let target = limited(2, 100).await?;
+    if !target.is_local() {
+        return Ok(());
+    }
+    let (a, b) = (reader(&target, "a").await?, reader(&target, "b").await?);
+    let open = |token: &str| {
+        let token = token.to_owned();
+        let target = &target;
+        async move {
+            Stream::request(target, &token, "facts.build", "", None)
+                .await
+                .map(|response| response.status())
+        }
+    };
+    let first = Stream::request(&target, &a, "facts.build", "", None).await?;
+    let second = Stream::request(&target, &a, "facts.build", "", None).await?;
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::OK);
+
+    let refused = Stream::request(&target, &a, "facts.build", "", None).await?;
+    assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body: Value = refused.json().await?;
+    assert_eq!(body["error"]["code"], "too_many_requests");
+
+    // Another credential has its own places.
+    assert_eq!(open(&b).await?, StatusCode::OK);
+
+    // Closing a stream gives its place back.
+    drop(first);
+    let deadline = tokio::time::Instant::now() + SLACK;
+    loop {
+        match open(&a).await? {
+            StatusCode::OK => break,
+            StatusCode::TOO_MANY_REQUESTS if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            other => bail!("the place did not come back: {other}"),
+        }
+    }
+    drop(second);
+    Ok(())
+}
+
+/// Above `MANSIO_SSE_MAX` open streams in all, the server answers 503 for the
+/// next one, whoever asks.
+#[tokio::test]
+async fn above_the_total_open_streams_the_server_answers_503() -> anyhow::Result<()> {
+    let target = limited(10, 3).await?;
+    if !target.is_local() {
+        return Ok(());
+    }
+    let mut held = Vec::new();
+    for name in ["a", "b", "c"] {
+        let token = reader(&target, name).await?;
+        let response = Stream::request(&target, &token, "facts.build", "", None).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        held.push(response);
+    }
+    for token in [target.token.clone(), reader(&target, "d").await?] {
+        let refused = Stream::request(&target, &token, "facts.build", "", None).await?;
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = refused.json().await?;
+        assert_eq!(body["error"]["code"], "unavailable");
+    }
+    drop(held);
+    Ok(())
+}

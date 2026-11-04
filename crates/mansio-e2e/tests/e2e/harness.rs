@@ -90,6 +90,7 @@ fn local_stream_settings() -> StreamSettings {
         poll: Duration::from_millis(50),
         sse_keepalive: Duration::from_secs(1),
         shutdown_grace: Duration::from_secs(2),
+        ..StreamSettings::default()
     }
 }
 

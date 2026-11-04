@@ -262,6 +262,12 @@ pub struct EffectiveSettings {
     /// `MANSIO_SHUTDOWN_GRACE_SECONDS`: how long a shutdown waits for the
     /// requests still being served once the event streams are ended.
     pub shutdown_grace_seconds: u64,
+    /// `MANSIO_SSE_MAX_PER_CREDENTIAL`: the most event streams one
+    /// credential may hold open; the next gets 429.
+    pub sse_max_per_credential: u64,
+    /// `MANSIO_SSE_MAX`: the most event streams open on the server in all;
+    /// the next gets 503.
+    pub sse_max: u64,
     /// `MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS`: the wait after a delivery's
     /// first failed attempt.
     pub webhook_backoff_base_seconds: u64,
