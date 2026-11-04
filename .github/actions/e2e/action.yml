@@ -26,6 +26,10 @@ runs:
           echo MANSIO_BACKOFF_CAP_SECONDS=4
           echo MANSIO_ALERT_RESURFACE_SECONDS=2
           echo MANSIO_TICK_MILLIS=200
+          # Above Iggy's payload cap of 64 000 000 bytes, so that a body over
+          # the cap reaches Iggy and oversized.rs sees what Iggy answers (the
+          # default, 1 MiB, would be a 413 first).
+          echo MANSIO_MAX_BODY_BYTES=100000000
           # A key is remembered for 10 s and a tenant keeps 20, so that the tests
           # of the window and of the bound take seconds.
           echo MANSIO_IDEMPOTENCY_WINDOW_SECONDS=10

@@ -68,6 +68,7 @@ fn local_work_settings() -> WorkSettings {
         tick: Duration::from_millis(100),
         idempotency_window: Duration::from_secs(4),
         idempotency_max_keys: 20,
+        recovery_log: Duration::from_secs(60),
     }
 }
 

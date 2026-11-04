@@ -15,6 +15,7 @@ mod events;
 mod harness;
 mod idempotency;
 mod ordering;
+mod oversized;
 mod passes;
 mod receiver;
 mod restart;

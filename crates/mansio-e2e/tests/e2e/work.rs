@@ -446,6 +446,7 @@ async fn the_settings_are_served_and_need_the_token() -> anyhow::Result<()> {
     assert!(settings.tick_millis >= 1);
     assert!(settings.idempotency_window_seconds >= 1);
     assert!(settings.idempotency_max_keys >= 1);
+    assert!(settings.recovery_log_seconds >= 1);
     assert!(settings.poll_max_count >= settings.poll_default_count);
     assert!(settings.agent_credential_ttl_seconds >= 1);
     assert!(settings.credential_recheck_seconds >= 1);
@@ -472,6 +473,7 @@ async fn the_settings_are_served_and_need_the_token() -> anyhow::Result<()> {
         "tick_millis",
         "idempotency_window_seconds",
         "idempotency_max_keys",
+        "recovery_log_seconds",
         "agent_credential_ttl_seconds",
         "credential_recheck_seconds",
         "credential_sweep_seconds",

@@ -76,6 +76,24 @@ enum Task {
     Resurface(EventId),
 }
 
+/// Where the retries of a recovery that fails stand.
+#[derive(Debug, Default)]
+struct RecoveryRetry {
+    failures: u32,
+    /// Not before this time, in milliseconds since the Unix epoch.
+    next_try: i64,
+    /// Not logged before this time.
+    next_log: i64,
+}
+
+/// What [`Engine::try_recover`] did.
+#[derive(Debug, PartialEq, Eq)]
+enum RecoveryAttempt {
+    Waiting,
+    Recovered,
+    Failed { logged: bool },
+}
+
 /// The work and alert engine for every tenant of a server.
 pub struct Engine {
     broker: Arc<dyn Broker>,
@@ -904,15 +922,48 @@ impl Engine {
         let tick = self.settings.tick.max(Duration::from_millis(1));
         let mut interval = tokio::time::interval(tick);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut retry = RecoveryRetry::default();
         loop {
             interval.tick().await;
-            if !self.discovered.load(Ordering::Acquire)
-                && let Err(error) = self.recover().await
-            {
-                warn!(?error, "the tenants could not be listed");
+            if !self.discovered.load(Ordering::Acquire) {
+                self.try_recover(&mut retry).await;
             }
             self.tick().await;
         }
+    }
+
+    /// One attempt at [`Engine::recover`] if the retry's wait is over. A
+    /// failure is logged the first time and then at most once per
+    /// `MANSIO_RECOVERY_LOG_SECONDS`, and the next attempt waits twice as long
+    /// as the last, from one tick up to that interval, so a broker that keeps
+    /// refusing is neither asked nor reported every tick.
+    async fn try_recover(&self, retry: &mut RecoveryRetry) -> RecoveryAttempt {
+        let now = self.clock.now_millis();
+        if now < retry.next_try {
+            return RecoveryAttempt::Waiting;
+        }
+        let Err(error) = self.recover().await else {
+            *retry = RecoveryRetry::default();
+            return RecoveryAttempt::Recovered;
+        };
+        let interval = millis(self.settings.recovery_log);
+        let first = millis(self.settings.tick.max(Duration::from_millis(1)));
+        retry.failures = retry.failures.saturating_add(1);
+        let wait = first
+            .saturating_mul(1_i64 << retry.failures.min(32))
+            .min(interval);
+        retry.next_try = now.saturating_add(wait);
+        let logged = now >= retry.next_log;
+        if logged {
+            retry.next_log = now.saturating_add(interval);
+            warn!(
+                ?error,
+                failures = retry.failures,
+                next_attempt_in_millis = wait,
+                "the tenants could not be listed; the broker is asked again with a longer wait, and this is logged at most once per MANSIO_RECOVERY_LOG_SECONDS"
+            );
+        }
+        RecoveryAttempt::Failed { logged }
     }
 
     /// Everything that is due in a tenant at `now`, in the order to do it:

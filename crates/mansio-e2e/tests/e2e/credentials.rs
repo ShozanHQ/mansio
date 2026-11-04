@@ -553,7 +553,14 @@ async fn an_expired_credential_is_refused_and_the_sweep_revokes_it() -> anyhow::
             || async { Ok(target.principals().await?.is_empty().then_some(())) },
         )
         .await?;
-    let facts = target.read("facts.principal").await?;
+    // The principal leaves the registry before its fact is published, so wait
+    // for the fact.
+    let facts = target
+        .until("the revocation to be recorded", SLACK, || async {
+            let facts = target.read("facts.principal").await?;
+            Ok((facts.len() >= 2).then_some(facts))
+        })
+        .await?;
     assert_eq!(
         principal_facts(&facts),
         [

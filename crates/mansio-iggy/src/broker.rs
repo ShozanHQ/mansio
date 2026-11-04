@@ -196,7 +196,7 @@ impl IggyBroker {
                     config.address, config.connect_timeout
                 ))
             })?
-            .map_err(map_iggy)?;
+            .map_err(connect_failure)?;
         info!(address = %config.address, user = %config.username, "connected to Iggy");
         Ok(Self {
             client: Arc::new(client),
@@ -832,8 +832,23 @@ fn map_iggy(error: IggyError) -> BrokerError {
         | IggyError::InvalidTopicName
         | IggyError::InvalidTopicId
         | IggyError::InvalidMessagesCount
-        | IggyError::TooBigMessagePayload => BrokerError::Rejected(text),
+        | IggyError::TooBigMessagePayload
+        | IggyError::InvalidMessagePayloadLength => BrokerError::Rejected(text),
         _ => BrokerError::Unavailable(text),
+    }
+}
+
+/// What Iggy said to the sign-in that `connect` makes with the configured
+/// user. A refusal of the credentials is `Unauthenticated`, so that the caller
+/// can say which setting to correct, and not `Unavailable`, which reads as a
+/// broker that is down.
+fn connect_failure(error: IggyError) -> BrokerError {
+    let text = error.to_string();
+    match error {
+        IggyError::InvalidCredentials | IggyError::Unauthenticated | IggyError::UserInactive => {
+            BrokerError::Unauthenticated(text)
+        }
+        other => map_iggy(other),
     }
 }
 
@@ -1193,6 +1208,7 @@ mod tests {
             IggyError::InvalidTopicId,
             IggyError::InvalidMessagesCount,
             IggyError::TooBigMessagePayload,
+            IggyError::InvalidMessagePayloadLength,
         ] {
             let text = refusal.to_string();
             assert!(
@@ -1200,6 +1216,24 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn a_refused_sign_in_at_connect_is_unauthenticated_and_a_dead_broker_is_not() {
+        for refused in [
+            IggyError::InvalidCredentials,
+            IggyError::Unauthenticated,
+            IggyError::UserInactive,
+        ] {
+            assert!(matches!(
+                connect_failure(refused),
+                BrokerError::Unauthenticated(_)
+            ));
+        }
+        assert!(matches!(
+            connect_failure(IggyError::CannotEstablishConnection),
+            BrokerError::Unavailable(_)
+        ));
     }
 
     #[test]

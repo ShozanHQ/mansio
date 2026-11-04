@@ -92,6 +92,10 @@ pub struct WorkSettings {
     /// ago is forgotten, even inside its window
     /// (`MANSIO_IDEMPOTENCY_MAX_KEYS`).
     pub idempotency_max_keys: usize,
+    /// How often a recovery that keeps failing is logged, and the longest wait
+    /// between its attempts, which back off from one tick to this
+    /// (`MANSIO_RECOVERY_LOG_SECONDS`).
+    pub recovery_log: Duration,
 }
 
 impl Default for WorkSettings {
@@ -106,6 +110,7 @@ impl Default for WorkSettings {
             tick: Duration::from_millis(500),
             idempotency_window: Duration::from_secs(86_400),
             idempotency_max_keys: 10_000,
+            recovery_log: Duration::from_secs(60),
         }
     }
 }
@@ -177,6 +182,9 @@ impl WorkSettings {
         }
         if self.idempotency_max_keys == 0 {
             return Err(invalid("MANSIO_IDEMPOTENCY_MAX_KEYS", "must be at least 1"));
+        }
+        if self.recovery_log < Duration::from_secs(1) {
+            return Err(invalid("MANSIO_RECOVERY_LOG_SECONDS", "must be at least 1"));
         }
         Ok(())
     }
@@ -479,6 +487,7 @@ impl Settings {
                 "MANSIO_IDEMPOTENCY_MAX_KEYS",
                 work_defaults.idempotency_max_keys,
             )?,
+            recovery_log: env.seconds("MANSIO_RECOVERY_LOG_SECONDS", work_defaults.recovery_log)?,
         };
         work.validate()?;
 
@@ -789,6 +798,7 @@ mod tests {
         assert_eq!(work.backoff_cap, Duration::from_secs(300));
         assert_eq!(work.alert_resurface, Duration::from_secs(3600));
         assert_eq!(work.tick, Duration::from_millis(500));
+        assert_eq!(work.recovery_log, Duration::from_secs(60));
         assert_eq!(work.validate(), Ok(()));
     }
 
@@ -806,6 +816,7 @@ mod tests {
             ("MANSIO_TICK_MILLIS", "100"),
             ("MANSIO_IDEMPOTENCY_WINDOW_SECONDS", "90"),
             ("MANSIO_IDEMPOTENCY_MAX_KEYS", "50"),
+            ("MANSIO_RECOVERY_LOG_SECONDS", "9"),
         ])
         .unwrap();
         assert_eq!(
@@ -820,6 +831,7 @@ mod tests {
                 tick: Duration::from_millis(100),
                 idempotency_window: Duration::from_secs(90),
                 idempotency_max_keys: 50,
+                recovery_log: Duration::from_secs(9),
             }
         );
     }
@@ -837,6 +849,7 @@ mod tests {
             ("MANSIO_MAX_ATTEMPTS", "0"),
             ("MANSIO_BACKOFF_BASE_SECONDS", "0"),
             ("MANSIO_ALERT_RESURFACE_SECONDS", "0"),
+            ("MANSIO_RECOVERY_LOG_SECONDS", "0"),
             ("MANSIO_TICK_MILLIS", "0"),
             ("MANSIO_LEASE_SECONDS", "soon"),
             ("MANSIO_TICK_MILLIS", "-5"),
