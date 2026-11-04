@@ -93,6 +93,10 @@ runs:
       run: |
         set -euo pipefail
         start=$SECONDS
+        # A builder of its own name, so a second run in one job, or a reused
+        # runner, does not collide with an existing one. The trap is set before
+        # the login, so a failure anywhere after it still logs out.
+        trap 'docker logout ghcr.io >/dev/null 2>&1 || true; [ -z "${builder:-}" ] || docker buildx rm "$builder" >/dev/null 2>&1 || true' EXIT
         args=()
         if [ -n "$CACHE_REF" ]; then
           ref="${CACHE_REF,,}"
@@ -102,10 +106,7 @@ runs:
           fi
           args+=(--cache-from "type=registry,ref=$ref")
         fi
-        # A builder of its own name, so a second run in one job, or a reused
-        # runner, does not collide with an existing one.
         builder="$(docker buildx create --driver docker-container --bootstrap)"
-        trap 'docker buildx rm "$builder" >/dev/null 2>&1 || true; docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
         docker buildx build --builder "$builder" --load --tag mansio-server:dev "${args[@]}" .
         elapsed=$((SECONDS - start))
         echo "Image build step: ${elapsed}s (cache: ${CACHE_REF:-none})"

@@ -15,6 +15,12 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # The image build cache: written by image-cache on a push to main, read by
+  # e2e. One place, so the two cannot drift. The package is first pushed by
+  # GITHUB_TOKEN and so starts private; set it public in the package settings
+  # so that a fork PR, whose token is read-only, reads it too. Until then a
+  # fork PR builds cold, which is slower and not wrong.
+  BUILD_CACHE_REF: ghcr.io/${{ github.repository }}/build-cache
 
 jobs:
   check:
@@ -115,7 +121,7 @@ jobs:
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          ref="ghcr.io/${GITHUB_REPOSITORY,,}/build-cache"
+          ref="${BUILD_CACHE_REF,,}"
           trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
           printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           start=$SECONDS
@@ -147,5 +153,5 @@ jobs:
       - name: Start Iggy and mansio-server, run the end-to-end suite through compose, stop the stack
         uses: ./.github/actions/e2e
         with:
-          cache-ref: ghcr.io/${{ github.repository }}/build-cache
+          cache-ref: ${{ env.BUILD_CACHE_REF }}
           registry-token: ${{ secrets.GITHUB_TOKEN }}
