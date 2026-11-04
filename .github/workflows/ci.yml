@@ -96,6 +96,24 @@ jobs:
         if: always()
         run: docker compose down --volumes
 
+  # The newest walkthrough in docs/demos/, run against a fresh memory-broker
+  # server, so a step that no longer works as written fails here.
+  demo:
+    name: demo
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Run the newest demo
+        run: .github/scripts/demo-check.sh "$(printf '%s\n' docs/demos/2026-*.md | sort | tail -n 1)"
+      - name: The checker fails on a failing block and names it
+        run: .github/scripts/demo-check-test.sh
+
   # The steps and the settings of the throwaway stack are in
   # .github/actions/e2e, which the weekly run against Iggy's edge build in
   # scheduled.yml uses too.
