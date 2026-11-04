@@ -52,8 +52,9 @@ pub use cursors::Cursors;
 pub use engine::{Engine, Holder};
 pub use error::ApiError;
 pub use settings::{
-    Backend, CredentialSettings, DEFAULT_LISTEN, DEFAULT_SINK_PATH, DEFAULT_TOKEN_PRINCIPAL,
-    Limits, Settings, SettingsError, StreamSettings, WebhookSettings, WorkSettings,
+    Backend, CredentialSettings, DEFAULT_LISTEN, DEFAULT_SINK_PATH, DEFAULT_SINK_SYNC,
+    DEFAULT_TOKEN_PRINCIPAL, Limits, Settings, SettingsError, StreamSettings, WebhookSettings,
+    WorkSettings,
 };
-pub use sink::FileSink;
+pub use sink::{FileSink, SinkOpenError};
 pub use webhooks::Webhooks;
