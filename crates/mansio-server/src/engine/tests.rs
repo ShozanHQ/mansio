@@ -24,6 +24,7 @@ fn settings() -> WorkSettings {
         tick: Duration::from_millis(100),
         idempotency_window: Duration::from_secs(60),
         idempotency_max_keys: 3,
+        recovery_log: Duration::from_secs(30),
     }
 }
 
@@ -56,6 +57,9 @@ struct FlakyBroker {
     system_down: std::sync::atomic::AtomicBool,
     /// Reads of the server's own logs are refused.
     system_unreadable: std::sync::atomic::AtomicBool,
+    /// The broker refuses to list its tenants, and counts the asks.
+    tenants_refused: std::sync::atomic::AtomicBool,
+    tenants_asked: AtomicU64,
 }
 
 impl FlakyBroker {
@@ -100,6 +104,10 @@ impl FlakyBroker {
 #[async_trait]
 impl Broker for FlakyBroker {
     async fn tenants(&self) -> Result<Vec<TenantId>, BrokerError> {
+        self.tenants_asked.fetch_add(1, Ordering::SeqCst);
+        if self.tenants_refused.load(Ordering::SeqCst) {
+            return Err(BrokerError::Forbidden("may not list streams".to_owned()));
+        }
         self.inner.tenants().await
     }
 
@@ -2720,4 +2728,62 @@ async fn a_fresh_claim_is_recorded_at_the_moment_its_lease_began_and_the_cap_sur
         .await
         .unwrap();
     assert_eq!(ends_at(&capped.envelope), claimed_at + 120_000);
+}
+
+#[tokio::test]
+async fn a_recovery_that_keeps_failing_is_logged_once_per_interval_and_backs_off() {
+    // The setting is 30 s and the tick 100 ms.
+    let rig = Rig::new();
+    rig.broker.tenants_refused.store(true, Ordering::SeqCst);
+    let mut retry = RecoveryRetry::default();
+    let asked = || rig.broker.tenants_asked.load(Ordering::SeqCst);
+
+    // The first failure is logged, and the broker is not asked again at once.
+    assert_eq!(
+        rig.engine.try_recover(&mut retry).await,
+        RecoveryAttempt::Failed { logged: true }
+    );
+    assert_eq!(
+        rig.engine.try_recover(&mut retry).await,
+        RecoveryAttempt::Waiting
+    );
+    assert_eq!(asked(), 1);
+
+    // Ticks of 100 ms for two minutes: asks back off and logs are 30 s apart.
+    let mut logs = 1;
+    let mut last_wait = 0;
+    let mut previous_ask = rig.clock.now_millis();
+    for _ in 0..1200 {
+        rig.clock.advance(Duration::from_millis(100));
+        let before = asked();
+        match rig.engine.try_recover(&mut retry).await {
+            RecoveryAttempt::Failed { logged } => {
+                logs += i32::from(logged);
+                let wait = rig.clock.now_millis() - previous_ask;
+                assert!(
+                    wait >= last_wait,
+                    "waits do not shrink: {wait} < {last_wait}"
+                );
+                last_wait = wait;
+                previous_ask = rig.clock.now_millis();
+            }
+            RecoveryAttempt::Waiting => assert_eq!(asked(), before),
+            RecoveryAttempt::Recovered => panic!("the broker still refuses"),
+        }
+    }
+    assert!(logs <= 5, "{logs} logs in two minutes of a 30 s interval");
+    assert!(logs >= 4, "{logs} logs: one per interval is still said");
+    assert!(
+        asked() < 40,
+        "{} asks in 1200 ticks: not backed off",
+        asked()
+    );
+
+    // Once the broker lists its tenants again, the recovery completes.
+    rig.broker.tenants_refused.store(false, Ordering::SeqCst);
+    rig.clock.advance(Duration::from_secs(31));
+    assert_eq!(
+        rig.engine.try_recover(&mut retry).await,
+        RecoveryAttempt::Recovered
+    );
 }

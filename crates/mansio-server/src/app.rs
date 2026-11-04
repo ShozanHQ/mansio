@@ -485,6 +485,7 @@ async fn settings(
         tick_millis: u64::try_from(work.tick.as_millis()).unwrap_or(u64::MAX),
         idempotency_window_seconds: seconds(work.idempotency_window),
         idempotency_max_keys: u64::try_from(work.idempotency_max_keys).unwrap_or(u64::MAX),
+        recovery_log_seconds: seconds(work.recovery_log),
         max_body_bytes: u64::try_from(limits.max_body_bytes).unwrap_or(u64::MAX),
         poll_default_count: limits.poll_default_count,
         poll_max_count: limits.poll_max_count,
@@ -1222,6 +1223,7 @@ mod tests {
         assert_eq!(settings.tick_millis, 500);
         assert_eq!(settings.idempotency_window_seconds, 86_400);
         assert_eq!(settings.idempotency_max_keys, 10_000);
+        assert_eq!(settings.recovery_log_seconds, 60);
         assert_eq!(settings.max_body_bytes, 2048);
         assert_eq!(settings.poll_default_count, 3);
         assert_eq!(settings.poll_max_count, 5);
