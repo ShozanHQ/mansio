@@ -2797,6 +2797,117 @@ async fn a_recovery_that_keeps_failing_is_logged_once_per_interval_and_backs_off
     );
 }
 
+/// Seed a tenant with `n` open items (a third claimable, a third leased and a
+/// third in backoff, all with nothing due) and `n / 10` alerts, directly in
+/// the engine's state.
+fn seed_idle_tenant(engine: &Engine, n: usize) {
+    let mut state = TenantState {
+        loaded: true,
+        keys_loaded: true,
+        ..TenantState::default()
+    };
+    let far = START + 3_600_000;
+    for i in 0..n {
+        let id = EventId::generate();
+        let item: ItemId = id.to_string().parse().unwrap();
+        let phase = match i % 3 {
+            0 => Phase::Ready,
+            1 => Phase::Leased(Lease {
+                fingerprint: LeaseId::generate().fingerprint(),
+                id: None,
+                holder: agent("worker"),
+                consumer: consumer("w1"),
+                expires_at: far + i64::try_from(i).unwrap(),
+                claimed_at: START,
+            }),
+            _ => Phase::Backoff {
+                due: far + i64::try_from(i).unwrap(),
+                next: Next::Retry,
+            },
+        };
+        state
+            .queue_mut(&queue())
+            .insert(item, item_envelope(id, "bench"), phase);
+    }
+    for _ in 0..n / 10 {
+        state.alerts.insert(EventId::generate(), START);
+    }
+    engine
+        .tenants
+        .lock()
+        .unwrap()
+        .insert(tenant(), Arc::new(Mutex::new(state)));
+}
+
+/// A tick with nothing due finds nothing through the due-time indexes and
+/// looks at one entry per index, with 100k open items: a return to scanning
+/// the items would raise the count.
+#[tokio::test]
+async fn a_tick_with_nothing_due_does_constant_work_at_100k_open_items() {
+    let rig = Rig::new();
+    seed_idle_tenant(&rig.engine, 100_000);
+    let cell = rig
+        .engine
+        .tenants
+        .lock()
+        .unwrap()
+        .get(&tenant())
+        .cloned()
+        .unwrap();
+    let mut held = cell.lock_owned().await;
+    let now = rig.clock.now_millis();
+    let (tasks, looked) = rig.engine.due_counted(&held, now);
+    assert!(tasks.is_empty());
+    // Leases and backoffs of the one queue, and the alerts. Owed entries
+    // count as due work, since an owed fact is due at once; none are owed
+    // here, so they add nothing.
+    assert_eq!(looked, 3);
+    rig.engine.tick_tenant(&mut held, &tenant()).await;
+}
+
+/// Tick time and lock hold time of a tick with nothing due, at three queue
+/// depths. Run with
+/// `cargo test -p mansio-server --release -- --ignored --nocapture tick_benchmark`.
+#[tokio::test]
+#[ignore = "a benchmark: run it by name"]
+async fn tick_benchmark() {
+    use std::time::Instant;
+    const TICKS: u32 = 50;
+    for n in [1_000, 10_000, 100_000] {
+        let rig = Rig::new();
+        seed_idle_tenant(&rig.engine, n);
+        rig.engine.tick().await;
+        let started = Instant::now();
+        for _ in 0..TICKS {
+            rig.engine.tick().await;
+        }
+        let tick = started.elapsed() / TICKS;
+
+        // The tick's critical section: the tenant lock, held from taking it
+        // to the end of the pass.
+        let cell = rig
+            .engine
+            .tenants
+            .lock()
+            .unwrap()
+            .get(&tenant())
+            .cloned()
+            .unwrap();
+        let mut hold = Duration::ZERO;
+        for _ in 0..TICKS {
+            let mut held = cell.clone().lock_owned().await;
+            let taken = Instant::now();
+            rig.engine.tick_tenant(&mut held, &tenant()).await;
+            hold += taken.elapsed();
+        }
+        println!(
+            "open_items={n} tick_nanos={} lock_hold_nanos={}",
+            tick.as_nanos(),
+            (hold / TICKS).as_nanos()
+        );
+    }
+}
+
 // ---- snapshots -------------------------------------------------------------
 
 /// Snapshots kept in memory.
@@ -3005,6 +3116,66 @@ async fn a_restart_from_a_snapshot_reads_fewer_messages_and_reaches_the_same_sta
     assert_eq!(from_snapshot, from_start);
     // And the engine that is still running agrees with both.
     assert_eq!(rig.picture().await, from_start);
+}
+
+/// A restart from a snapshot finds the leases and backoffs the snapshot holds
+/// through the due-time index: the lease expires and the retry comes back
+/// once the clock passes them, with no message replayed to put them there.
+#[tokio::test]
+async fn a_restart_from_a_snapshot_still_expires_its_leases_and_retries_its_backoffs() {
+    let store = Arc::new(MemorySnapshots::default());
+    let rig = Rig::over_with(
+        Arc::default(),
+        Arc::default(),
+        Arc::new(ManualClock::new(START)),
+        Some(store.clone()),
+    );
+    let failing = rig.publish_item("failing").await;
+    let held = rig.publish_item("held").await;
+    rig.pass(59).await;
+    let claim = rig.pull("one").await.unwrap();
+    assert_eq!(claim.item.item_id.as_ref(), Some(&failing));
+    rig.fail("one", &failing, &claim.lease_id).await.unwrap();
+    let claim = rig.pull("one").await.unwrap();
+    assert_eq!(claim.item.item_id.as_ref(), Some(&held));
+    // The snapshot is taken at the interval, with one item backing off and
+    // the other leased.
+    rig.pass(1).await;
+    assert!(store.get().is_some(), "a snapshot at the interval");
+    let restored = Rig::over_with(
+        rig.broker.clone(),
+        rig.sink.clone(),
+        rig.clock.clone(),
+        Some(store.clone()),
+    );
+    restored.engine.recover().await.unwrap();
+    {
+        let state = restored.engine.lock(&tenant()).await.unwrap();
+        let item_queue = &state.queues[&queue()];
+        assert!(matches!(
+            item_queue.get(&held).unwrap().phase,
+            Phase::Leased(_)
+        ));
+        assert!(matches!(
+            item_queue.get(&failing).unwrap().phase,
+            Phase::Backoff { .. }
+        ));
+    }
+    // Past the long lease and every backoff.
+    restored.pass(400).await;
+    let state = restored.engine.lock(&tenant()).await.unwrap();
+    let item_queue = &state.queues[&queue()];
+    assert!(
+        !matches!(item_queue.get(&held).unwrap().phase, Phase::Leased(_)),
+        "the restored lease expired"
+    );
+    assert!(
+        !matches!(
+            item_queue.get(&failing).unwrap().phase,
+            Phase::Backoff { .. }
+        ),
+        "the restored retry was republished"
+    );
 }
 
 #[tokio::test]

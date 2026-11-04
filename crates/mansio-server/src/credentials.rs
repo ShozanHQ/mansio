@@ -136,6 +136,11 @@ pub struct Credentials {
 struct Followed {
     next: u64,
     at: Option<i64>,
+    /// The last read stopped at a record it could not decode.
+    stuck: bool,
+    /// When the record that stopped the read was last logged, so that it is
+    /// one line an interval, as `load` logs a failure.
+    logged: Option<i64>,
 }
 
 impl std::fmt::Debug for Credentials {
@@ -264,6 +269,8 @@ impl Credentials {
             offset = next;
         }
         followed.next = offset;
+        followed.stuck = false;
+        followed.logged = None;
         followed.at = Some(self.clock.now_millis());
         drop(followed);
         for record in self.registry.all() {
@@ -292,9 +299,13 @@ impl Credentials {
     /// Unless `force`, the log is not read again within
     /// `MANSIO_CREDENTIAL_FOLLOW_MILLIS` of the last read, so that tokens that were never issued cannot make the server read
     /// it at every request.
-    /// Whether a record was applied is not reported; a failed read is tried
-    /// again at the next call.
-    async fn follow(&self, force: bool) {
+    /// A record that cannot be read (one a newer server wrote, say) stops the
+    /// read: it and everything after it are left unapplied and `next` stays at
+    /// it, as `rebuild` fails on it, so that the registry is never taken to be
+    /// whole when it is not. Returns whether the log was read to its end;
+    /// callers that would delete what no record owns must not go on when it
+    /// was not. A failed read is tried again at the next call.
+    async fn follow(&self, force: bool) -> bool {
         let mut followed = self.followed.lock().await;
         let now = self.clock.now_millis();
         let wait = millis(self.settings.follow);
@@ -303,12 +314,13 @@ impl Credentials {
                 .at
                 .is_some_and(|at| (0..wait).contains(&now.saturating_sub(at)))
         {
-            return;
+            return !followed.stuck;
         }
         followed.at = Some(now);
         let mut entries = Vec::new();
         let mut offset = followed.next;
-        loop {
+        let mut whole = true;
+        'read: loop {
             let batch = match self
                 .broker
                 .system_read(SystemLog::Principals, offset, self.page)
@@ -317,7 +329,7 @@ impl Credentials {
                 Ok(batch) => batch,
                 Err(error) => {
                     warn!(%error, "the principals log could not be read for records of other servers");
-                    return;
+                    return false;
                 }
             };
             let Some(last) = batch.last() else { break };
@@ -326,7 +338,22 @@ impl Credentials {
                 match Entry::decode(&record.payload) {
                     Ok(entry) => entries.push(entry),
                     Err(reason) => {
-                        warn!(offset = record.offset, %reason, "a record of the principals log was not read");
+                        let wait = millis(self.settings.recheck);
+                        if !followed
+                            .logged
+                            .is_some_and(|at| (0..wait).contains(&now.saturating_sub(at)))
+                        {
+                            followed.logged = Some(now);
+                            error!(
+                                offset = record.offset,
+                                %reason,
+                                retry_seconds = self.settings.recheck.as_secs(),
+                                "a record of the principals log cannot be read; nothing from it on is applied, no credential issued after it is known and no broker user is deleted, until it can"
+                            );
+                        }
+                        offset = record.offset;
+                        whole = false;
+                        break 'read;
                     }
                 }
             }
@@ -341,6 +368,18 @@ impl Credentials {
             self.registry.apply(entry);
         }
         followed.next = offset;
+        followed.stuck = !whole;
+        if whole {
+            followed.logged = None;
+        }
+        whole
+    }
+
+    /// Whether the registry holds every record of the log, as far as the log
+    /// was last read. False while a record cannot be read: a credential issued
+    /// after it is not known, and `/healthz` says so.
+    pub async fn whole(&self) -> bool {
+        self.follow(false).await
     }
 
     /// Delete the broker users made for principals that no record owns. Called
@@ -436,10 +475,14 @@ impl Credentials {
             None => {
                 // It may have been issued by another server since this one read
                 // the log.
-                self.follow(false).await;
-                self.registry
-                    .by_digest(&digest)
-                    .ok_or(ApiError::Unauthorized)?
+                let whole = self.follow(false).await;
+                match self.registry.by_digest(&digest) {
+                    Some(record) => record,
+                    // Not known is not the same as not issued while a record
+                    // cannot be read, and a 401 is final for a client.
+                    None if !whole => return Err(not_loaded()),
+                    None => return Err(ApiError::Unauthorized),
+                }
             }
         };
         let now = self.clock.now_millis();
@@ -742,8 +785,9 @@ impl Credentials {
         if self.load().await.is_err() {
             return;
         }
-        self.follow(true).await;
-        if self.engine.shared()
+        let whole = self.follow(true).await;
+        if whole
+            && self.engine.shared()
             && let Err(error) = self.delete_orphans().await
         {
             warn!(%error, "broker users that no principal owns could not be looked for");
@@ -1264,6 +1308,61 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_shared_server_deletes_no_user_while_a_record_of_the_log_cannot_be_read() {
+        // It logs why, which a capture in another test must not lose.
+        let (logs, _guard) = crate::testing::Logs::capture().await;
+        let first = Rig::sharing(Arc::default(), Arc::new(ManualClock::new(START)), shared());
+        let second = Rig::sharing(first.broker.clone(), first.clock.clone(), shared());
+        second.credentials.load().await.unwrap();
+        first.issue("agent", "before", None).await.unwrap();
+        // A record a newer server wrote, and a principal recorded after it.
+        first
+            .broker
+            .system_append(
+                SystemLog::Principals,
+                br#"{"op":"revoked","v":2,"id":"x","at":"y"}"#,
+            )
+            .await
+            .unwrap();
+        let after = first.issue("agent", "after", None).await.unwrap();
+
+        second.clock.advance(Duration::from_secs(2));
+        // The token issued after the record is not known here, and is told 503,
+        // which a client retries, not 401, which it takes as final. The
+        // registry is reported as not whole.
+        let error = second
+            .credentials
+            .authenticate(&token(&after))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApiError::Unavailable(_)), "{error:?}");
+        assert!(!second.credentials.whole().await);
+        second
+            .credentials
+            .authenticate(&token(&after))
+            .await
+            .unwrap_err();
+        // One line in the interval, however often it was read.
+        assert_eq!(
+            logs.text()
+                .matches("cannot be read; nothing from it on")
+                .count(),
+            1,
+            "{}",
+            logs.text()
+        );
+
+        // Its user is not in the registry the second server could build, and
+        // is not deleted however long it goes unowned.
+        for _ in 0..3 {
+            second.credentials.sweep().await;
+            second.clock.advance(Duration::from_secs(60));
+        }
+        assert!(second.broker.deleted.lock().unwrap().is_empty());
+        assert_eq!(second.credentials.list(None).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

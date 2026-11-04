@@ -51,7 +51,7 @@ use crate::recover;
 use crate::settings::WorkSettings;
 use crate::snapshot::{FileSnapshots, Restored, Snapshot, Snapshots};
 pub use crate::state::Holder;
-use crate::state::{Item, Lease, Phase, Remembered, TenantState, Then, backoff, held_lease};
+use crate::state::{Due, Item, Lease, Phase, Remembered, TenantState, Then, backoff, held_lease};
 
 type Held = OwnedMutexGuard<TenantState>;
 
@@ -114,6 +114,10 @@ pub struct Engine {
     /// The idempotency keys the log holds, read once, until each tenant takes
     /// its own.
     seeded_keys: Mutex<Option<HashMap<TenantId, Keys>>>,
+    /// With servers sharing a broker: the idempotency log as far as this
+    /// server has read it, and the keys it holds, so that a tenant taken up
+    /// reads only what was added since, not the whole log.
+    shared_keys: Mutex<(u64, HashMap<TenantId, Keys>)>,
     /// Where snapshots of each tenant's state are kept, if they are.
     snapshots: Option<Arc<dyn Snapshots>>,
     /// Which server owns which tenant, if servers share a broker
@@ -160,6 +164,7 @@ impl Engine {
             tenants: StdMutex::default(),
             discovered: AtomicBool::new(false),
             seeded_keys: Mutex::new(None),
+            shared_keys: Mutex::new((0, HashMap::new())),
             snapshots: None,
         }
     }
@@ -261,14 +266,25 @@ impl Engine {
         if seeded.is_some() {
             return Ok(());
         }
+        let mut tenants = HashMap::new();
+        self.read_keys(&mut tenants, &mut 0).await?;
+        *seeded = Some(tenants);
+        Ok(())
+    }
+
+    /// Read the idempotency log from `offset` to its end into `tenants`, and
+    /// move `offset` past what was read.
+    async fn read_keys(
+        &self,
+        tenants: &mut HashMap<TenantId, Keys>,
+        offset: &mut u64,
+    ) -> Result<(), ApiError> {
         let now = self.clock.now_millis();
         let window = millis(self.settings.idempotency_window);
-        let mut tenants = HashMap::new();
-        let mut offset = 0;
         loop {
             let batch = match self
                 .broker
-                .system_read(SystemLog::Idempotency, offset, self.page)
+                .system_read(SystemLog::Idempotency, *offset, self.page)
                 .await
             {
                 Ok(batch) => batch,
@@ -279,16 +295,15 @@ impl Engine {
                 Err(error) => return Err(error.into()),
             };
             let Some(last) = batch.last() else { break };
-            offset = last.offset.saturating_add(1);
+            *offset = last.offset.saturating_add(1);
             idempotency::replay_into(
-                &mut tenants,
+                tenants,
                 &batch,
                 now,
                 window,
                 self.settings.idempotency_max_keys,
             );
         }
-        *seeded = Some(tenants);
         Ok(())
     }
 
@@ -303,11 +318,10 @@ impl Engine {
         if self.ownership.is_some() {
             // Another server may have published with keys since this one
             // last held the tenant, so they are read again from the log.
-            let mut fresh = None;
-            self.seed_keys(&mut fresh).await?;
-            held.keys = fresh
-                .and_then(|mut tenants| tenants.remove(tenant))
-                .unwrap_or_default();
+            let mut shared = self.shared_keys.lock().await;
+            let (next, tenants) = &mut *shared;
+            self.read_keys(tenants, next).await?;
+            held.keys = tenants.get(tenant).cloned().unwrap_or_default();
             held.keys_loaded = true;
             return Ok(());
         }
@@ -370,7 +384,7 @@ impl Engine {
             }
         }
         state.queues = rebuilt.queues;
-        state.alerts = alerts;
+        state.alerts = alerts.into();
         state.acknowledged_alerts = rebuilt.acknowledged_alerts;
         state.loaded = true;
         Ok(())
@@ -1099,10 +1113,7 @@ impl Engine {
                 warn!(%tenant, ?error, "the state could not be rebuilt");
                 continue;
             }
-            let now = self.clock.now_millis();
-            held.keys
-                .prune(now, millis(self.settings.idempotency_window));
-            self.process_due(&mut held, &tenant, now).await;
+            self.tick_tenant(&mut held, &tenant).await;
             let due = self.snapshot_due(&tenant, &mut held, self.clock.now_millis());
             // The write is not made with the lock held.
             drop(held);
@@ -1113,6 +1124,14 @@ impl Engine {
                 cell.lock().await.changed = true;
             }
         }
+    }
+
+    /// One tenant's share of a tick, run under its lock.
+    async fn tick_tenant(&self, held: &mut TenantState, tenant: &TenantId) {
+        let now = self.clock.now_millis();
+        held.keys
+            .prune(now, millis(self.settings.idempotency_window));
+        self.process_due(held, tenant, now).await;
     }
 
     /// Run the timer until the task is dropped or aborted: take up the
@@ -1215,31 +1234,36 @@ impl Engine {
     /// leases that ran out, oldest first, then items whose backoff is over or
     /// that owe a fact, then alerts to surface again.
     fn due(&self, held: &TenantState, now: i64) -> Vec<Task> {
+        self.due_counted(held, now).0
+    }
+
+    /// [`Engine::due`] and how many index entries it looked at: the due ones
+    /// and at most one more per index, so a tick with nothing due does the
+    /// same work at any queue depth.
+    fn due_counted(&self, held: &TenantState, now: i64) -> (Vec<Task>, usize) {
         let mut due: Vec<(u8, i64, Task)> = Vec::new();
-        for (queue, items) in &held.queues {
-            for (id, item) in items.iter() {
-                match &item.phase {
-                    Phase::Leased(lease) if lease.expires_at <= now => {
-                        due.push((0, lease.expires_at, Task::Expire(queue.clone(), id.clone())))
-                    }
-                    Phase::Backoff { due: at, .. } if *at <= now => {
-                        due.push((1, *at, Task::Advance(queue.clone(), id.clone())));
-                    }
-                    Phase::Owed { .. } => {
-                        due.push((1, now, Task::Advance(queue.clone(), id.clone())));
-                    }
-                    _ => {}
-                }
-            }
+        let mut looked = 0;
+        let mut items = Vec::new();
+        for (queue, items_of) in &held.queues {
+            items.clear();
+            looked += items_of.due(now, &mut items);
+            due.extend(items.drain(..).map(|(kind, at, id)| match kind {
+                Due::Lease => (0, at, Task::Expire(queue.clone(), id)),
+                Due::Advance => (1, at, Task::Advance(queue.clone(), id)),
+            }));
         }
         let interval = millis(self.settings.alert_resurface);
-        for (alert, surfaced_at) in &held.alerts {
-            if surfaced_at.saturating_add(interval) <= now {
-                due.push((2, *surfaced_at, Task::Resurface(*alert)));
-            }
-        }
+        let mut alerts = Vec::new();
+        looked += held
+            .alerts
+            .surfaced_by(now.saturating_sub(interval), &mut alerts);
+        due.extend(
+            alerts
+                .into_iter()
+                .map(|(at, alert)| (2, at, Task::Resurface(alert))),
+        );
         due.sort();
-        due.into_iter().map(|(_, _, task)| task).collect()
+        (due.into_iter().map(|(_, _, task)| task).collect(), looked)
     }
 
     /// Do what is due in a tenant.
@@ -1297,8 +1321,8 @@ impl Engine {
             &data,
         )?;
         self.append(held, fact).await?;
-        if let Some(surfaced_at) = held.alerts.get_mut(&alert) {
-            *surfaced_at = now;
+        if held.alerts.contains_key(&alert) {
+            held.alerts.insert(alert, now);
         }
         debug!(%tenant, %alert, "alert surfaced again");
         Ok(())

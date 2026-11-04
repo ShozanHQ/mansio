@@ -468,7 +468,7 @@ impl Server {
 /// the second no webhook is delivered. Asking for it tries each load again
 /// when its time is up, which is what a health check that keeps asking wants.
 async fn healthz(State(state): State<Arc<AppState>>) -> Response {
-    let credentials = state.credentials.load().await.is_err();
+    let credentials = state.credentials.load().await.is_err() || !state.credentials.whole().await;
     let webhooks = state.webhooks.load().await.is_err();
     if !credentials && !webhooks {
         return Json(json!({ "status": "ok" })).into_response();
