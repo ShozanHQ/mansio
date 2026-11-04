@@ -108,6 +108,12 @@ jobs:
       # would fail after the crates were on crates.io.
       - name: The tag's trust anchor is committed
         run: '[ -s .github/release-signers ] || { echo "::error::.github/release-signers is missing or empty; the one-time setup is not done"; exit 1; }'
+      # Checked once, on Linux, before anything is published. The pattern
+      # stops at the closing quote, so line endings do not matter.
+      - name: dist-workspace.toml names the cargo-dist version this workflow installs
+        run: |
+          in_toml="$(sed -n 's/^cargo-dist-version *= *"\([^"]*\)".*/\1/p' dist-workspace.toml)"
+          [ "$in_toml" = "$DIST_VERSION" ] || { echo "::error::dist-workspace.toml has cargo-dist '$in_toml', the workflow '$DIST_VERSION'"; exit 1; }
       - name: Install the toolchain pinned in rust-toolchain.toml
         run: rustup toolchain install
       - name: Read the version of the mansio package
@@ -261,13 +267,10 @@ jobs:
           persist-credentials: false
       - name: Install the toolchain pinned in rust-toolchain.toml
         run: rustup toolchain install
-      # dist reads its own version from dist-workspace.toml; this step checks
-      # that it is DIST_VERSION.
+      # `prepare` checked that dist-workspace.toml names DIST_VERSION, so dist
+      # builds the version installed here.
       - name: Install cargo-dist
-        run: |
-          in_toml="$(sed -n 's/^cargo-dist-version *= *"\(.*\)"/\1/p' dist-workspace.toml)"
-          [ "$in_toml" = "$DIST_VERSION" ] || { echo "::error::dist-workspace.toml has cargo-dist $in_toml, the workflow $DIST_VERSION"; exit 1; }
-          cargo install cargo-dist --locked --version "$DIST_VERSION"
+        run: cargo install cargo-dist --locked --version "$DIST_VERSION"
       - name: Build the archive
         run: dist build --tag "v$VERSION" --artifacts=local --target "$TARGET"
       - name: Attest the build provenance of the archive
