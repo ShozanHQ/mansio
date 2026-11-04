@@ -344,6 +344,7 @@ impl Server {
             )
             .route("/v1/webhooks/{id}", delete(webhooks_api::webhooks_delete))
             .fallback(not_found)
+            .method_not_allowed_fallback(method_not_allowed)
             .layer(DefaultBodyLimit::max(max_body))
             .with_state(Arc::new(state));
         Parts {
@@ -499,6 +500,10 @@ async fn settings(
         webhook_timeout_seconds: seconds(webhooks.timeout),
         webhook_url_max_bytes: u64::try_from(webhooks.url_max_bytes).unwrap_or(u64::MAX),
     })
+}
+
+async fn method_not_allowed() -> ApiError {
+    ApiError::MethodNotAllowed
 }
 
 async fn not_found() -> ApiError {
@@ -777,6 +782,24 @@ mod tests {
             .unwrap()
             .error
             .code
+    }
+
+    #[tokio::test]
+    async fn a_wrong_method_is_a_405_in_the_error_shape() {
+        let _serial = serial().await;
+        let router = router();
+        for (method, uri) in [
+            (Method::DELETE, URI),
+            (Method::POST, "/healthz"),
+            (Method::PUT, "/v1/settings"),
+            (Method::GET, "/v1/webhooks/x"),
+        ] {
+            for token in [Some(TOKEN), None] {
+                let (status, body) = send(&router, method.clone(), uri, token, "").await;
+                assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method} {uri}");
+                assert_eq!(error_code(&body), "method_not_allowed");
+            }
+        }
     }
 
     #[tokio::test]
