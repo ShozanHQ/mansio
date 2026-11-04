@@ -1065,6 +1065,12 @@ impl Webhooks {
     }
 }
 
+/// Read a record of the webhooks log. For the fuzz targets.
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_record(bytes: &[u8]) -> bool {
+    records::decode::<Entry>(bytes).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
