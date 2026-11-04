@@ -265,6 +265,11 @@ impl Queue {
         self.items.len()
     }
 
+    /// How many items are held under a lease.
+    pub(crate) fn leased(&self) -> usize {
+        self.timers.leases.len()
+    }
+
     /// The claimable item that was published first.
     pub(crate) fn oldest_ready(&self) -> Option<&ItemId> {
         self.ready.first().map(|(_, id)| id)

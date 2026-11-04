@@ -18,6 +18,7 @@ use subtle::ConstantTimeEq;
 
 use crate::app::AppState;
 use crate::error::ApiError;
+use crate::request_log::Seen;
 
 /// The admin's credential.
 #[derive(Debug, Clone)]
@@ -208,14 +209,15 @@ impl FromRequestParts<Arc<AppState>> for Authenticated {
             .and_then(|value| value.to_str().ok())
             .and_then(bearer)
             .ok_or(ApiError::Unauthorized)?;
-        if let Some(principal) = state.auth.principal_for(presented) {
-            return Ok(Authenticated(Actor::admin(principal.clone())));
+        let actor = if let Some(principal) = state.auth.principal_for(presented) {
+            Actor::admin(principal.clone())
+        } else {
+            state.credentials.authenticate(presented).await?
+        };
+        if let Some(seen) = parts.extensions.get::<Arc<Seen>>() {
+            seen.principal(actor.principal());
         }
-        state
-            .credentials
-            .authenticate(presented)
-            .await
-            .map(Authenticated)
+        Ok(Authenticated(actor))
     }
 }
 

@@ -3325,6 +3325,97 @@ async fn an_engine_without_a_store_keeps_no_snapshot_and_still_restarts() {
     assert_eq!(picture, rig.picture().await);
 }
 
+#[tokio::test]
+async fn a_server_that_lost_a_tenant_reports_no_gauges_for_it() {
+    let (a, b) = sharing_pair();
+    a.publish_item("job").await;
+    run_for(&a, 1).await;
+    let before = a.engine.queue_gauges().await;
+    assert_eq!(before.len(), 1, "{before:?}");
+    assert_eq!(before[0].open, 1);
+    assert!(b.engine.queue_gauges().await.is_empty());
+
+    // The first server stops renewing; the other takes the tenant over.
+    let mut seconds = 0;
+    while b.engine.queue_gauges().await.is_empty() {
+        seconds += 1;
+        assert!(seconds < 40, "the tenant was not taken over");
+        run_for(&b, 1).await;
+        let _ = b
+            .engine
+            .work_pull(
+                &tenant(),
+                &queue(),
+                &agent("y"),
+                &consumer(&format!("g{seconds}")),
+            )
+            .await;
+    }
+    // The old owner's state is still loaded, and it reports nothing for it.
+    a.engine.keep_ownership().await;
+    a.engine.tick().await;
+    assert!(a.engine.queue_gauges().await.is_empty());
+    assert_eq!(b.engine.queue_gauges().await.len(), 1);
+}
+
+#[tokio::test]
+async fn expiries_retries_dead_letters_and_the_queue_gauges_are_counted() {
+    let metrics = Arc::new(Metrics::new(true));
+    let clock = Arc::new(ManualClock::new(START));
+    let engine = Engine::new(
+        Arc::<FlakyBroker>::default(),
+        Arc::new(LogSink::default()),
+        clock.clone(),
+        settings(),
+        3,
+    )
+    .with_metrics(Arc::clone(&metrics));
+    let pull = async |name: &str| {
+        engine
+            .work_pull(&tenant(), &queue(), &agent("one"), &consumer(name))
+            .await
+    };
+
+    engine
+        .work_publish(item_envelope(EventId::generate(), "job"))
+        .await
+        .unwrap();
+    // Every attempt's lease runs out: the first two are retried, the third
+    // goes to dead.
+    for name in ["w1", "w2", "w3"] {
+        pull(name).await.unwrap().unwrap();
+        clock.advance(Duration::from_secs(10));
+        engine.tick().await;
+        clock.advance(Duration::from_secs(5));
+        engine.tick().await;
+    }
+    let text = metrics.render(&engine.queue_gauges().await);
+    for expected in [
+        "mansio_queue_lease_expiries_total{tenant=\"acme\",queue=\"builds\"} 3",
+        "mansio_queue_retries_total{tenant=\"acme\",queue=\"builds\"} 2",
+        "mansio_queue_dead_letters_total{tenant=\"acme\",queue=\"builds\"} 1",
+        "mansio_queue_open_items{tenant=\"acme\",queue=\"builds\"} 0",
+        "mansio_queue_active_leases{tenant=\"acme\",queue=\"builds\"} 0",
+        "mansio_published_messages_total{tenant=\"acme\",topic=\"dead\"} 1",
+    ] {
+        assert!(text.contains(expected), "{expected} is not in {text}");
+    }
+
+    // A claimed item is open and leased.
+    engine
+        .work_publish(item_envelope(EventId::generate(), "next"))
+        .await
+        .unwrap();
+    pull("w4").await.unwrap().unwrap();
+    let text = metrics.render(&engine.queue_gauges().await);
+    for expected in [
+        "mansio_queue_open_items{tenant=\"acme\",queue=\"builds\"} 1",
+        "mansio_queue_active_leases{tenant=\"acme\",queue=\"builds\"} 1",
+    ] {
+        assert!(text.contains(expected), "{expected} is not in {text}");
+    }
+}
+
 // ---- servers that share a broker ---------------------------------------------
 
 const OWNER_TTL: Duration = Duration::from_secs(8);

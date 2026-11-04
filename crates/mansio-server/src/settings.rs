@@ -29,6 +29,8 @@ pub const DEFAULT_TOKEN_PRINCIPAL: &str = "service:mansio";
 pub const DEFAULT_SINK_PATH: &str = "mansio-sink.jsonl";
 /// Whether the file sink syncs each record to disk by default.
 pub const DEFAULT_SINK_SYNC: bool = true;
+/// Whether `GET /metrics` is served and counted by default (`MANSIO_METRICS`).
+pub const DEFAULT_METRICS: bool = true;
 /// Default directory of the snapshots (`MANSIO_SNAPSHOT_DIR`).
 pub const DEFAULT_SNAPSHOT_DIR: &str = "mansio-snapshots";
 /// Default interval between snapshots, in seconds
@@ -355,6 +357,14 @@ pub struct WebhookSettings {
     /// The longest address a webhook may have, in bytes
     /// (`MANSIO_WEBHOOK_URL_MAX_BYTES`).
     pub url_max_bytes: usize,
+    /// Whether a delivery may go to a loopback, link-local or private
+    /// address (`MANSIO_WEBHOOK_ALLOW_PRIVATE_DESTINATIONS`). Off by default:
+    /// a webhook is a request the server makes on the admin's behalf, and an
+    /// address that names an internal service is how it would be misused.
+    pub allow_private_destinations: bool,
+    /// How long after a rotation deliveries are signed with the old secret as
+    /// well as the new (`MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS`).
+    pub rotation_grace: Duration,
 }
 
 impl Default for WebhookSettings {
@@ -365,6 +375,8 @@ impl Default for WebhookSettings {
             max_attempts: 8,
             timeout: Duration::from_secs(10),
             url_max_bytes: 2048,
+            allow_private_destinations: false,
+            rotation_grace: Duration::from_secs(24 * 60 * 60),
         }
     }
 }
@@ -406,6 +418,14 @@ impl WebhookSettings {
             return Err(invalid(
                 "MANSIO_WEBHOOK_URL_MAX_BYTES",
                 "must be at least 1",
+            ));
+        }
+        // The end of a grace is written as an RFC 3339 time (year 9999 at the
+        // latest), so a grace of a century is the most that can be kept.
+        if self.rotation_grace > Duration::from_secs(100 * 365 * 24 * 60 * 60) {
+            return Err(invalid(
+                "MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS",
+                "must be at most 3153600000 (100 years)",
             ));
         }
         Ok(())
@@ -494,6 +514,9 @@ pub struct Settings {
     /// Whether the sink syncs each record to disk before the publish goes on
     /// (`MANSIO_SINK_SYNC`, default `true`). Turn it off for development only.
     pub sink_sync: bool,
+    /// Whether `GET /metrics` is served and what it reports is counted
+    /// (`MANSIO_METRICS`, default `true`).
+    pub metrics: bool,
     /// The directory of the snapshots of each tenant's state
     /// (`MANSIO_SNAPSHOT_DIR`); `None` keeps none, and every start replays
     /// every topic from offset 0.
@@ -632,6 +655,14 @@ impl Settings {
                 "MANSIO_WEBHOOK_URL_MAX_BYTES",
                 webhook_defaults.url_max_bytes,
             )?,
+            allow_private_destinations: env.parse(
+                "MANSIO_WEBHOOK_ALLOW_PRIVATE_DESTINATIONS",
+                webhook_defaults.allow_private_destinations,
+            )?,
+            rotation_grace: env.seconds(
+                "MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS",
+                webhook_defaults.rotation_grace,
+            )?,
         };
         webhooks.validate()?;
 
@@ -657,6 +688,7 @@ impl Settings {
                 Some(path) => Some(PathBuf::from(path)),
             },
             sink_sync: env.parse("MANSIO_SINK_SYNC", DEFAULT_SINK_SYNC)?,
+            metrics: env.parse("MANSIO_METRICS", DEFAULT_METRICS)?,
             snapshot_dir: match env.raw("MANSIO_SNAPSHOT_DIR") {
                 None => Some(PathBuf::from(DEFAULT_SNAPSHOT_DIR)),
                 Some(dir) if dir.is_empty() => None,
@@ -1195,13 +1227,23 @@ mod tests {
         assert_eq!(stream.sse_max_per_credential, 10);
         assert_eq!(stream.sse_max, 1000);
         assert_eq!(stream.validate(), Ok(()));
-        let webhooks = WebhookSettings::default();
+        let mut webhooks = WebhookSettings::default();
         assert_eq!(webhooks.backoff_base, Duration::from_secs(5));
         assert_eq!(webhooks.backoff_cap, Duration::from_secs(300));
         assert_eq!(webhooks.max_attempts, 8);
         assert_eq!(webhooks.timeout, Duration::from_secs(10));
         assert_eq!(webhooks.url_max_bytes, 2048);
+        assert!(!webhooks.allow_private_destinations);
+        assert_eq!(webhooks.rotation_grace, Duration::from_secs(86_400));
         assert_eq!(webhooks.validate(), Ok(()));
+        webhooks.rotation_grace = Duration::from_secs(u64::MAX / 2);
+        assert!(matches!(
+            webhooks.validate(),
+            Err(SettingsError::Invalid {
+                name: "MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1219,6 +1261,8 @@ mod tests {
             ("MANSIO_WEBHOOK_MAX_ATTEMPTS", "5"),
             ("MANSIO_WEBHOOK_TIMEOUT_SECONDS", "2"),
             ("MANSIO_WEBHOOK_URL_MAX_BYTES", "512"),
+            ("MANSIO_WEBHOOK_ALLOW_PRIVATE_DESTINATIONS", "true"),
+            ("MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS", "60"),
         ])
         .unwrap();
         assert_eq!(
@@ -1239,6 +1283,8 @@ mod tests {
                 max_attempts: 5,
                 timeout: Duration::from_secs(2),
                 url_max_bytes: 512,
+                allow_private_destinations: true,
+                rotation_grace: Duration::from_secs(60),
             }
         );
     }
@@ -1340,6 +1386,24 @@ mod tests {
             settings(&bad).unwrap_err(),
             SettingsError::Invalid {
                 name: "MANSIO_SINK_SYNC",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn metrics_are_on_unless_told_not_to() {
+        let base = [("MANSIO_TOKEN", "t"), ("MANSIO_BROKER", "memory")];
+        assert!(settings(&base).unwrap().metrics);
+        let mut off = base.to_vec();
+        off.push(("MANSIO_METRICS", "false"));
+        assert!(!settings(&off).unwrap().metrics);
+        let mut bad = base.to_vec();
+        bad.push(("MANSIO_METRICS", "maybe"));
+        assert!(matches!(
+            settings(&bad).unwrap_err(),
+            SettingsError::Invalid {
+                name: "MANSIO_METRICS",
                 ..
             }
         ));
