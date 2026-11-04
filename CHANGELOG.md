@@ -7,6 +7,18 @@ All notable changes to mansio are listed here. The format follows
 
 ### Added
 
+- The engine writes a snapshot of each tenant's state (open items, leases,
+  items owed a fact, ids of finished items, unacknowledged alerts, and the
+  ids of acknowledged ones) with the offset of each topic it covers, and a
+  start replays only the messages after those offsets instead of every topic
+  from offset 0. `MANSIO_SNAPSHOT_INTERVAL_SECONDS` (default 300, 0 for none;
+  `snapshot_interval_seconds` in `GET /v1/settings`) says how often a
+  tenant whose state changed is written, and `MANSIO_SNAPSHOT_DIR` (default
+  `mansio-snapshots`, `/data/snapshots` in the image, empty for none) where.
+  A snapshot that cannot be read, or does not fit the topics, is ignored with
+  a warning and the start replays from offset 0. The server also logs a
+  warning at start when `MANSIO_RETENTION_FACTS_SECONDS` is shorter than
+  `MANSIO_RETENTION_WORK_SECONDS`.
 - Credential sessions on Iggy are bounded. `MANSIO_IGGY_SESSION_IDLE_SECONDS`
   (default 300) closes the clients of a credential that has gone unused, and
   the next request signs in again. `MANSIO_IGGY_SESSION_CLIENTS` (default 2)
