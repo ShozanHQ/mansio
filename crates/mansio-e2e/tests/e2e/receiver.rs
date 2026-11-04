@@ -213,6 +213,13 @@ pub fn signature(secret: &str, timestamp: i64, body: &[u8]) -> String {
 /// is the one worked out here over the timestamp it names and the body, and a
 /// timestamp that is recent. Returns the timestamp.
 pub fn check_signed(received: &Received, secret: &str) -> anyhow::Result<i64> {
+    check_signed_under(received, &[secret])
+}
+
+/// As [`check_signed`] for a delivery signed under several secrets, as one is
+/// in the grace period after a rotation: one `v1` for each secret, in the
+/// order given.
+pub fn check_signed_under(received: &Received, secrets: &[&str]) -> anyhow::Result<i64> {
     ensure!(
         received.header("content-type")? == "application/cloudevents+json",
         "content-type is {:?}",
@@ -225,14 +232,20 @@ pub fn check_signed(received: &Received, secret: &str) -> anyhow::Result<i64> {
         .and_then(|part| part.strip_prefix("t="))
         .and_then(|value| value.parse().ok())
         .with_context(|| format!("no t= in {header:?}"))?;
-    let given = parts
-        .next()
-        .and_then(|part| part.strip_prefix("v1="))
-        .with_context(|| format!("no v1= in {header:?}"))?;
-    ensure!(parts.next().is_none(), "more than t and v1 in {header:?}");
+    for secret in secrets {
+        let given = parts
+            .next()
+            .and_then(|part| part.strip_prefix("v1="))
+            .with_context(|| format!("no v1= in {header:?}"))?;
+        ensure!(
+            given == signature(secret, timestamp, &received.body),
+            "the signature in {header:?} is not the HMAC-SHA256 of the timestamp and the body"
+        );
+    }
     ensure!(
-        given == signature(secret, timestamp, &received.body),
-        "the signature in {header:?} is not the HMAC-SHA256 of the timestamp and the body"
+        parts.next().is_none(),
+        "more than t and {} v1 in {header:?}",
+        secrets.len()
     );
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?

@@ -48,7 +48,7 @@ The tools are the commands of `mansio`, with the same names and parameters:
 `publish`, `poll`, `work_publish`, `work_pull`, `work_extend`, `work_ack`,
 `work_fail`, `alerts_publish`, `alerts_ack`, `consumers_get`, `consumers_commit`,
 `principals_create`, `principals_list`, `principals_revoke`, `webhooks_create`,
-`webhooks_list` and `webhooks_delete`. The last six need the admin token and
+`webhooks_list`, `webhooks_delete` and `webhooks_rotate`. The last seven need the admin token and
 are refused to a credential like the one above.
 
 ## A first `work_pull` and `work_ack`

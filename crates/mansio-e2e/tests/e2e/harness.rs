@@ -107,6 +107,9 @@ fn local_webhook_settings() -> WebhookSettings {
         max_attempts: 3,
         timeout: Duration::from_secs(2),
         url_max_bytes: 2048,
+        // The tests' receivers listen on the loopback.
+        allow_private_destinations: true,
+        rotation_grace: Duration::from_secs(4),
     }
 }
 
@@ -961,13 +964,39 @@ impl Target {
         topic: &str,
         url: &str,
     ) -> anyhow::Result<(StatusCode, Value)> {
-        let body = json!({"tenant": self.tenant, "topic": topic, "url": url});
+        self.create_webhook_at(topic, url, None).await
+    }
+
+    /// `webhooks_create` with a start position (`first` or `next`) or, with
+    /// `None`, none, which the server takes as `first`.
+    pub async fn create_webhook_at(
+        &self,
+        topic: &str,
+        url: &str,
+        start: Option<&str>,
+    ) -> anyhow::Result<(StatusCode, Value)> {
+        let mut body = json!({"tenant": self.tenant, "topic": topic, "url": url});
+        if let Some(start) = start {
+            body["start"] = json!(start);
+        }
         self.authed(
             Method::POST,
             &format!("{}/v1/webhooks", self.base),
             Some(&body),
         )
         .await
+    }
+
+    /// `webhooks_rotate`, which must be accepted: the answer with the webhook,
+    /// the new secret and until when the old one signs too.
+    pub async fn rotate_webhook(&self, id: &str) -> anyhow::Result<Value> {
+        let uri = format!("{}/v1/webhooks/{id}/rotate", self.base);
+        let (status, response) = self.authed(Method::POST, &uri, None).await?;
+        ensure!(
+            status == StatusCode::OK,
+            "webhooks_rotate answered {status}: {response}"
+        );
+        Ok(response)
     }
 
     /// `webhooks_create`, which must be accepted: the answer with the

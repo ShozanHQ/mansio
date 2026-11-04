@@ -384,7 +384,11 @@ impl Server {
                 "/v1/webhooks",
                 post(webhooks_api::webhooks_create).get(webhooks_api::webhooks_list),
             )
-            .route("/v1/webhooks/{id}", delete(webhooks_api::webhooks_delete));
+            .route("/v1/webhooks/{id}", delete(webhooks_api::webhooks_delete))
+            .route(
+                "/v1/webhooks/{id}/rotate",
+                post(webhooks_api::webhooks_rotate),
+            );
         if metrics_on {
             router = router.route("/metrics", get(metrics_text));
         }
@@ -574,6 +578,8 @@ async fn settings(
         webhook_max_attempts: webhooks.max_attempts,
         webhook_timeout_seconds: seconds(webhooks.timeout),
         webhook_url_max_bytes: u64::try_from(webhooks.url_max_bytes).unwrap_or(u64::MAX),
+        webhook_allow_private_destinations: webhooks.allow_private_destinations,
+        webhook_rotation_grace_seconds: seconds(webhooks.rotation_grace),
     })
 }
 
@@ -1095,6 +1101,10 @@ mod tests {
                 Method::DELETE,
                 "/v1/webhooks/0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3",
             ),
+            (
+                Method::POST,
+                "/v1/webhooks/0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3/rotate",
+            ),
         ];
         for (method, uri) in routes {
             let (status, body) = send(&router, method.clone(), uri, None, "{}").await;
@@ -1310,6 +1320,8 @@ mod tests {
         assert_eq!(settings.webhook_max_attempts, 8);
         assert_eq!(settings.webhook_timeout_seconds, 10);
         assert_eq!(settings.webhook_url_max_bytes, 2048);
+        assert!(!settings.webhook_allow_private_destinations);
+        assert_eq!(settings.webhook_rotation_grace_seconds, 86_400);
     }
 
     #[tokio::test]

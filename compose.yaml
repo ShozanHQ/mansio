@@ -41,10 +41,14 @@
 #   MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS,
 #   MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS, MANSIO_WEBHOOK_MAX_ATTEMPTS,
 #   MANSIO_WEBHOOK_TIMEOUT_SECONDS, MANSIO_WEBHOOK_URL_MAX_BYTES,
+#   MANSIO_WEBHOOK_ALLOW_PRIVATE_DESTINATIONS,
+#   MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS,
 #   MANSIO_OWNER_TTL_SECONDS
 #
 # A webhook to a program on the host is reached from the container as
 # host.docker.internal, which the mansio-server service maps to the host.
+# That is a private address, which a webhook is refused unless
+# MANSIO_WEBHOOK_ALLOW_PRIVATE_DESTINATIONS=true.
 #
 # On start mansio-server replays the topics of every tenant before it answers
 # anything, /healthz included, so a big log keeps /healthz dark for a while.
@@ -171,6 +175,8 @@ services:
       MANSIO_WEBHOOK_MAX_ATTEMPTS: ${MANSIO_WEBHOOK_MAX_ATTEMPTS:-}
       MANSIO_WEBHOOK_TIMEOUT_SECONDS: ${MANSIO_WEBHOOK_TIMEOUT_SECONDS:-}
       MANSIO_WEBHOOK_URL_MAX_BYTES: ${MANSIO_WEBHOOK_URL_MAX_BYTES:-}
+      MANSIO_WEBHOOK_ALLOW_PRIVATE_DESTINATIONS: ${MANSIO_WEBHOOK_ALLOW_PRIVATE_DESTINATIONS:-}
+      MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS: ${MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS:-}
       MANSIO_OWNER_TTL_SECONDS: ${MANSIO_OWNER_TTL_SECONDS:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"

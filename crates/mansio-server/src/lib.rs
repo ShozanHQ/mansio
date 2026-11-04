@@ -25,6 +25,7 @@ mod clock;
 mod consumers_api;
 mod credentials;
 mod cursors;
+mod destination;
 mod engine;
 mod error;
 mod events_api;

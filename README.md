@@ -227,6 +227,7 @@ as a space, and each flag is a parameter of the operation, with `-` for `_`.
 | `principals list`, `webhooks list` | One principal, or webhook, a line. |
 | `principals revoke`, `webhooks delete` | The principal, or webhook. |
 | `webhooks create` | `{"webhook", "secret"}`: the signing secret is shown this once. |
+| `webhooks rotate` | `{"webhook", "secret", "previous_secret_valid_until"}`: the new signing secret is shown this once. |
 | `consumers get`, `consumers commit` | `{"consumer", "offset", "next"}`. |
 | `mcp` | Nothing: it serves [MCP](#mcp) on stdin and stdout. |
 
@@ -254,8 +255,9 @@ mansio alerts ack --tenant acme --alert ALERTID
 mansio principals create --kind agent --name builder-1 --tenant acme \
   --scopes '[{"topic":"work.builds","verbs":["claim"]}]' --ttl-seconds 3600
 mansio webhooks create --tenant acme --topic facts.build \
-  --endpoint https://example.com/hook
+  --endpoint https://example.com/hook --start next
 mansio webhooks list --tenant acme
+mansio webhooks rotate --id WEBHOOKID
 ```
 
 - `work pull --wait SECONDS` looks again every `MANSIO_POLL_INTERVAL_MILLIS`
@@ -307,7 +309,7 @@ or not JSON is a JSON-RPC parse error and does not end the server.
 | `alerts_publish`, `alerts_ack` | Alerts. |
 | `consumers_get`, `consumers_commit` | Where a named consumer stands. |
 | `principals_create`, `principals_list`, `principals_revoke` | Credentials, with the admin token. |
-| `webhooks_create`, `webhooks_list`, `webhooks_delete` | Webhooks, with the admin token. |
+| `webhooks_create`, `webhooks_list`, `webhooks_delete`, `webhooks_rotate` | Webhooks, with the admin token. `webhooks_create` takes `start`, `first` or `next`. |
 
 Configuration for [Claude Code](docs/mcp-claude-code.md) and
 [Codex](docs/mcp-codex.md), each with a first `work_pull` and `work_ack`, is in
@@ -623,11 +625,12 @@ data: {"specversion":"1.0","id":"...","type":"build.finished",...}
 
 Software that will not hold a connection is sent each envelope of a topic as an
 HTTP POST. The admin credential makes them: `webhooks_create` (a tenant, a
-topic and an `http` or `https` URL), `webhooks_list` and `webhooks_delete`.
+topic, an `http` or `https` URL and optionally a `start`), `webhooks_list`,
+`webhooks_rotate` and `webhooks_delete`.
 
 ```sh
 curl -H "Authorization: Bearer $MANSIO_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"tenant":"acme","topic":"facts.build","url":"https://example.com/hook"}' \
+  -d '{"tenant":"acme","topic":"facts.build","url":"https://example.com/hook","start":"next"}' \
   http://127.0.0.1:7070/v1/webhooks
 # 201 {"webhook":{"id":"<uuid>",...},"secret":"whsec_..."}   the secret, once
 
@@ -636,6 +639,10 @@ curl -H "Authorization: Bearer $MANSIO_TOKEN" 'http://127.0.0.1:7070/v1/webhooks
 #      "url":"https://example.com/hook","created_at":"...",
 #      "last_delivered_offset":7,"last_error":{"at":"...","offset":7,"message":"HTTP 500"}}]}
 #      no secret in it
+
+curl -X POST -H "Authorization: Bearer $MANSIO_TOKEN" http://127.0.0.1:7070/v1/webhooks/<id>/rotate
+# 200 {"webhook":{...},"secret":"whsec_...","previous_secret_valid_until":"..."}
+#      the new secret, once
 
 curl -X DELETE -H "Authorization: Bearer $MANSIO_TOKEN" http://127.0.0.1:7070/v1/webhooks/<id>
 ```
@@ -653,9 +660,36 @@ lines. The timestamp is the moment of that attempt.
 
 - Each webhook follows its topic from a position of its own that mansio keeps
   (see [Consumers](#consumers)), so it delivers in offset order, one envelope
-  at a time, and a restarted server resumes where the last one stopped. A new webhook starts at the first
-  message the topic holds, and a topic nobody has published to yet is waited
-  for.
+  at a time, and a restarted server resumes where the last one stopped. A new
+  webhook starts at the first message the topic holds, or, with `"start":
+  "next"`, at the first one published after it is made (`"first"` is the
+  default). `next` reads the topic through once to find its end. A topic
+  nobody has published to yet is waited for.
+- A delivery goes only to an address outside the server's own network. The
+  address a host name resolves to is checked when each delivery is made, and a
+  loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, `fe80::/10`)
+  or private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`)
+  address, or a host name with one among its addresses, is refused: the
+  attempt fails with "the destination is a loopback, link-local or private
+  address" (never the address itself), is retried like any other failure and
+  is given up on the same way. `MANSIO_WEBHOOK_ALLOW_PRIVATE_DESTINATIONS=true`
+  allows them, for a receiver inside the network. While they are
+  refused, deliveries ignore a proxy named in the server's environment, which
+  would resolve the host itself.
+- `webhooks_rotate` makes a new signing secret and returns it this once.
+  Until `MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS` have passed
+  (`previous_secret_valid_until` says when) every delivery is signed with the
+  new secret and the old, `mansio-signature: t=...,v1=<new>,v1=<old>`, and a
+  receiver that holds either verifies it; after that, with the new one only.
+  Rotating again inside the grace drops the first secret. The old secret is
+  not kept past the grace on the wire, but stays in the server's log.
+- Creating, rotating and deleting a webhook are recorded as
+  `mansio.webhook.created`, `mansio.webhook.rotated` and
+  `mansio.webhook.deleted` on `facts.webhook`, in the sink first, made by the
+  admin who did it. They carry the webhook, the topic and the origin of the
+  address (scheme, host and port, not a user name, path or query), the start
+  of a created one and `previous_secret_valid_until` of a rotated one, and no
+  secret.
 - A 2xx is delivery. Any other answer, no answer within
   `MANSIO_WEBHOOK_TIMEOUT_SECONDS` and a connection that cannot be made are
   tried again after `MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS * 2^(attempt-1)`, at
@@ -680,7 +714,8 @@ lines. The timestamp is the moment of that attempt.
   to an address the admin removed, and skipping a creation would lose the only
   copy of its secret. The log says why, at `error`, when the failures start and
   again if what goes wrong changes, not on every try. Until it loads,
-  `webhooks_create`, `webhooks_list` and `webhooks_delete` answer 503,
+  `webhooks_create`, `webhooks_list`, `webhooks_rotate` and `webhooks_delete`
+  answer 503,
   `/healthz` is `degraded`, and no delivery task starts; it is read again after
   a wait that grows from `MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS` to
   `MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS`, by whichever request, health check or
@@ -935,6 +970,8 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_WEBHOOK_MAX_ATTEMPTS` | `8` | Attempts at one delivery before it is recorded as failed and the webhook moves on. |
 | `MANSIO_WEBHOOK_TIMEOUT_SECONDS` | `10` | How long one attempt may take. |
 | `MANSIO_WEBHOOK_URL_MAX_BYTES` | `2048` | The longest address a webhook may have. |
+| `MANSIO_WEBHOOK_ALLOW_PRIVATE_DESTINATIONS` | `false` | Whether a delivery may go to a loopback, link-local or private address. Off, it is refused, judged on the address the host name resolves to when the delivery is made. |
+| `MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS` | `86400` | How long after `webhooks_rotate` deliveries are signed with the old secret as well as the new. `0` stops signing with the old one at once. At most `3153600000` (100 years); the server refuses a larger value at start. |
 | `MANSIO_IGGY_ADDRESS` | `127.0.0.1:8090` | Iggy's TCP address, `host:port`. |
 | `MANSIO_IGGY_USERNAME` | `mansio` | The Iggy user mansio-server acts as. It manages users and streams and reads and writes topics; it is not Iggy's root user. |
 | `MANSIO_IGGY_PASSWORD` | none, required with `iggy` | Its password. If Iggy refuses it at startup, the server exits with a message that names this variable and `MANSIO_IGGY_USERNAME`. |
@@ -1003,7 +1040,7 @@ topics it creates, and leaves Iggy's own settings at its defaults.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MANSIO_E2E_URL` | unset | A running server for `mansio-e2e` to use, with `MANSIO_TOKEN` set to its token. Unset starts a server in the test process on the memory broker, with a lease of 2 s that may run to 60 s, 3 attempts, a backoff from 1 s to 4 s, alerts surfaced every 2 s, an agent credential that lasts 3 s, is checked every second and swept every second, streams that look every 50 ms and send a comment every second, a grace of 2 s for a shutdown, and webhooks that retry after 1 s to 4 s, give up after 3 attempts and wait 2 s for an answer, and an idempotency window of 4 s over at most 20 keys. Against a running server the tests read its settings from `GET /v1/settings`. |
+| `MANSIO_E2E_URL` | unset | A running server for `mansio-e2e` to use, with `MANSIO_TOKEN` set to its token. Unset starts a server in the test process on the memory broker, with a lease of 2 s that may run to 60 s, 3 attempts, a backoff from 1 s to 4 s, alerts surfaced every 2 s, an agent credential that lasts 3 s, is checked every second and swept every second, streams that look every 50 ms and send a comment every second, a grace of 2 s for a shutdown, and webhooks that retry after 1 s to 4 s, give up after 3 attempts, wait 2 s for an answer, may go to private addresses and sign with a rotated secret's predecessor for 4 s, and an idempotency window of 4 s over at most 20 keys. Against a running server the tests read its settings from `GET /v1/settings`. |
 | `MANSIO_E2E_STATE_DIR` | unset | A directory that the first and second passes of the restart, idempotency and retention tests (see [Develop](#develop)) keep their state in. Required by those tests, which fail without it. |
 | `MANSIO_E2E_SINK_PATH` | unset | The sink file of the running server, as the test process can read it. With it the tests also check the order of the sink; without it they check the topics only. |
 | `MANSIO_E2E_IGGY_ADDRESS` | unset | Iggy's TCP address as the test process reaches it (`127.0.0.1:8090` for `compose.yaml`). With `MANSIO_E2E_URL` set it is required: the credential tests ask Iggy itself, without mansio-server, what a credential may do, and fail if they cannot. Without `MANSIO_E2E_URL` they ask the memory broker. |
@@ -1060,6 +1097,8 @@ MANSIO_LEASE_SECONDS=2 MANSIO_MAX_ATTEMPTS=3 MANSIO_BACKOFF_BASE_SECONDS=1 \
   MANSIO_STREAM_POLL_MILLIS=100 MANSIO_SSE_KEEPALIVE_SECONDS=1 \
   MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS=1 MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS=4 \
   MANSIO_WEBHOOK_MAX_ATTEMPTS=3 MANSIO_WEBHOOK_TIMEOUT_SECONDS=2 \
+  MANSIO_WEBHOOK_ALLOW_PRIVATE_DESTINATIONS=true \
+  MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS=4 \
   MANSIO_IDEMPOTENCY_WINDOW_SECONDS=10 MANSIO_IDEMPOTENCY_MAX_KEYS=20 \
   docker compose up --build --wait
 MANSIO_E2E_URL=http://127.0.0.1:7070 MANSIO_TOKEN=mansio-dev-token \
