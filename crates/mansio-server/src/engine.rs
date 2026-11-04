@@ -45,6 +45,7 @@ use crate::clock::Clock;
 use crate::error::ApiError;
 use crate::facts::Facts;
 use crate::idempotency::{self, Keys};
+use crate::metrics::{Metrics, QueueGauge};
 use crate::records;
 use crate::recover;
 use crate::settings::WorkSettings;
@@ -115,6 +116,7 @@ pub struct Engine {
     seeded_keys: Mutex<Option<HashMap<TenantId, Keys>>>,
     /// Where snapshots of each tenant's state are kept, if they are.
     snapshots: Option<Arc<dyn Snapshots>>,
+    metrics: Arc<Metrics>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -147,7 +149,44 @@ impl Engine {
             discovered: AtomicBool::new(false),
             seeded_keys: Mutex::new(None),
             snapshots: None,
+            metrics: Arc::new(Metrics::new(false)),
         }
+    }
+
+    /// Count what the engine does in `metrics`.
+    #[must_use]
+    pub(crate) fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Each queue's open items and leases, for the tenants whose state is
+    /// loaded. Waits for a tenant's lock like any request does.
+    pub(crate) async fn queue_gauges(&self) -> Vec<QueueGauge> {
+        let cells: Vec<(TenantId, Arc<Mutex<TenantState>>)> = {
+            let tenants = self.tenants.lock().unwrap_or_else(PoisonError::into_inner);
+            tenants
+                .iter()
+                .map(|(tenant, cell)| (tenant.clone(), Arc::clone(cell)))
+                .collect()
+        };
+        let mut gauges = Vec::new();
+        for (tenant, cell) in cells {
+            let held = cell.lock().await;
+            if !held.loaded {
+                continue;
+            }
+            for (queue, items) in &held.queues {
+                gauges.push(QueueGauge {
+                    tenant: tenant.to_string(),
+                    queue: queue.to_string(),
+                    open: items.len(),
+                    leases: items.leased(),
+                });
+            }
+        }
+        gauges.sort_by(|a, b| (&a.tenant, &a.queue).cmp(&(&b.tenant, &b.queue)));
+        gauges
     }
 
     /// Keep snapshots of each tenant's state in files in `dir`, one per
@@ -464,6 +503,8 @@ impl Engine {
             }
         };
         note_published(held, &envelope.topic, offset);
+        self.metrics
+            .published(envelope.tenant.as_str(), &envelope.topic.to_string());
         Ok(Published { offset, envelope })
     }
 
@@ -529,6 +570,8 @@ impl Engine {
                 .ensure_topic(&envelope.tenant, &envelope.topic)
                 .await?;
             let offset = self.broker.publish(&Caller::Admin, &envelope).await?;
+            self.metrics
+                .published(envelope.tenant.as_str(), &envelope.topic.to_string());
             return Ok((Published { offset, envelope }, false));
         }
         let mut held = self.lock(&envelope.tenant).await?;
@@ -1271,6 +1314,7 @@ impl Engine {
         self.append(held, fact).await?;
         held.queue_mut(queue)
             .set_phase(id, Phase::Backoff { due, next });
+        self.metrics.expired(tenant.as_str(), queue.as_str());
         debug!(%tenant, %queue, %id, "lease expired");
         self.advance(held, tenant, queue, id, now).await
     }
@@ -1334,6 +1378,10 @@ impl Engine {
             return Ok(());
         };
         self.append(held, *fact).await?;
+        match then {
+            Then::Ready => self.metrics.retried(tenant.as_str(), queue.as_str()),
+            Then::Gone => self.metrics.dead(tenant.as_str(), queue.as_str()),
+        }
         let q = held.queue_mut(queue);
         match then {
             Then::Ready => q.set_phase(id, Phase::Ready),

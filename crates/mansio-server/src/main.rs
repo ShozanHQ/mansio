@@ -87,6 +87,7 @@ async fn serve() -> anyhow::Result<()> {
     server
         .with_sink(sink)
         .with_limits(settings.limits)
+        .with_metrics(settings.metrics)
         .with_work_settings(settings.work)
         .context("the work settings")?
         .with_credential_settings(settings.credentials)

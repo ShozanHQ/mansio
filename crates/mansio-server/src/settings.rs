@@ -29,6 +29,8 @@ pub const DEFAULT_TOKEN_PRINCIPAL: &str = "service:mansio";
 pub const DEFAULT_SINK_PATH: &str = "mansio-sink.jsonl";
 /// Whether the file sink syncs each record to disk by default.
 pub const DEFAULT_SINK_SYNC: bool = true;
+/// Whether `GET /metrics` is served and counted by default (`MANSIO_METRICS`).
+pub const DEFAULT_METRICS: bool = true;
 /// Default directory of the snapshots (`MANSIO_SNAPSHOT_DIR`).
 pub const DEFAULT_SNAPSHOT_DIR: &str = "mansio-snapshots";
 /// Default interval between snapshots, in seconds
@@ -474,6 +476,9 @@ pub struct Settings {
     /// Whether the sink syncs each record to disk before the publish goes on
     /// (`MANSIO_SINK_SYNC`, default `true`). Turn it off for development only.
     pub sink_sync: bool,
+    /// Whether `GET /metrics` is served and what it reports is counted
+    /// (`MANSIO_METRICS`, default `true`).
+    pub metrics: bool,
     /// The directory of the snapshots of each tenant's state
     /// (`MANSIO_SNAPSHOT_DIR`); `None` keeps none, and every start replays
     /// every topic from offset 0.
@@ -632,6 +637,7 @@ impl Settings {
                 Some(path) => Some(PathBuf::from(path)),
             },
             sink_sync: env.parse("MANSIO_SINK_SYNC", DEFAULT_SINK_SYNC)?,
+            metrics: env.parse("MANSIO_METRICS", DEFAULT_METRICS)?,
             snapshot_dir: match env.raw("MANSIO_SNAPSHOT_DIR") {
                 None => Some(PathBuf::from(DEFAULT_SNAPSHOT_DIR)),
                 Some(dir) if dir.is_empty() => None,
@@ -1296,6 +1302,24 @@ mod tests {
             settings(&bad).unwrap_err(),
             SettingsError::Invalid {
                 name: "MANSIO_SINK_SYNC",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn metrics_are_on_unless_told_not_to() {
+        let base = [("MANSIO_TOKEN", "t"), ("MANSIO_BROKER", "memory")];
+        assert!(settings(&base).unwrap().metrics);
+        let mut off = base.to_vec();
+        off.push(("MANSIO_METRICS", "false"));
+        assert!(!settings(&off).unwrap().metrics);
+        let mut bad = base.to_vec();
+        bad.push(("MANSIO_METRICS", "maybe"));
+        assert!(matches!(
+            settings(&bad).unwrap_err(),
+            SettingsError::Invalid {
+                name: "MANSIO_METRICS",
                 ..
             }
         ));

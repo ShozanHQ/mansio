@@ -14,6 +14,7 @@ mod credentials;
 mod events;
 mod harness;
 mod idempotency;
+mod metrics;
 mod ordering;
 mod oversized;
 mod passes;

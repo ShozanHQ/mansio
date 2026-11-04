@@ -3323,3 +3323,61 @@ async fn an_engine_without_a_store_keeps_no_snapshot_and_still_restarts() {
     let (picture, _) = restarted(&rig, None).await;
     assert_eq!(picture, rig.picture().await);
 }
+
+#[tokio::test]
+async fn expiries_retries_dead_letters_and_the_queue_gauges_are_counted() {
+    let metrics = Arc::new(Metrics::new(true));
+    let clock = Arc::new(ManualClock::new(START));
+    let engine = Engine::new(
+        Arc::<FlakyBroker>::default(),
+        Arc::new(LogSink::default()),
+        clock.clone(),
+        settings(),
+        3,
+    )
+    .with_metrics(Arc::clone(&metrics));
+    let pull = async |name: &str| {
+        engine
+            .work_pull(&tenant(), &queue(), &agent("one"), &consumer(name))
+            .await
+    };
+
+    engine
+        .work_publish(item_envelope(EventId::generate(), "job"))
+        .await
+        .unwrap();
+    // Every attempt's lease runs out: the first two are retried, the third
+    // goes to dead.
+    for name in ["w1", "w2", "w3"] {
+        pull(name).await.unwrap().unwrap();
+        clock.advance(Duration::from_secs(10));
+        engine.tick().await;
+        clock.advance(Duration::from_secs(5));
+        engine.tick().await;
+    }
+    let text = metrics.render(&engine.queue_gauges().await);
+    for expected in [
+        "mansio_queue_lease_expiries_total{tenant=\"acme\",queue=\"builds\"} 3",
+        "mansio_queue_retries_total{tenant=\"acme\",queue=\"builds\"} 2",
+        "mansio_queue_dead_letters_total{tenant=\"acme\",queue=\"builds\"} 1",
+        "mansio_queue_open_items{tenant=\"acme\",queue=\"builds\"} 0",
+        "mansio_queue_active_leases{tenant=\"acme\",queue=\"builds\"} 0",
+        "mansio_published_messages_total{tenant=\"acme\",topic=\"dead\"} 1",
+    ] {
+        assert!(text.contains(expected), "{expected} is not in {text}");
+    }
+
+    // A claimed item is open and leased.
+    engine
+        .work_publish(item_envelope(EventId::generate(), "next"))
+        .await
+        .unwrap();
+    pull("w4").await.unwrap().unwrap();
+    let text = metrics.render(&engine.queue_gauges().await);
+    for expected in [
+        "mansio_queue_open_items{tenant=\"acme\",queue=\"builds\"} 1",
+        "mansio_queue_active_leases{tenant=\"acme\",queue=\"builds\"} 1",
+    ] {
+        assert!(text.contains(expected), "{expected} is not in {text}");
+    }
+}

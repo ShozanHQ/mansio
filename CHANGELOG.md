@@ -26,6 +26,13 @@ All notable changes to mansio are listed here. The format follows
 
 ### Added
 
+- One structured log line per request (method, route pattern, tenant,
+  status, duration, principal kind and name, never a token), and
+  `GET /metrics` in Prometheus text format for the admin token: requests
+  and latency by method, route and status, published messages by tenant and
+  topic, and open items, active leases, lease expiries, retries and dead
+  letters per queue. `MANSIO_METRICS` (default `true`) turns the endpoint and
+  its counting off.
 - The engine writes a snapshot of each tenant's state (open items, leases,
   items owed a fact, ids of finished items, unacknowledged alerts, and the
   ids of acknowledged ones) with the offset of each topic it covers, and a
