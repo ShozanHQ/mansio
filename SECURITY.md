@@ -2,8 +2,10 @@
 
 ## Supported versions
 
-mansio has no release yet. The supported version is `main`: a fix lands there.
-When there is a first release, this page will say which releases get fixes.
+Releases are made by the release workflow (README, "Releases"; verify one with
+"Verify a release"). The supported version is the latest release and `main`: a
+fix lands on `main` and ships in the next release. Until the first release is
+published, only `main` is supported.
 
 ## Reporting a vulnerability
 
