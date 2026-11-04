@@ -74,15 +74,20 @@ pub enum SystemLog {
     /// each first got, so that a restarted server still answers a repeat with
     /// the first.
     Idempotency,
+    /// Which server owns which tenant: the claims, renewals and releases that
+    /// let several servers share one broker without two of them serving the
+    /// same tenant's work.
+    Owners,
 }
 
 impl SystemLog {
     /// Every log.
-    pub const ALL: [SystemLog; 4] = [
+    pub const ALL: [SystemLog; 5] = [
         SystemLog::Principals,
         SystemLog::Webhooks,
         SystemLog::Cursors,
         SystemLog::Idempotency,
+        SystemLog::Owners,
     ];
 
     /// The name of the log: the topic it lives in.
@@ -93,6 +98,7 @@ impl SystemLog {
             SystemLog::Webhooks => "webhooks",
             SystemLog::Cursors => "cursors",
             SystemLog::Idempotency => "idempotency",
+            SystemLog::Owners => "owners",
         }
     }
 }

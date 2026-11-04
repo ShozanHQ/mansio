@@ -30,6 +30,7 @@ mod error;
 mod events_api;
 mod facts;
 mod idempotency;
+mod ownership;
 mod principals_api;
 mod records;
 mod recover;

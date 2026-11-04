@@ -424,6 +424,7 @@ impl Server {
                 "the registry of webhooks could not be loaded; the next request will try again"
             );
         }
+        let stopped_engine = Arc::clone(&engine);
         let timer = Timer::start(engine, credentials, webhooks);
         // The signal ends the event streams, which would otherwise never let
         // the graceful shutdown finish, and starts the clock on what is left.
@@ -454,6 +455,8 @@ impl Server {
             }
         };
         timer.stop().await;
+        // Nothing is served now: another server may take the tenants at once.
+        stopped_engine.release_ownership().await;
         served
     }
 }
@@ -509,6 +512,7 @@ async fn settings(
         idempotency_max_keys: u64::try_from(work.idempotency_max_keys).unwrap_or(u64::MAX),
         recovery_log_seconds: seconds(work.recovery_log),
         snapshot_interval_seconds: seconds(work.snapshot_interval),
+        owner_ttl_seconds: seconds(work.owner_ttl),
         max_body_bytes: u64::try_from(limits.max_body_bytes).unwrap_or(u64::MAX),
         poll_default_count: limits.poll_default_count,
         poll_max_count: limits.poll_max_count,

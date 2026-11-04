@@ -37,6 +37,11 @@ use crate::facts::{ENGINE_PRINCIPAL, Facts};
 use crate::registry::{Entry, Record, Registry};
 use crate::settings::CredentialSettings;
 
+/// How soon after a read of the principals log a token nobody issued here may
+/// make the server read it again. The sweep reads it every
+/// `MANSIO_CREDENTIAL_SWEEP_SECONDS` whatever this says.
+const FOLLOW_MISS_MILLIS: i64 = 1_000;
+
 /// The kind of principal whose credential always expires.
 const AGENT: &str = "agent";
 
@@ -121,6 +126,16 @@ pub struct Credentials {
     /// When the broker last confirmed each principal's credential, in
     /// milliseconds since the Unix epoch.
     checked: StdMutex<HashMap<PrincipalId, i64>>,
+    /// How far the principals log has been read, and when it was last read
+    /// for records another server may have written.
+    followed: Mutex<Followed>,
+}
+
+/// Where the tail of the principals log stands.
+#[derive(Debug, Default)]
+struct Followed {
+    next: u64,
+    at: Option<i64>,
 }
 
 impl std::fmt::Debug for Credentials {
@@ -156,6 +171,7 @@ impl Credentials {
             loaded: OnceCell::new(),
             failed: Mutex::new(None),
             checked: StdMutex::default(),
+            followed: Mutex::new(Followed::default()),
         }
     }
 
@@ -224,6 +240,7 @@ impl Credentials {
 
     async fn rebuild(&self) -> Result<(), LoadError> {
         self.registry.clear();
+        let mut followed = self.followed.lock().await;
         let mut offset = 0;
         loop {
             let batch = self
@@ -245,6 +262,9 @@ impl Credentials {
             }
             offset = next;
         }
+        followed.next = offset;
+        followed.at = Some(self.clock.now_millis());
+        drop(followed);
         for record in self.registry.all() {
             let told = self
                 .broker
@@ -262,6 +282,64 @@ impl Credentials {
         self.delete_orphans().await?;
         info!(principals = self.registry.all().len(), "registry rebuilt");
         Ok(())
+    }
+
+    /// Read the records another server has added to the principals log since
+    /// this one last read it, so that a credential issued or revoked there is
+    /// known here. Servers that share a broker each issue credentials, and the
+    /// one that takes over a dead server's tenants must accept what it issued.
+    /// Unless `force`, the log is not read again within a second of the last
+    /// read, so that tokens that were never issued cannot make the server read
+    /// it at every request.
+    /// Whether a record was applied is not reported; a failed read is tried
+    /// again at the next call.
+    async fn follow(&self, force: bool) {
+        let mut followed = self.followed.lock().await;
+        let now = self.clock.now_millis();
+        let wait = FOLLOW_MISS_MILLIS;
+        if !force
+            && followed
+                .at
+                .is_some_and(|at| (0..wait).contains(&now.saturating_sub(at)))
+        {
+            return;
+        }
+        followed.at = Some(now);
+        let mut entries = Vec::new();
+        let mut offset = followed.next;
+        loop {
+            let batch = match self
+                .broker
+                .system_read(SystemLog::Principals, offset, self.page)
+                .await
+            {
+                Ok(batch) => batch,
+                Err(error) => {
+                    warn!(%error, "the principals log could not be read for records of other servers");
+                    return;
+                }
+            };
+            let Some(last) = batch.last() else { break };
+            let next = last.offset.saturating_add(1);
+            for record in &batch {
+                match Entry::decode(&record.payload) {
+                    Ok(entry) => entries.push(entry),
+                    Err(reason) => {
+                        warn!(offset = record.offset, %reason, "a record of the principals log was not read");
+                    }
+                }
+            }
+            if next <= offset {
+                break;
+            }
+            offset = next;
+        }
+        // Applied together, so that a principal revoked in this very log is
+        // never seen alive by a request in between.
+        for entry in entries {
+            self.registry.apply(entry);
+        }
+        followed.next = offset;
     }
 
     /// Delete the broker users made for principals that no record owns. Called
@@ -325,10 +403,18 @@ impl Credentials {
     pub(crate) async fn authenticate(&self, presented: &str) -> Result<Actor, ApiError> {
         self.load().await?;
         let credential = Credential::new(presented);
-        let record = self
-            .registry
-            .by_digest(&credential.digest())
-            .ok_or(ApiError::Unauthorized)?;
+        let digest = credential.digest();
+        let record = match self.registry.by_digest(&digest) {
+            Some(record) => record,
+            None => {
+                // It may have been issued by another server since this one read
+                // the log.
+                self.follow(false).await;
+                self.registry
+                    .by_digest(&digest)
+                    .ok_or(ApiError::Unauthorized)?
+            }
+        };
         let now = self.clock.now_millis();
         if record.expired(now) {
             return Err(ApiError::Unauthorized);
@@ -624,6 +710,7 @@ impl Credentials {
         if self.load().await.is_err() {
             return;
         }
+        self.follow(true).await;
         let now = self.clock.now_millis();
         let by = self.engine_principal();
         for id in self.registry.expired(now) {
@@ -959,6 +1046,42 @@ mod tests {
             assert!(is(&error, &ApiError::Unauthorized), "{presented:?}");
         }
         assert_eq!(rig.broker.identifies.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_credential_another_server_issued_after_this_one_started_is_accepted() {
+        let first = Rig::new();
+        first.credentials.load().await.unwrap();
+        let second = Rig::over(first.broker.clone(), first.clock.clone());
+        let issued = second.issue("agent", "builder-1", None).await.unwrap();
+
+        // Inside the second after the last read of the log it is not asked
+        // again.
+        assert!(
+            first
+                .credentials
+                .authenticate(&token(&issued))
+                .await
+                .is_err()
+        );
+        first.clock.advance(Duration::from_secs(1));
+        let actor = first.credentials.authenticate(&token(&issued)).await;
+        assert!(actor.is_ok(), "{actor:?}");
+
+        // A revocation made there is known here by the next sweep.
+        second
+            .credentials
+            .revoke(&admin(), issued.principal.id, RevokeReason::Requested)
+            .await
+            .unwrap();
+        first.clock.advance(Duration::from_secs(1));
+        first.credentials.sweep().await;
+        let error = first
+            .credentials
+            .authenticate(&token(&issued))
+            .await
+            .unwrap_err();
+        assert!(is(&error, &ApiError::Unauthorized), "{error:?}");
     }
 
     #[tokio::test]

@@ -241,6 +241,10 @@ pub struct EffectiveSettings {
     /// `MANSIO_SNAPSHOT_INTERVAL_SECONDS`: how often the state of a tenant
     /// that has changed is written to a snapshot. 0 means never.
     pub snapshot_interval_seconds: u64,
+    /// `MANSIO_OWNER_TTL_SECONDS`: how long a tenant stays with a server
+    /// that has stopped renewing it before another server takes it over.
+    /// 0 means servers do not share a broker.
+    pub owner_ttl_seconds: u64,
     /// `MANSIO_MAX_BODY_BYTES`.
     pub max_body_bytes: u64,
     /// `MANSIO_POLL_DEFAULT_COUNT`.
