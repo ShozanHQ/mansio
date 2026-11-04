@@ -18,6 +18,10 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 pub const DEFAULT_LOCATE_WINDOW: u32 = 100;
 /// Default retention of `presence`, which is ephemeral.
 pub const DEFAULT_PRESENCE_RETENTION: Duration = Duration::from_secs(60 * 60);
+/// Default segment size of `presence` topics: the smallest Iggy admits, so
+/// that a heartbeat is deleted soon after its retention instead of waiting
+/// for a 1 GiB segment to fill.
+pub const DEFAULT_PRESENCE_SEGMENT_SIZE_BYTES: u64 = MIN_SEGMENT_SIZE_BYTES;
 /// Smallest segment size Iggy admits for a topic.
 pub const MIN_SEGMENT_SIZE_BYTES: u64 = 1024 * 1024;
 /// Largest segment size Iggy admits for a topic, and what it uses when none
@@ -180,6 +184,10 @@ pub struct IggyConfig {
     /// to the one it is writing, so this is also how coarsely retention
     /// trims a topic.
     pub segment_size_bytes: u64,
+    /// The segment size of `presence` topics, in bytes, with the same rules
+    /// as `segment_size_bytes`. Presence is ephemeral, so it defaults to
+    /// [`DEFAULT_PRESENCE_SEGMENT_SIZE_BYTES`]; zero leaves it to Iggy.
+    pub presence_segment_size_bytes: u64,
     /// How long the log of idempotency keys keeps a record. Set it to the
     /// server's idempotency window: Iggy then drops records the server would
     /// skip anyway.
@@ -204,6 +212,7 @@ impl IggyConfig {
             retention: Retention::default(),
             durability: DurabilityPolicy::default(),
             segment_size_bytes: 0,
+            presence_segment_size_bytes: DEFAULT_PRESENCE_SEGMENT_SIZE_BYTES,
             idempotency_expiry: DEFAULT_IDEMPOTENCY_EXPIRY,
         }
     }
@@ -228,6 +237,17 @@ mod tests {
         ] {
             assert_eq!(retention.for_kind(kind), None);
         }
+    }
+
+    #[test]
+    fn presence_gets_a_small_segment_by_default() {
+        let config = IggyConfig::new("a", "u", SecretString::from(String::new()));
+        assert_eq!(config.presence_segment_size_bytes, MIN_SEGMENT_SIZE_BYTES);
+        assert_eq!(config.segment_size_bytes, 0);
+        assert_eq!(
+            check_segment_size(config.presence_segment_size_bytes),
+            Ok(())
+        );
     }
 
     #[test]

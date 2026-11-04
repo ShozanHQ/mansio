@@ -27,6 +27,10 @@
 //!   short retention loses its head to Iggy's cleaner, and an alert is
 //!   published after that. After the restart the server's rebuild, which
 //!   reads the topic from offset 0, finds the alerts that are left.
+//! - `presence_retention`: a `presence` heartbeat on a short retention, in a
+//!   topic whose segment comes from `MANSIO_IGGY_PRESENCE_SEGMENT_SIZE_BYTES`
+//!   as the e2e step sets it (about 1 MiB), is gone once retention has passed
+//!   and one segment has rolled. One pass, no restart.
 //!
 //! The first group also runs in one process, with the restart in between,
 //! against the in-process server (`a_long_queue_survives_a_restart_...`), so
@@ -558,4 +562,66 @@ async fn retention_second_pass() -> anyhow::Result<()> {
     let state = load("retention")?;
     let target = Target::live(Some(text(&state, "tenant")?)).await?;
     retention_after(&target, &state).await
+}
+
+/// A presence heartbeat with `filler` bytes of padding.
+fn heartbeat(n: u32, filler: usize) -> Value {
+    json!({
+        "source": "e2e",
+        "type": "presence.heartbeat",
+        "data": {"n": n, "filler": "x".repeat(filler)}
+    })
+}
+
+/// Publish a heartbeat to `presence`, fill the segment it is in so that Iggy
+/// rolls it, and wait for Iggy's cleaner to delete it. The topic got its
+/// segment from `MANSIO_IGGY_PRESENCE_SEGMENT_SIZE_BYTES` (1 MiB by default)
+/// and its retention from `MANSIO_RETENTION_PRESENCE_SECONDS` (seconds, set by
+/// the retention step); Iggy deletes only a segment that has filled and rolled.
+#[tokio::test]
+#[ignore = "run by the presence step of the e2e job: -- --ignored presence_retention"]
+async fn presence_retention() -> anyhow::Result<()> {
+    let target = Target::live(None).await?;
+    let first = target.publish("presence", &heartbeat(0, 0)).await?;
+    let first_id = first.envelope.id.to_string();
+    for n in 1..3 {
+        target
+            .publish("presence", &heartbeat(n, FILLER_BYTES))
+            .await?;
+    }
+    // Written after the roll, so it sits in the open segment.
+    let last = target.publish("presence", &heartbeat(3, 0)).await?;
+    let last_id = last.envelope.id.to_string();
+
+    let deadline = std::time::Instant::now() + RETENTION_WAIT;
+    loop {
+        let page = target.poll("presence", "offset=0&count=1").await?;
+        match page.messages.first() {
+            Some(head) if head.offset > 0 => break,
+            Some(_) => {}
+            None => bail!("presence holds no message at all"),
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "Iggy still holds the first heartbeat after {RETENTION_WAIT:?}: check MANSIO_RETENTION_PRESENCE_SECONDS, MANSIO_IGGY_PRESENCE_SEGMENT_SIZE_BYTES and IGGY_DATA_MAINTENANCE_MESSAGES_INTERVAL"
+            );
+        }
+        tokio::time::sleep(RETENTION_LOOK).await;
+    }
+
+    let left: Vec<String> = target
+        .read("presence")
+        .await?
+        .iter()
+        .map(|envelope| envelope.id.to_string())
+        .collect();
+    ensure!(
+        !left.contains(&first_id),
+        "the first heartbeat outlived its retention and a segment roll: {left:?}"
+    );
+    ensure!(
+        left.contains(&last_id),
+        "the heartbeat in the open segment was deleted too: {left:?}"
+    );
+    Ok(())
 }

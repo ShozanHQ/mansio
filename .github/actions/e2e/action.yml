@@ -77,7 +77,7 @@ runs:
     # server is restarted, and a second pass checks what the new server made
     # of them. They are #[ignore]d and selected by name, and they fail
     # without a live server and a state directory.
-    - name: A server with pages of 5, a lease of 30 s, a segment of 1 MiB, alerts kept 5 s and keys kept 10 min
+    - name: A server with pages of 5, a lease of 30 s, a segment of 1 MiB, alerts and presence kept 5 s and keys kept 10 min
       shell: bash
       run: |
         # Set here, in the command's own environment, over the 2 s lease above.
@@ -86,12 +86,21 @@ runs:
         export MANSIO_POLL_MAX_COUNT=5
         export MANSIO_IGGY_SEGMENT_SIZE_BYTES=1048576
         export MANSIO_RETENTION_ALERTS_SECONDS=5
+        # presence has its own segment setting, set here so the run uses it. It is
+        # 512 bytes over the general one, close enough that the e2e rolls both
+        # after the same fillers: the unit tests in config.rs and the server
+        # check which setting each kind of topic takes, not this step.
+        export MANSIO_IGGY_PRESENCE_SEGMENT_SIZE_BYTES=1049088
+        export MANSIO_RETENTION_PRESENCE_SECONDS=5
         # Long enough that a key outlasts the restart below.
         export MANSIO_IDEMPOTENCY_WINDOW_SECONDS=600
         docker compose up --detach --wait --no-deps --force-recreate mansio-server
     - name: Retention, first pass (alerts lose their head to Iggy, then another is published)
       shell: bash
       run: cargo test -p mansio-e2e --locked -- --ignored retention_first_pass
+    - name: Presence retention (a heartbeat is gone after its retention and one segment roll)
+      shell: bash
+      run: cargo test -p mansio-e2e --locked -- --ignored presence_retention
     - name: Restart, first pass (a queue longer than a page, one item claimed)
       shell: bash
       run: cargo test -p mansio-e2e --locked -- --ignored restart_first_pass
