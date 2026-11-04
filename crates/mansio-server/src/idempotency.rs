@@ -75,7 +75,7 @@ struct Remembered {
 }
 
 /// The keys of one tenant, oldest first by when they were remembered.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct Keys {
     by_slot: HashMap<Slot, Remembered>,
     order: BTreeMap<u64, Slot>,

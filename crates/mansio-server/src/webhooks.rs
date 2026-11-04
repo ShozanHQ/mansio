@@ -621,6 +621,20 @@ impl Webhooks {
             offset = next;
         }
         info!(webhooks = records.len(), "webhooks loaded");
+        if self.delivery.engine.shared() && !records.is_empty() {
+            warn!(
+                webhooks = records.len(),
+                "servers share this broker (MANSIO_OWNER_TTL_SECONDS is set) and webhooks exist: every server that holds a webhook delivers it, so a receiver gets each delivery once per server, and a position committed on one server is not seen by the others"
+            );
+        }
+        if self.delivery.engine.shared()
+            && let Some(named @ 1..) = self.delivery.cursors.named().await
+        {
+            warn!(
+                named_consumers = named,
+                "servers share this broker (MANSIO_OWNER_TTL_SECONDS is set) and named consumers have positions: a position committed on one server is not seen by the others, so a consumer that moves between servers may read again from an older position"
+            );
+        }
         *self.registry() = records;
         Ok(())
     }

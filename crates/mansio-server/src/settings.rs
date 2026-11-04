@@ -112,6 +112,12 @@ pub struct WorkSettings {
     /// offset 0 (`MANSIO_SNAPSHOT_INTERVAL_SECONDS`). Zero turns snapshots
     /// off.
     pub snapshot_interval: Duration,
+    /// How long a server may go without renewing a tenant before another
+    /// server takes the tenant over (`MANSIO_OWNER_TTL_SECONDS`). Zero, the
+    /// default, means no ownership: the server serves every tenant, and it
+    /// must be the only one on its broker. Set it on every server that shares
+    /// a broker.
+    pub owner_ttl: Duration,
 }
 
 impl Default for WorkSettings {
@@ -128,6 +134,7 @@ impl Default for WorkSettings {
             idempotency_max_keys: 10_000,
             recovery_log: Duration::from_secs(60),
             snapshot_interval: Duration::from_secs(DEFAULT_SNAPSHOT_INTERVAL_SECONDS),
+            owner_ttl: Duration::ZERO,
         }
     }
 }
@@ -166,6 +173,12 @@ impl WorkSettings {
         }
         if self.max_attempts == 0 {
             return Err(invalid("MANSIO_MAX_ATTEMPTS", "must be at least 1"));
+        }
+        if !self.owner_ttl.is_zero() && self.owner_ttl < Duration::from_secs(3) {
+            return Err(invalid(
+                "MANSIO_OWNER_TTL_SECONDS",
+                "must be 0 (no ownership) or at least 3",
+            ));
         }
         if self.backoff_base < Duration::from_secs(1) {
             return Err(invalid("MANSIO_BACKOFF_BASE_SECONDS", "must be at least 1"));
@@ -220,6 +233,9 @@ pub struct CredentialSettings {
     /// How often expired principals are revoked
     /// (`MANSIO_CREDENTIAL_SWEEP_SECONDS`).
     pub sweep: Duration,
+    /// The soonest the principals log is read again for a token the registry
+    /// does not know (`MANSIO_CREDENTIAL_FOLLOW_MILLIS`).
+    pub follow: Duration,
 }
 
 impl Default for CredentialSettings {
@@ -228,6 +244,7 @@ impl Default for CredentialSettings {
             agent_ttl: Duration::from_secs(3600),
             recheck: Duration::from_secs(30),
             sweep: Duration::from_secs(60),
+            follow: Duration::from_millis(1000),
         }
     }
 }
@@ -252,6 +269,9 @@ impl CredentialSettings {
         }
         if self.sweep < one {
             return Err(invalid("MANSIO_CREDENTIAL_SWEEP_SECONDS"));
+        }
+        if self.follow.is_zero() {
+            return Err(invalid("MANSIO_CREDENTIAL_FOLLOW_MILLIS"));
         }
         Ok(())
     }
@@ -556,6 +576,7 @@ impl Settings {
                 "MANSIO_SNAPSHOT_INTERVAL_SECONDS",
                 work_defaults.snapshot_interval,
             )?,
+            owner_ttl: env.seconds("MANSIO_OWNER_TTL_SECONDS", work_defaults.owner_ttl)?,
         };
         work.validate()?;
 
@@ -570,6 +591,10 @@ impl Settings {
                 credential_defaults.recheck,
             )?,
             sweep: env.seconds("MANSIO_CREDENTIAL_SWEEP_SECONDS", credential_defaults.sweep)?,
+            follow: Duration::from_millis(env.parse(
+                "MANSIO_CREDENTIAL_FOLLOW_MILLIS",
+                u64::try_from(credential_defaults.follow.as_millis()).unwrap_or(u64::MAX),
+            )?),
         };
         credentials.validate()?;
 
@@ -961,6 +986,7 @@ mod tests {
                 idempotency_max_keys: 50,
                 recovery_log: Duration::from_secs(9),
                 snapshot_interval: Duration::from_secs(300),
+                owner_ttl: Duration::ZERO,
             }
         );
     }
@@ -991,6 +1017,20 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(off.snapshot_dir, None);
+    }
+
+    #[test]
+    fn servers_share_a_broker_only_when_an_owner_ttl_is_set() {
+        let base = [("MANSIO_TOKEN", "t"), ("MANSIO_BROKER", "memory")];
+        let defaults = settings(&base).unwrap();
+        assert_eq!(defaults.work.owner_ttl, Duration::ZERO);
+
+        let with =
+            |ttl: &'static str| settings(&[base[0], base[1], ("MANSIO_OWNER_TTL_SECONDS", ttl)]);
+        assert_eq!(with("15").unwrap().work.owner_ttl, Duration::from_secs(15));
+        assert_eq!(with("0").unwrap().work.owner_ttl, Duration::ZERO);
+        // Too short to renew inside: renewals are a quarter of it apart.
+        assert!(with("2").is_err());
     }
 
     #[test]
@@ -1104,6 +1144,7 @@ mod tests {
         assert_eq!(credentials.agent_ttl, Duration::from_secs(3600));
         assert_eq!(credentials.recheck, Duration::from_secs(30));
         assert_eq!(credentials.sweep, Duration::from_secs(60));
+        assert_eq!(credentials.follow, Duration::from_millis(1000));
         assert_eq!(credentials.validate(), Ok(()));
     }
 
@@ -1115,6 +1156,7 @@ mod tests {
             ("MANSIO_AGENT_CREDENTIAL_TTL_SECONDS", "120"),
             ("MANSIO_CREDENTIAL_RECHECK_SECONDS", "5"),
             ("MANSIO_CREDENTIAL_SWEEP_SECONDS", "7"),
+            ("MANSIO_CREDENTIAL_FOLLOW_MILLIS", "250"),
         ])
         .unwrap();
         assert_eq!(
@@ -1123,6 +1165,7 @@ mod tests {
                 agent_ttl: Duration::from_secs(120),
                 recheck: Duration::from_secs(5),
                 sweep: Duration::from_secs(7),
+                follow: Duration::from_millis(250),
             }
         );
     }
@@ -1133,6 +1176,7 @@ mod tests {
             ("MANSIO_AGENT_CREDENTIAL_TTL_SECONDS", "0"),
             ("MANSIO_CREDENTIAL_RECHECK_SECONDS", "0"),
             ("MANSIO_CREDENTIAL_SWEEP_SECONDS", "0"),
+            ("MANSIO_CREDENTIAL_FOLLOW_MILLIS", "0"),
             ("MANSIO_CREDENTIAL_SWEEP_SECONDS", "often"),
         ] {
             let error = settings(&[

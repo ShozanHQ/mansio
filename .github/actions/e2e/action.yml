@@ -160,11 +160,39 @@ runs:
     - name: Restart, retention and idempotency, second pass (the lease holds, the retry happens once, the alerts are known, the key answers with the first)
       shell: bash
       run: cargo test -p mansio-e2e --locked -- --ignored restart_second_pass retention_second_pass idempotency_second_pass
+    # Two servers on the one Iggy, sharing tenants (README, "More than one
+    # server per broker"). Both run with an owner ttl of 6 s. The first pass
+    # races pulls over both servers and leaves work behind; the job kills
+    # whichever server owns the tenant, with no warning; the second pass checks
+    # that the other took the tenant within the ttl and that no item was lost.
+    - name: Two servers on one Iggy, with an owner ttl of 6 s
+      shell: bash
+      run: |
+        export MANSIO_OWNER_TTL_SECONDS=6
+        docker compose --profile ha up --detach --wait --no-deps --force-recreate mansio-server mansio-server-b
+        echo MANSIO_E2E_URL_B=http://127.0.0.1:7071 >> "$GITHUB_ENV"
+    - name: Pulls spread over both servers lease no item twice
+      shell: bash
+      run: cargo test -p mansio-e2e --locked -- ha::two_servers_never_lease
+    - name: Shared tenants, first pass (a race for a tenant, then work left behind)
+      shell: bash
+      run: cargo test -p mansio-e2e --locked -- --ignored ha_first_pass
+    - name: Kill the server that owns the tenant
+      shell: bash
+      run: |
+        owner="$(jq -r .owner_service "$MANSIO_E2E_STATE_DIR/ha.json")"
+        echo "killing $owner"
+        docker compose --profile ha kill "$owner"
+        # The second pass holds the handover to the ttl from this moment.
+        echo "MANSIO_E2E_KILLED_AT_MS=$(date +%s%3N)" >> "$GITHUB_ENV"
+    - name: Shared tenants, second pass (the other server takes the tenant over and no item is dropped)
+      shell: bash
+      run: cargo test -p mansio-e2e --locked -- --ignored ha_second_pass
     - name: Compose logs
       if: failure()
       shell: bash
-      run: docker compose logs --no-color
+      run: docker compose --profile ha logs --no-color
     - name: Stop the stack
       if: always()
       shell: bash
-      run: docker compose down --volumes
+      run: docker compose --profile ha down --volumes

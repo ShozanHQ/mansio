@@ -12,6 +12,7 @@ mod alerts;
 mod consumers;
 mod credentials;
 mod events;
+mod ha;
 mod harness;
 mod idempotency;
 mod metrics;
