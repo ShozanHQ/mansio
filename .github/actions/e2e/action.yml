@@ -70,9 +70,44 @@ runs:
       run: |
         mkdir -p "$RUNNER_TEMP/mansio-state"
         echo "MANSIO_E2E_STATE_DIR=$RUNNER_TEMP/mansio-state" >> "$GITHUB_ENV"
+    # The image is built here, before compose, so that the build can use GitHub's
+    # Actions cache and be timed on its own. compose finds mansio-server:dev and
+    # does not build it again. The cache is scoped per branch: a run writes its
+    # branch's scope and reads it, then main's. The weekly run in scheduled.yml
+    # runs on main, so it shares main's scope and this code.
+    - name: Name the cache scope and start the clock
+      id: cache
+      shell: bash
+      env:
+        REF_NAME: ${{ github.ref_name }}
+      run: |
+        scope="mansio-server-$(printf '%s' "$REF_NAME" | tr -c 'A-Za-z0-9._-' '-')"
+        echo "scope=$scope" >> "$GITHUB_OUTPUT"
+        echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
+    - name: Set up Buildx
+      uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+    - name: Build the mansio-server image, reusing the cached dependency layer
+      uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+      with:
+        context: .
+        load: true
+        push: false
+        tags: mansio-server:dev
+        cache-from: |
+          type=gha,scope=${{ steps.cache.outputs.scope }}
+          type=gha,scope=mansio-server-main
+        cache-to: type=gha,mode=max,scope=${{ steps.cache.outputs.scope }}
+    - name: Time the image build step
+      shell: bash
+      env:
+        STARTED: ${{ steps.cache.outputs.started }}
+      run: |
+        elapsed=$(( $(date +%s) - STARTED ))
+        echo "Image build step: ${elapsed}s"
+        echo "Image build step: ${elapsed}s" >> "$GITHUB_STEP_SUMMARY"
     - name: Start Iggy, make mansio's Iggy user, and start mansio-server
       shell: bash
-      run: docker compose up --build --wait
+      run: docker compose up --wait
     - name: Publish, poll, claim, retry, acknowledge, stream, deliver webhooks and issue credentials through Iggy
       shell: bash
       run: cargo test -p mansio-e2e --locked
