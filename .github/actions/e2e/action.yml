@@ -82,8 +82,10 @@ runs:
         export MANSIO_POLL_MAX_COUNT=5
         export MANSIO_IGGY_SEGMENT_SIZE_BYTES=1048576
         export MANSIO_RETENTION_ALERTS_SECONDS=5
-        # presence has its own segment, 512 bytes over the general one, so this run
-        # sets it apart from MANSIO_IGGY_SEGMENT_SIZE_BYTES.
+        # presence has its own segment setting, set here so the run uses it. It is
+        # 512 bytes over the general one, close enough that the e2e rolls both
+        # after the same fillers: the unit tests in config.rs and the server
+        # check which setting each kind of topic takes, not this step.
         export MANSIO_IGGY_PRESENCE_SEGMENT_SIZE_BYTES=1049088
         export MANSIO_RETENTION_PRESENCE_SECONDS=5
         # Long enough that a key outlasts the restart below.

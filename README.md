@@ -987,8 +987,10 @@ and `retention_second_pass` in `crates/mansio-e2e/tests/e2e/passes.rs`, and
 skip, without `MANSIO_E2E_URL` or `MANSIO_E2E_STATE_DIR`. The `e2e` job in
 `.github/workflows/ci.yml`, through the action in `.github/actions/e2e`, runs
 them in order: it recreates mansio-server with
-pages of 5, a lease of 30 s, a segment of 1 MiB, alerts kept for 5 s and an
-idempotency window of 600 s, runs the three first passes, restarts mansio-server
+pages of 5, a lease of 30 s, a segment of 1 MiB, alerts and presence kept for
+5 s, a presence segment of about 1 MiB
+(`MANSIO_IGGY_PRESENCE_SEGMENT_SIZE_BYTES`) and an idempotency window of 600 s,
+runs the three first passes and `presence_retention`, restarts mansio-server
 (`docker compose restart`), and runs the three second passes. The idempotency
 pair publishes with a key, and after the restart checks that the same key is
 answered 200 with the first envelope and offset and that the topic holds one
@@ -1000,7 +1002,10 @@ retried exactly once after that and that every other item can be claimed
 once. The retention pair fills and rolls a
 segment of `alerts`, waits for Iggy to delete it, publishes another alert, and
 after the restart checks that the server's rebuild, which reads from offset 0,
-finds the alerts that are left. The same checks as the restart pair run in one
+finds the alerts that are left. `presence_retention` is a single pass with no
+restart: it publishes a `presence` heartbeat, fills and rolls the segment, and
+checks that the first heartbeat is gone once the 5 s retention has passed while
+the one in the open segment is still there. The same checks as the restart pair run in one
 process, against the in-process server, on every `cargo test`.
 
 The `offline` job runs `tests/offline/run.sh` against a compose stack of its own;

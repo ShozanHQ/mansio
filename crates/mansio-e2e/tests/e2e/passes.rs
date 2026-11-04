@@ -28,8 +28,9 @@
 //!   published after that. After the restart the server's rebuild, which
 //!   reads the topic from offset 0, finds the alerts that are left.
 //! - `presence_retention`: a `presence` heartbeat on a short retention, in a
-//!   topic that took the default presence segment of 1 MiB, is gone once
-//!   retention has passed and one segment has rolled. One pass, no restart.
+//!   topic whose segment comes from `MANSIO_IGGY_PRESENCE_SEGMENT_SIZE_BYTES`
+//!   as the e2e step sets it (about 1 MiB), is gone once retention has passed
+//!   and one segment has rolled. One pass, no restart.
 //!
 //! The first group also runs in one process, with the restart in between,
 //! against the in-process server (`a_long_queue_survives_a_restart_...`), so
