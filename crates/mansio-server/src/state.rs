@@ -265,6 +265,11 @@ impl Queue {
         self.items.len()
     }
 
+    /// How many items are held under a lease.
+    pub(crate) fn leased(&self) -> usize {
+        self.timers.leases.len()
+    }
+
     /// The claimable item that was published first.
     pub(crate) fn oldest_ready(&self) -> Option<&ItemId> {
         self.ready.first().map(|(_, id)| id)
@@ -476,6 +481,10 @@ pub(crate) struct TenantState {
     /// the log of keys, and a reload of the rest keeps them.
     pub(crate) keys: Keys,
     pub(crate) keys_loaded: bool,
+    /// The epoch at which this server owned the tenant when the state was
+    /// built, if servers share a broker. A different epoch means another
+    /// server held the tenant in between, and the state is built again.
+    pub(crate) owner_epoch: u64,
     /// For each topic the state is made from, the offset the next message
     /// will have if the state covers every message before it. `None` when it
     /// is not known to, so that no snapshot is taken of it.

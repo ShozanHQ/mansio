@@ -71,6 +71,7 @@ fn local_work_settings() -> WorkSettings {
         idempotency_max_keys: 20,
         recovery_log: Duration::from_secs(60),
         snapshot_interval: Duration::from_secs(1),
+        owner_ttl: Duration::ZERO,
     }
 }
 
@@ -81,6 +82,7 @@ fn local_credential_settings() -> CredentialSettings {
         agent_ttl: Duration::from_secs(3),
         recheck: Duration::from_secs(1),
         sweep: Duration::from_secs(1),
+        follow: Duration::from_millis(1000),
     }
 }
 
@@ -105,6 +107,9 @@ fn local_webhook_settings() -> WebhookSettings {
         max_attempts: 3,
         timeout: Duration::from_secs(2),
         url_max_bytes: 2048,
+        // The tests' receivers listen on the loopback.
+        allow_private_destinations: true,
+        rotation_grace: Duration::from_secs(4),
     }
 }
 
@@ -128,6 +133,16 @@ impl Default for LocalSettings {
             streams: local_stream_settings(),
             webhooks: local_webhook_settings(),
         }
+    }
+}
+
+impl LocalSettings {
+    /// Servers that share tenants: a tenant stays with a server that has gone
+    /// quiet for `ttl`.
+    pub fn sharing(ttl: Duration) -> Self {
+        let mut settings = Self::default();
+        settings.work.owner_ttl = ttl;
+        settings
     }
 }
 
@@ -279,6 +294,13 @@ impl LocalServer {
         })
     }
 
+    /// Stop the server as a crash does: nothing is shut down in order, so
+    /// the tenants it owned are not given up.
+    async fn crash(mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+    }
+
     /// Shut the server down and wait until it has gone, its timer too, so
     /// that nothing of it is still running when a new one starts. A server
     /// that does not stop in time is aborted.
@@ -419,6 +441,89 @@ impl Target {
             .context("the server is already stopped")?
             .stop()
             .await
+    }
+
+    /// Stop the in-process server without letting it give its tenants up, as
+    /// a crash or a kill does.
+    pub async fn crash_server(&mut self) -> anyhow::Result<()> {
+        let (_, server, _) = self.local.as_mut().context("the server is not local")?;
+        server
+            .take()
+            .context("the server is already stopped")?
+            .crash()
+            .await;
+        Ok(())
+    }
+
+    /// A second server on the same broker and for the same tenant, to share
+    /// tenants with this one: in this process for an in-process server, else
+    /// the one at `MANSIO_E2E_URL_B`, or `None` if that is not set.
+    pub async fn peer(&self) -> anyhow::Result<Option<Target>> {
+        if let Some((broker, _, settings)) = &self.local {
+            let sink = std::env::temp_dir().join(format!("mansio-{}-peer.jsonl", self.tenant));
+            let snapshots =
+                std::env::temp_dir().join(format!("mansio-snapshots-{}-peer", self.tenant));
+            let server =
+                LocalServer::start(broker, &self.read, &sink, &snapshots, *settings).await?;
+            let settings_now = read_settings(&self.http, &server.base, LOCAL_TOKEN).await?;
+            return Ok(Some(Self {
+                base: server.base.clone(),
+                token: LOCAL_TOKEN.to_owned(),
+                http: self.http.clone(),
+                tenant: self.tenant.clone(),
+                settings: settings_now,
+                sink: Some(sink),
+                snapshots: Some(snapshots),
+                read: self.read.clone(),
+                local: Some((broker.clone(), Some(server), *settings)),
+            }));
+        }
+        match std::env::var("MANSIO_E2E_URL_B")
+            .ok()
+            .filter(|url| !url.is_empty())
+        {
+            Some(url) => self.at(&url).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The live server at `url`, for `tenant`, with the token in
+    /// `MANSIO_TOKEN`. A second pass uses it for the one server that is still
+    /// there when the other has been killed.
+    pub async fn live_at(url: &str, tenant: &str) -> anyhow::Result<Self> {
+        let http = reqwest::Client::new();
+        let token =
+            std::env::var("MANSIO_TOKEN").context("MANSIO_TOKEN must be set for a live server")?;
+        let base = url.trim_end_matches('/').to_owned();
+        let settings = read_settings(&http, &base, &token).await?;
+        Ok(Self {
+            base,
+            token,
+            http,
+            tenant: tenant.to_owned(),
+            settings,
+            sink: None,
+            snapshots: None,
+            read: Arc::default(),
+            local: None,
+        })
+    }
+
+    /// The live server at `url`, with this one's token and tenant.
+    async fn at(&self, url: &str) -> anyhow::Result<Target> {
+        let base = url.trim_end_matches('/').to_owned();
+        let settings = read_settings(&self.http, &base, &self.token).await?;
+        Ok(Self {
+            base,
+            token: self.token.clone(),
+            http: self.http.clone(),
+            tenant: self.tenant.clone(),
+            settings,
+            sink: None,
+            snapshots: None,
+            read: Arc::default(),
+            local: None,
+        })
     }
 
     /// Start a new in-process server on the broker and the sink file that
@@ -859,13 +964,39 @@ impl Target {
         topic: &str,
         url: &str,
     ) -> anyhow::Result<(StatusCode, Value)> {
-        let body = json!({"tenant": self.tenant, "topic": topic, "url": url});
+        self.create_webhook_at(topic, url, None).await
+    }
+
+    /// `webhooks_create` with a start position (`first` or `next`) or, with
+    /// `None`, none, which the server takes as `first`.
+    pub async fn create_webhook_at(
+        &self,
+        topic: &str,
+        url: &str,
+        start: Option<&str>,
+    ) -> anyhow::Result<(StatusCode, Value)> {
+        let mut body = json!({"tenant": self.tenant, "topic": topic, "url": url});
+        if let Some(start) = start {
+            body["start"] = json!(start);
+        }
         self.authed(
             Method::POST,
             &format!("{}/v1/webhooks", self.base),
             Some(&body),
         )
         .await
+    }
+
+    /// `webhooks_rotate`, which must be accepted: the answer with the webhook,
+    /// the new secret and until when the old one signs too.
+    pub async fn rotate_webhook(&self, id: &str) -> anyhow::Result<Value> {
+        let uri = format!("{}/v1/webhooks/{id}/rotate", self.base);
+        let (status, response) = self.authed(Method::POST, &uri, None).await?;
+        ensure!(
+            status == StatusCode::OK,
+            "webhooks_rotate answered {status}: {response}"
+        );
+        Ok(response)
     }
 
     /// `webhooks_create`, which must be accepted: the answer with the

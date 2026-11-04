@@ -26,6 +26,56 @@ All notable changes to mansio are listed here. The format follows
 
 ### Added
 
+- One structured log line per request (method, route pattern, tenant,
+  status, duration, principal kind and name, never a token), and
+  `GET /metrics` in Prometheus text format for the admin token: requests
+  and latency by method, route and status, published messages by tenant and
+  topic, and open items, active leases, lease expiries, retries and dead
+  letters per queue. `MANSIO_METRICS` (default `true`) turns the endpoint and
+  its counting off.
+- Webhooks have a start position, a destination policy, secret rotation and
+  lifecycle facts.
+  - `webhooks_create` takes an optional `start`, `first` (the default, as
+    before) or `next`, which delivers only what is published after the webhook
+    is made. The CLI flag is `--start`.
+  - `webhooks_rotate` (`POST /v1/webhooks/{id}/rotate`, `mansio webhooks
+    rotate`, the MCP tool of that name) returns a new signing secret once.
+    For `MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS` (default a day) deliveries are
+    signed with the new secret and the old, two `v1` values in
+    `mansio-signature`, then with the new one only. `mansio_core::webhook::sign_many`
+    makes such a header, and `verify` already accepted one.
+  - `mansio.webhook.created`, `.rotated` and `.deleted` are recorded in the
+    sink and on `facts.webhook`. They carry the webhook, the topic and the
+    origin of the address, and never a secret or the user name, path or query
+    of the address.
+  - A delivery to a loopback, link-local or private address is refused, judged
+    on the address the host name resolves to when the delivery is made.
+    `MANSIO_WEBHOOK_ALLOW_PRIVATE_DESTINATIONS=true` allows them.
+
+  Upgrading: a receiver on a private address stops receiving until
+  `MANSIO_WEBHOOK_ALLOW_PRIVATE_DESTINATIONS=true` is set. `/v1/settings` gains
+  `webhook_allow_private_destinations` and `webhook_rotation_grace_seconds`. A
+  server older than this change cannot read a `rotated` record of the webhooks'
+  log and keeps the registry unloaded, so do not roll back after a rotation.
+
+- More than one mansio-server can share a broker without leasing an item twice.
+  With `MANSIO_OWNER_TTL_SECONDS` (default 0, which keeps one server per
+  broker; `owner_ttl_seconds` in `GET /v1/settings`) set to the same value on
+  each, a tenant has one owner at a time, decided in a new `owners` log in the
+  broker's system stream: a claim made against the owner's last renewal, so the
+  first in the log wins and a stale one is refused. The other servers answer
+  `503` for that tenant. When the owner stops, another takes its tenants within
+  the ttl and a quarter more, or at once if it stops in order, and rebuilds
+  their state from the broker, so no item is lost. `docker compose --profile ha`
+  adds a second server, and CI runs two containers on one Iggy. The ownership
+  times are measured on a monotonic clock. Each server tails the principals log
+  (at every sweep, and when shown a token it does not know, at most once per
+  `MANSIO_CREDENTIAL_FOLLOW_MILLIS`, default 1000, `credential_follow_millis`
+  in `GET /v1/settings`), so a credential issued through one works on the
+  other, also after the first dies. Only a tenant's owner revokes its
+  principals: a revoke asked of another server answers `503`, and its sweep
+  leaves them to the owner. Webhooks and consumer positions are still per
+  server.
 - The engine writes a snapshot of each tenant's state (open items, leases,
   items owed a fact, ids of finished items, unacknowledged alerts, and the
   ids of acknowledged ones) with the offset of each topic it covers, and a

@@ -19,6 +19,9 @@ a [command line](#the-cli) and an [MCP server](#mcp) for agents, [server-sent
 events](#server-sent-events) for a dashboard, and [signed
 webhooks](#webhooks) for software that will not hold a connection.
 
+What shipped each week, with steps you can run on your own machine without
+Docker, is in [`docs/demos/`](docs/demos/). CI runs the newest one.
+
 ## The contract
 
 ### Envelope
@@ -227,6 +230,7 @@ as a space, and each flag is a parameter of the operation, with `-` for `_`.
 | `principals list`, `webhooks list` | One principal, or webhook, a line. |
 | `principals revoke`, `webhooks delete` | The principal, or webhook. |
 | `webhooks create` | `{"webhook", "secret"}`: the signing secret is shown this once. |
+| `webhooks rotate` | `{"webhook", "secret", "previous_secret_valid_until"}`: the new signing secret is shown this once. |
 | `consumers get`, `consumers commit` | `{"consumer", "offset", "next"}`. |
 | `mcp` | Nothing: it serves [MCP](#mcp) on stdin and stdout. |
 
@@ -254,8 +258,9 @@ mansio alerts ack --tenant acme --alert ALERTID
 mansio principals create --kind agent --name builder-1 --tenant acme \
   --scopes '[{"topic":"work.builds","verbs":["claim"]}]' --ttl-seconds 3600
 mansio webhooks create --tenant acme --topic facts.build \
-  --endpoint https://example.com/hook
+  --endpoint https://example.com/hook --start next
 mansio webhooks list --tenant acme
+mansio webhooks rotate --id WEBHOOKID
 ```
 
 - `work pull --wait SECONDS` looks again every `MANSIO_POLL_INTERVAL_MILLIS`
@@ -307,7 +312,7 @@ or not JSON is a JSON-RPC parse error and does not end the server.
 | `alerts_publish`, `alerts_ack` | Alerts. |
 | `consumers_get`, `consumers_commit` | Where a named consumer stands. |
 | `principals_create`, `principals_list`, `principals_revoke` | Credentials, with the admin token. |
-| `webhooks_create`, `webhooks_list`, `webhooks_delete` | Webhooks, with the admin token. |
+| `webhooks_create`, `webhooks_list`, `webhooks_delete`, `webhooks_rotate` | Webhooks, with the admin token. `webhooks_create` takes `start`, `first` or `next`. |
 
 Configuration for [Claude Code](docs/mcp-claude-code.md) and
 [Codex](docs/mcp-codex.md), each with a first `work_pull` and `work_ack`, is in
@@ -623,11 +628,12 @@ data: {"specversion":"1.0","id":"...","type":"build.finished",...}
 
 Software that will not hold a connection is sent each envelope of a topic as an
 HTTP POST. The admin credential makes them: `webhooks_create` (a tenant, a
-topic and an `http` or `https` URL), `webhooks_list` and `webhooks_delete`.
+topic, an `http` or `https` URL and optionally a `start`), `webhooks_list`,
+`webhooks_rotate` and `webhooks_delete`.
 
 ```sh
 curl -H "Authorization: Bearer $MANSIO_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"tenant":"acme","topic":"facts.build","url":"https://example.com/hook"}' \
+  -d '{"tenant":"acme","topic":"facts.build","url":"https://example.com/hook","start":"next"}' \
   http://127.0.0.1:7070/v1/webhooks
 # 201 {"webhook":{"id":"<uuid>",...},"secret":"whsec_..."}   the secret, once
 
@@ -636,6 +642,10 @@ curl -H "Authorization: Bearer $MANSIO_TOKEN" 'http://127.0.0.1:7070/v1/webhooks
 #      "url":"https://example.com/hook","created_at":"...",
 #      "last_delivered_offset":7,"last_error":{"at":"...","offset":7,"message":"HTTP 500"}}]}
 #      no secret in it
+
+curl -X POST -H "Authorization: Bearer $MANSIO_TOKEN" http://127.0.0.1:7070/v1/webhooks/<id>/rotate
+# 200 {"webhook":{...},"secret":"whsec_...","previous_secret_valid_until":"..."}
+#      the new secret, once
 
 curl -X DELETE -H "Authorization: Bearer $MANSIO_TOKEN" http://127.0.0.1:7070/v1/webhooks/<id>
 ```
@@ -653,9 +663,36 @@ lines. The timestamp is the moment of that attempt.
 
 - Each webhook follows its topic from a position of its own that mansio keeps
   (see [Consumers](#consumers)), so it delivers in offset order, one envelope
-  at a time, and a restarted server resumes where the last one stopped. A new webhook starts at the first
-  message the topic holds, and a topic nobody has published to yet is waited
-  for.
+  at a time, and a restarted server resumes where the last one stopped. A new
+  webhook starts at the first message the topic holds, or, with `"start":
+  "next"`, at the first one published after it is made (`"first"` is the
+  default). `next` reads the topic through once to find its end. A topic
+  nobody has published to yet is waited for.
+- A delivery goes only to an address outside the server's own network. The
+  address a host name resolves to is checked when each delivery is made, and a
+  loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, `fe80::/10`)
+  or private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`)
+  address, or a host name with one among its addresses, is refused: the
+  attempt fails with "the destination is a loopback, link-local or private
+  address" (never the address itself), is retried like any other failure and
+  is given up on the same way. `MANSIO_WEBHOOK_ALLOW_PRIVATE_DESTINATIONS=true`
+  allows them, for a receiver inside the network. While they are
+  refused, deliveries ignore a proxy named in the server's environment, which
+  would resolve the host itself.
+- `webhooks_rotate` makes a new signing secret and returns it this once.
+  Until `MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS` have passed
+  (`previous_secret_valid_until` says when) every delivery is signed with the
+  new secret and the old, `mansio-signature: t=...,v1=<new>,v1=<old>`, and a
+  receiver that holds either verifies it; after that, with the new one only.
+  Rotating again inside the grace drops the first secret. The old secret is
+  not kept past the grace on the wire, but stays in the server's log.
+- Creating, rotating and deleting a webhook are recorded as
+  `mansio.webhook.created`, `mansio.webhook.rotated` and
+  `mansio.webhook.deleted` on `facts.webhook`, in the sink first, made by the
+  admin who did it. They carry the webhook, the topic and the origin of the
+  address (scheme, host and port, not a user name, path or query), the start
+  of a created one and `previous_secret_valid_until` of a rotated one, and no
+  secret.
 - A 2xx is delivery. Any other answer, no answer within
   `MANSIO_WEBHOOK_TIMEOUT_SECONDS` and a connection that cannot be made are
   tried again after `MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS * 2^(attempt-1)`, at
@@ -680,7 +717,8 @@ lines. The timestamp is the moment of that attempt.
   to an address the admin removed, and skipping a creation would lose the only
   copy of its secret. The log says why, at `error`, when the failures start and
   again if what goes wrong changes, not on every try. Until it loads,
-  `webhooks_create`, `webhooks_list` and `webhooks_delete` answer 503,
+  `webhooks_create`, `webhooks_list`, `webhooks_rotate` and `webhooks_delete`
+  answer 503,
   `/healthz` is `degraded`, and no delivery task starts; it is read again after
   a wait that grows from `MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS` to
   `MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS`, by whichever request, health check or
@@ -693,11 +731,39 @@ lines. The timestamp is the moment of that attempt.
   same fact.
 - The address is at most `MANSIO_WEBHOOK_URL_MAX_BYTES`.
 
-### One server per broker
+### More than one server per broker
 
 The lock that makes a claim atomic, and the state behind it, are in one
-mansio-server's memory. Run one mansio-server per broker; two on the same
-broker could give the same item to two consumers.
+mansio-server's memory. So by default, run one mansio-server per broker: two on
+the same broker could give the same item to two consumers.
+
+To run several for availability, set `MANSIO_OWNER_TTL_SECONDS` to the same
+value (3 or more) on every one of them. Each tenant then has one owner at a
+time, and only its owner serves it: the others answer `503` `unavailable` for
+that tenant, and a client sends the request again, as it does for any 503, or a
+load balancer in front of the servers sends it to the next. A tenant goes to
+whichever server asks for it first; the others stand by.
+
+When the owner stops, another server takes its tenants within
+`MANSIO_OWNER_TTL_SECONDS` and a quarter of it (a kill or a crash), or at once
+(a stop in order, `SIGTERM`). Nothing is lost: the new owner rebuilds the
+tenant from the broker as a restart does, so a lease the old owner gave is held
+until it ends and the item is then retried, and every item that was waiting is
+claimable. Try it with `docker compose --profile ha up --build --wait`, which
+adds a second server on port 7071 (set the variable for both).
+
+Credentials follow the broker: a server reads new records of the principals log
+at every sweep (`MANSIO_CREDENTIAL_SWEEP_SECONDS`) and, at most once per
+`MANSIO_CREDENTIAL_FOLLOW_MILLIS`, when it is shown a token it does not know, so a credential issued through one
+server works on the other, including after the first dies.
+
+Still per server: webhooks and consumer positions are read when a server
+starts, so a webhook or a named consumer made through one server is known to
+another only after that restarts, a position committed on one is not seen by
+the other, and each server delivers the webhooks it holds (a server that holds
+webhooks logs a warning at start when this setting is on). The bootstrap
+`MANSIO_TOKEN` works on all of them. Iggy's own clustering is separate: mansio
+uses one Iggy.
 
 ### Credentials
 
@@ -819,6 +885,43 @@ expire; they stop working with the user. When the server starts, and has read th
 registry, it deletes the Iggy users it made for principals it holds no record
 of. While a record cannot be read it deletes none.
 
+### Request log and metrics
+
+The server writes one log line per request, at `info`, when the answer is
+ready: `method`, `route` (the route pattern, such as
+`/v1/tenants/{tenant}/topics/{topic}/messages`, or `unmatched`, never the
+path), `tenant` (from the path or the `tenant` query, `-` if there is none),
+`status`, `duration_ms`, and `principal_kind` and `principal_name` of the
+credential (`-` when the request had none that was accepted). A header is
+never logged, so a token never is. For an event stream the duration is the
+time to the start of the answer. The log is always on.
+
+`GET /metrics` serves Prometheus text, for the admin token only (it names
+every tenant, topic and queue). Point a scrape job at it with
+`authorization: {credentials: <MANSIO_TOKEN>}`.
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `mansio_http_requests_total` | counter | `method`, `route`, `status` |
+| `mansio_http_request_duration_seconds` | histogram | `method`, `route`, `status` |
+| `mansio_published_messages_total` | counter | `tenant`, `topic` |
+| `mansio_queue_open_items` | gauge | `tenant`, `queue` |
+| `mansio_queue_active_leases` | gauge | `tenant`, `queue` |
+| `mansio_queue_lease_expiries_total` | counter | `tenant`, `queue` |
+| `mansio_queue_retries_total` | counter | `tenant`, `queue` |
+| `mansio_queue_dead_letters_total` | counter | `tenant`, `queue` |
+
+Counters start at zero when the server starts. Open items are those not yet
+acknowledged or dead lettered, and a gauge is read when the endpoint is
+scraped, for tenants whose state is loaded. Published messages include the
+facts the server writes itself, on `facts.*` and `dead`. `MANSIO_METRICS=false`
+turns the endpoint off (it is then a 404) and stops the counting; the request
+log stays.
+
+With `MANSIO_OWNER_TTL_SECONDS` set, the queue gauges come only from the
+server that serves each tenant; a server that has lost a tenant reports none
+for it, so a sum across servers does not count a tenant twice.
+
 ### Order
 
 Every durable publish mansio makes (messages, work, transitions) is recorded
@@ -839,9 +942,11 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_TOKEN_PRINCIPAL` | `service:mansio` | The `kind:name` the admin token stands for. |
 | `MANSIO_AGENT_CREDENTIAL_TTL_SECONDS` | `3600` | How long an agent credential lasts when the request does not say. |
 | `MANSIO_CREDENTIAL_RECHECK_SECONDS` | `30` | The longest a credential is trusted without asking the broker again, so the longest a revocation the server did not see itself takes to apply. Also how long the server waits after a registry that could not be loaded before it tries again. |
-| `MANSIO_CREDENTIAL_SWEEP_SECONDS` | `60` | How often expired credentials are revoked. |
+| `MANSIO_CREDENTIAL_SWEEP_SECONDS` | `60` | How often expired credentials are revoked. With servers sharing a broker, only a tenant's owner revokes its principals; a revoke asked of another server answers 503. |
+| `MANSIO_CREDENTIAL_FOLLOW_MILLIS` | `1000` | The soonest the principals log is read again for a token the registry does not know, so that tokens never issued cannot make the server read it at every request. Also how long a broker user no record owns is left before it is deleted, when servers share a broker. |
 | `MANSIO_SINK_PATH` | `mansio-sink.jsonl` (`/data/sink.jsonl` in the image) | JSON Lines file that every durable publish is appended to before it is published. Empty turns the sink off. |
 | `MANSIO_SINK_SYNC` | `true` | `true` or `false`. Whether the sink syncs each record to disk before the publish goes on. `false` is for development: a crash can lose recent records. |
+| `MANSIO_METRICS` | `true` | `true` or `false`. Whether `GET /metrics` is served and the counters behind it are kept. `false` makes `/metrics` a 404. The request log is written either way; see [Request log and metrics](#request-log-and-metrics). |
 | `MANSIO_MAX_BODY_BYTES` | `1048576` | Largest request body; a larger one is a 413. Iggy has a cap of its own on a message payload, 64 000 000 bytes (the stored envelope, not the body's `data` alone), and a body over it is refused by Iggy as a 502, which a client does not retry. A value above about 64 000 000 lets a body reach that refusal; a value below it makes this setting the limit. Raise it only when messages are that large: Iggy holds a whole message in memory. |
 | `MANSIO_POLL_DEFAULT_COUNT` | `100` | Envelopes a poll returns when `count` is not given. |
 | `MANSIO_POLL_MAX_COUNT` | `1000` | The most a poll may ask for. Also how many messages the server reads at a time when it rebuilds its state on start. |
@@ -853,6 +958,7 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_RECOVERY_LOG_SECONDS` | `60` | While the broker will not list its tenants at startup (for example an Iggy user that may not list streams), the server asks again after a wait that doubles from one tick up to this many seconds, and logs the failure at most once per this interval. At least 1. |
 | `MANSIO_SNAPSHOT_INTERVAL_SECONDS` | `300` | How often the state of a tenant that has changed is written to a snapshot, which the next start reads instead of replaying every topic from offset 0 (see "Snapshots" in ARCHITECTURE.md). 0 writes none. |
 | `MANSIO_SNAPSHOT_DIR` | `mansio-snapshots` | The directory of the snapshots, one file per tenant; `/data/snapshots` in the container image. Empty keeps none. A snapshot that cannot be read is ignored with a warning and the start replays from offset 0. |
+| `MANSIO_OWNER_TTL_SECONDS` | `0` | Set on every mansio-server that shares a broker, to the same value (3 or more; 30 or more for a cluster that stays up for months, because every owner appends a record each quarter of it, about 11,500 a day per tenant at 30, and a starting server reads them all), to run more than one: a tenant is served by one of them, and another takes it over this long (and a quarter more) after its server stops renewing it. `0` serves every tenant and must be the only server on its broker (see [More than one server per broker](#more-than-one-server-per-broker)). |
 | `MANSIO_ALERT_RESURFACE_SECONDS` | `3600` | How long an alert may go unacknowledged before it is surfaced again, and again after each further interval. |
 | `MANSIO_TICK_MILLIS` | `500` | How often the timer looks for leases to expire, items to republish and alerts to surface again. |
 | `MANSIO_IDEMPOTENCY_WINDOW_SECONDS` | `86400` | How long a publish's `idempotencykey` is remembered. A second publish to the same tenant and topic with the same key inside the window is answered 200 with the first envelope and offset and publishes nothing. At least `1`, at most `315360000` (ten years). |
@@ -867,6 +973,8 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_WEBHOOK_MAX_ATTEMPTS` | `8` | Attempts at one delivery before it is recorded as failed and the webhook moves on. |
 | `MANSIO_WEBHOOK_TIMEOUT_SECONDS` | `10` | How long one attempt may take. |
 | `MANSIO_WEBHOOK_URL_MAX_BYTES` | `2048` | The longest address a webhook may have. |
+| `MANSIO_WEBHOOK_ALLOW_PRIVATE_DESTINATIONS` | `false` | Whether a delivery may go to a loopback, link-local or private address. Off, it is refused, judged on the address the host name resolves to when the delivery is made. |
+| `MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS` | `86400` | How long after `webhooks_rotate` deliveries are signed with the old secret as well as the new. `0` stops signing with the old one at once. At most `3153600000` (100 years); the server refuses a larger value at start. |
 | `MANSIO_IGGY_ADDRESS` | `127.0.0.1:8090` | Iggy's TCP address, `host:port`. |
 | `MANSIO_IGGY_USERNAME` | `mansio` | The Iggy user mansio-server acts as. It manages users and streams and reads and writes topics; it is not Iggy's root user. |
 | `MANSIO_IGGY_PASSWORD` | none, required with `iggy` | Its password. If Iggy refuses it at startup, the server exits with a message that names this variable and `MANSIO_IGGY_USERNAME`. |
@@ -935,7 +1043,7 @@ topics it creates, and leaves Iggy's own settings at its defaults.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MANSIO_E2E_URL` | unset | A running server for `mansio-e2e` to use, with `MANSIO_TOKEN` set to its token. Unset starts a server in the test process on the memory broker, with a lease of 2 s that may run to 60 s, 3 attempts, a backoff from 1 s to 4 s, alerts surfaced every 2 s, an agent credential that lasts 3 s, is checked every second and swept every second, streams that look every 50 ms and send a comment every second, a grace of 2 s for a shutdown, and webhooks that retry after 1 s to 4 s, give up after 3 attempts and wait 2 s for an answer, and an idempotency window of 4 s over at most 20 keys. Against a running server the tests read its settings from `GET /v1/settings`. |
+| `MANSIO_E2E_URL` | unset | A running server for `mansio-e2e` to use, with `MANSIO_TOKEN` set to its token. Unset starts a server in the test process on the memory broker, with a lease of 2 s that may run to 60 s, 3 attempts, a backoff from 1 s to 4 s, alerts surfaced every 2 s, an agent credential that lasts 3 s, is checked every second and swept every second, streams that look every 50 ms and send a comment every second, a grace of 2 s for a shutdown, and webhooks that retry after 1 s to 4 s, give up after 3 attempts, wait 2 s for an answer, may go to private addresses and sign with a rotated secret's predecessor for 4 s, and an idempotency window of 4 s over at most 20 keys. Against a running server the tests read its settings from `GET /v1/settings`. |
 | `MANSIO_E2E_STATE_DIR` | unset | A directory that the first and second passes of the restart, idempotency and retention tests (see [Develop](#develop)) keep their state in. Required by those tests, which fail without it. |
 | `MANSIO_E2E_SINK_PATH` | unset | The sink file of the running server, as the test process can read it. With it the tests also check the order of the sink; without it they check the topics only. |
 | `MANSIO_E2E_IGGY_ADDRESS` | unset | Iggy's TCP address as the test process reaches it (`127.0.0.1:8090` for `compose.yaml`). With `MANSIO_E2E_URL` set it is required: the credential tests ask Iggy itself, without mansio-server, what a credential may do, and fail if they cannot. Without `MANSIO_E2E_URL` they ask the memory broker. |
@@ -992,6 +1100,8 @@ MANSIO_LEASE_SECONDS=2 MANSIO_MAX_ATTEMPTS=3 MANSIO_BACKOFF_BASE_SECONDS=1 \
   MANSIO_STREAM_POLL_MILLIS=100 MANSIO_SSE_KEEPALIVE_SECONDS=1 \
   MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS=1 MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS=4 \
   MANSIO_WEBHOOK_MAX_ATTEMPTS=3 MANSIO_WEBHOOK_TIMEOUT_SECONDS=2 \
+  MANSIO_WEBHOOK_ALLOW_PRIVATE_DESTINATIONS=true \
+  MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS=4 \
   MANSIO_IDEMPOTENCY_WINDOW_SECONDS=10 MANSIO_IDEMPOTENCY_MAX_KEYS=20 \
   docker compose up --build --wait
 MANSIO_E2E_URL=http://127.0.0.1:7070 MANSIO_TOKEN=mansio-dev-token \

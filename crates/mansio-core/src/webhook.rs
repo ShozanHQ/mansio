@@ -110,11 +110,25 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
 /// seconds): `t=<timestamp>,v1=<hex HMAC-SHA256 of "<timestamp>.<body>">`.
 #[must_use]
 pub fn sign(secret: &WebhookSecret, timestamp: i64, body: &[u8]) -> String {
-    let mut mac = mac_for(secret);
-    mac.update(timestamp.to_string().as_bytes());
-    mac.update(b".");
-    mac.update(body);
-    format!("t={timestamp},v1={}", hex(&mac.finalize().into_bytes()))
+    sign_many(&[secret], timestamp, body)
+}
+
+/// The signature header for a body signed under every one of `secrets`, in
+/// order: `t=<timestamp>,v1=<hex>,v1=<hex>`. A webhook whose secret was
+/// rotated is signed under the new secret and the old one until the grace
+/// period is over, and a receiver that holds either verifies it.
+#[must_use]
+pub fn sign_many(secrets: &[&WebhookSecret], timestamp: i64, body: &[u8]) -> String {
+    let mut header = format!("t={timestamp}");
+    for secret in secrets {
+        let mut mac = mac_for(secret);
+        mac.update(timestamp.to_string().as_bytes());
+        mac.update(b".");
+        mac.update(body);
+        header.push_str(",v1=");
+        header.push_str(&hex(&mac.finalize().into_bytes()));
+    }
+    header
 }
 
 /// Whether the header is a valid signature of `body` under `secret`, made
@@ -151,6 +165,38 @@ pub fn verify(
         mac.update(body);
         mac.verify_slice(signature).is_ok()
     })
+}
+
+/// Where in its topic a new webhook starts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartPosition {
+    /// At the topic's first message: the whole history is delivered.
+    #[default]
+    First,
+    /// At the next message published after the webhook is made.
+    Next,
+}
+
+impl fmt::Display for StartPosition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            StartPosition::First => "first",
+            StartPosition::Next => "next",
+        })
+    }
+}
+
+impl std::str::FromStr for StartPosition {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "first" => Ok(StartPosition::First),
+            "next" => Ok(StartPosition::Next),
+            _ => Err("must be first or next".to_owned()),
+        }
+    }
 }
 
 /// A webhook as registered: where a topic of a tenant is delivered to.
@@ -208,18 +254,32 @@ pub struct WebhookInfo {
 /// A change to a webhook that mansio records on `facts.webhook`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WebhookEvent {
+    /// A webhook was made.
+    Created,
+    /// A webhook was deleted.
+    Deleted,
+    /// A webhook's signing secret was replaced.
+    Rotated,
     /// Every attempt at one envelope failed, and the webhook moved on.
     Failed,
 }
 
 impl WebhookEvent {
     /// Every event.
-    pub const ALL: [WebhookEvent; 1] = [WebhookEvent::Failed];
+    pub const ALL: [WebhookEvent; 4] = [
+        WebhookEvent::Created,
+        WebhookEvent::Deleted,
+        WebhookEvent::Rotated,
+        WebhookEvent::Failed,
+    ];
 
     /// The CloudEvents `type` of the fact: `mansio.webhook.failed`.
     #[must_use]
     pub fn event_type(self) -> &'static str {
         match self {
+            WebhookEvent::Created => "mansio.webhook.created",
+            WebhookEvent::Deleted => "mansio.webhook.deleted",
+            WebhookEvent::Rotated => "mansio.webhook.rotated",
             WebhookEvent::Failed => "mansio.webhook.failed",
         }
     }
@@ -249,6 +309,26 @@ pub struct WebhookFact {
     pub attempts: u32,
     /// What the last attempt failed with.
     pub error: String,
+}
+
+/// The `data` of a `mansio.webhook.created`, `.deleted` or `.rotated` fact.
+/// It carries no signing secret, and of the address only its origin (scheme,
+/// host and port): a user name, path or query can hold a secret of the
+/// receiver's own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebhookChange {
+    /// The webhook that changed.
+    pub webhook_id: WebhookId,
+    /// The topic it delivers.
+    pub topic: Topic,
+    /// The scheme, host and port it delivers to, as `https://example.com`.
+    pub origin: String,
+    /// Where a created webhook starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<StartPosition>,
+    /// Until when a rotated webhook is also signed with its old secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_secret_valid_until: Option<Timestamp>,
 }
 
 #[cfg(test)]
@@ -293,6 +373,57 @@ mod tests {
         ));
         let moved = header.replacen("t=1000", "t=1001", 1);
         assert!(!verify(&secret(), &moved, BODY, 1_000, 300));
+    }
+
+    #[test]
+    fn a_body_signed_under_two_secrets_verifies_under_either_and_no_other() {
+        let new = WebhookSecret::new("whsec_new");
+        let header = sign_many(&[&new, &secret()], 1_000, BODY);
+        assert_eq!(header.matches("v1=").count(), 2);
+        assert!(verify(&new, &header, BODY, 1_000, 300));
+        assert!(verify(&secret(), &header, BODY, 1_000, 300));
+        let third = WebhookSecret::new("third");
+        assert!(!verify(&third, &header, BODY, 1_000, 300));
+        assert_eq!(
+            sign_many(&[&secret()], 1_000, BODY),
+            sign(&secret(), 1_000, BODY)
+        );
+    }
+
+    #[test]
+    fn a_start_position_is_first_unless_next_is_asked_for() {
+        assert_eq!(StartPosition::default(), StartPosition::First);
+        assert_eq!("next".parse(), Ok(StartPosition::Next));
+        assert_eq!("first".parse(), Ok(StartPosition::First));
+        assert!("last".parse::<StartPosition>().is_err());
+        assert_eq!(
+            serde_json::to_string(&StartPosition::Next).unwrap(),
+            r#""next""#
+        );
+    }
+
+    #[test]
+    fn a_change_names_no_secret_and_keeps_only_what_is_set() {
+        let change = WebhookChange {
+            webhook_id: WebhookId::generate(),
+            topic: "facts.build".parse().unwrap(),
+            origin: "https://example.com".to_owned(),
+            start: None,
+            previous_secret_valid_until: None,
+        };
+        let json = serde_json::to_value(&change).unwrap();
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["origin", "topic", "webhook_id"]);
+        assert_eq!(
+            serde_json::from_value::<WebhookChange>(json).unwrap(),
+            change
+        );
     }
 
     #[test]

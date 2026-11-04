@@ -201,6 +201,7 @@ async fn every_command_refuses_without_a_token_and_calls_nothing() -> anyhow::Re
             "http://127.0.0.1:1/",
         ],
         vec!["webhooks", "list"],
+        vec!["webhooks", "rotate", "--id", id],
         vec!["webhooks", "delete", "--id", id],
         vec![
             "consumers",
@@ -985,6 +986,43 @@ async fn the_commands_do_what_their_operations_do() -> anyhow::Result<()> {
         .await?;
     assert_eq!(delivered["last_error"]["offset"], 0);
     assert_eq!(delivered["last_error"]["message"], "HTTP 500");
+    // webhooks rotate: a new secret, shown once, and when the old one stops.
+    let rotated = one(
+        &target,
+        &admin,
+        &["webhooks", "rotate", "--id", &webhook_id],
+    )
+    .await?;
+    assert_eq!(rotated["webhook"]["id"], json!(webhook_id));
+    assert!(
+        rotated["secret"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("whsec_"))
+    );
+    assert!(
+        rotated["secret"] != made["secret"],
+        "the rotated secret is the same as the old one"
+    );
+    assert!(rotated["previous_secret_valid_until"].is_string());
+    // A start position is first or next.
+    refused(
+        &target,
+        Some(&admin),
+        &[
+            "webhooks",
+            "create",
+            "--tenant",
+            &t,
+            "--topic",
+            "facts.build",
+            "--endpoint",
+            &receiver.url,
+            "--start",
+            "last",
+        ],
+        "first or next",
+    )
+    .await?;
     let deleted = one(
         &target,
         &admin,
@@ -1254,6 +1292,7 @@ async fn the_mcp_server_lists_the_tools_and_pulls_and_acks_work_over_stdio() -> 
         "webhooks_create",
         "webhooks_delete",
         "webhooks_list",
+        "webhooks_rotate",
         "work_ack",
         "work_extend",
         "work_fail",

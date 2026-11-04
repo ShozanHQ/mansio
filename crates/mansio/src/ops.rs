@@ -14,8 +14,8 @@ use anyhow::{Context, bail};
 use mansio_core::api::{CreatePrincipal, CreateWebhook};
 use mansio_core::{
     CausationId, ConsumerName, CorrelationId, EventId, EventType, Grant, IdempotencyKey,
-    PrincipalId, PrincipalKind, PrincipalName, Segment, Source, Subject, TenantId, Topic,
-    WebhookId,
+    PrincipalId, PrincipalKind, PrincipalName, Segment, Source, StartPosition, Subject, TenantId,
+    Topic, WebhookId,
 };
 use reqwest::Method;
 use serde_json::value::RawValue;
@@ -59,6 +59,8 @@ pub enum Op {
     WebhooksList,
     /// Delete a webhook.
     WebhooksDelete,
+    /// Replace a webhook's signing secret.
+    WebhooksRotate,
     /// Show where a named consumer stands.
     ConsumersGet,
     /// Move a named consumer.
@@ -179,7 +181,7 @@ const ENVELOPE: [Param; 8] = [
 
 impl Op {
     /// Every operation, in the order they are listed.
-    pub const ALL: [Op; 18] = [
+    pub const ALL: [Op; 19] = [
         Op::Publish,
         Op::Poll,
         Op::Watch,
@@ -196,6 +198,7 @@ impl Op {
         Op::WebhooksCreate,
         Op::WebhooksList,
         Op::WebhooksDelete,
+        Op::WebhooksRotate,
         Op::ConsumersGet,
         Op::ConsumersCommit,
     ];
@@ -219,6 +222,7 @@ impl Op {
             Op::WebhooksCreate => &["webhooks", "create"],
             Op::WebhooksList => &["webhooks", "list"],
             Op::WebhooksDelete => &["webhooks", "delete"],
+            Op::WebhooksRotate => &["webhooks", "rotate"],
             Op::ConsumersGet => &["consumers", "get"],
             Op::ConsumersCommit => &["consumers", "commit"],
         }
@@ -275,12 +279,15 @@ impl Op {
             }
             Op::PrincipalsRevoke => "Withdraw a principal's credential. Admin only.",
             Op::WebhooksCreate => {
-                "Deliver every envelope of a topic, signed, to a URL. The signing secret is printed this once. Admin only."
+                "Deliver the envelopes of a topic, signed, to a URL, from the topic's first message or, with --start next, from the next one published. The signing secret is printed this once. A URL that names a loopback, link-local or private address is refused at delivery unless the server allows it. Admin only."
             }
             Op::WebhooksList => {
                 "List the webhooks with their last delivered offset and last error, one JSON object per line. Admin only."
             }
             Op::WebhooksDelete => "Delete a webhook. Admin only.",
+            Op::WebhooksRotate => {
+                "Replace a webhook's signing secret. The new secret is printed this once. Until the time printed as previous_secret_valid_until deliveries are signed with the old secret as well as the new, so the receiver can be moved over; after it, with the new one only. Admin only."
+            }
             Op::ConsumersGet => {
                 "Show the offset a named consumer last committed on a topic, and the one it reads next."
             }
@@ -414,13 +421,20 @@ impl Op {
                     Kind::Text,
                     "The http or https address each envelope is POSTed to.",
                 ),
+                optional(
+                    "start",
+                    Kind::Text,
+                    "Where the webhook starts: first (the default) delivers the topic's whole history, next only what is published after the webhook is made.",
+                ),
             ],
             Op::WebhooksList => vec![optional(
                 "tenant",
                 Kind::Text,
                 "Only this tenant's webhooks.",
             )],
-            Op::WebhooksDelete => vec![required("id", Kind::Text, "The webhook's id.")],
+            Op::WebhooksDelete | Op::WebhooksRotate => {
+                vec![required("id", Kind::Text, "The webhook's id.")]
+            }
             Op::ConsumersGet => vec![TENANT, TOPIC, CONSUMER_NAMED],
             Op::ConsumersCommit => vec![
                 TENANT,
@@ -919,6 +933,9 @@ pub async fn run(
                     .text("endpoint")
                     .context("endpoint is required")?
                     .to_owned(),
+                start: args
+                    .parse_opt::<StartPosition>("start")?
+                    .unwrap_or_default(),
             };
             let reply = client
                 .call(
@@ -954,6 +971,19 @@ pub async fn run(
                 )
                 .await?;
             Ok(vec![answered(reply, "webhooks_delete")?])
+        }
+        Op::WebhooksRotate => {
+            let id: WebhookId = args.parse("id")?;
+            let reply = client
+                .call(
+                    Method::POST,
+                    &["v1", "webhooks", &id.to_string(), "rotate"],
+                    &[],
+                    None,
+                    Replay::Unsafe,
+                )
+                .await?;
+            Ok(vec![answered(reply, "webhooks_rotate")?])
         }
         Op::ConsumersGet => Ok(vec![
             consumer_state(
@@ -1097,6 +1127,7 @@ mod tests {
                 "webhooks_create",
                 "webhooks_list",
                 "webhooks_delete",
+                "webhooks_rotate",
                 "consumers_get",
                 "consumers_commit",
             ]

@@ -19,6 +19,26 @@
 //! secret. Until the registry loads, the admin API answers 503, `/healthz`
 //! says `degraded`, and no delivery task starts.
 //!
+//! A new webhook starts at the topic's first message or, if it asks for
+//! `next`, after the last one the topic holds when it is made: the position
+//! the task resumes from is set before the webhook is registered.
+//!
+//! A delivery goes only to an address outside the network the server runs in,
+//! unless `MANSIO_WEBHOOK_ALLOW_PRIVATE_DESTINATIONS` says otherwise (see
+//! [`crate::destination`]).
+//!
+//! `webhooks_rotate` replaces the signing secret. Until
+//! `MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS` have passed a delivery is signed
+//! with both the new secret and the old, two `v1` values in one header, so a
+//! receiver is moved from one to the other without a missed delivery; after
+//! that, with the new one only.
+//!
+//! The creation, deletion and rotation of a webhook are recorded as
+//! `mansio.webhook.created`, `.deleted` and `.rotated` in the sink and on
+//! `facts.webhook` before the registry's log is written, so a change nobody
+//! recorded is never made. They name no secret, and of the address only its
+//! origin.
+//!
 //! Delivery is at least once: a server that stops between the receiver's
 //! answer and the commit of the offset sends that envelope again. Its `id` is
 //! the same, so a receiver deduplicates on it.
@@ -27,11 +47,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use mansio_core::api::{CreateWebhook, WebhookCreated};
-use mansio_core::webhook::{CONTENT_TYPE, SIGNATURE_HEADER, sign};
+use mansio_core::api::{CreateWebhook, WebhookCreated, WebhookRotated};
+use mansio_core::webhook::{CONTENT_TYPE, SIGNATURE_HEADER, sign_many};
 use mansio_core::{
-    Broker, BrokerError, Caller, Stored, SystemLog, TenantId, Timestamp, Topic, Webhook,
-    WebhookError, WebhookEvent, WebhookFact, WebhookId, WebhookInfo, WebhookSecret, WebhookStatus,
+    Broker, BrokerError, Caller, Principal, StartPosition, Stored, SystemLog, TenantId, Timestamp,
+    Topic, Webhook, WebhookChange, WebhookError, WebhookEvent, WebhookFact, WebhookId, WebhookInfo,
+    WebhookSecret, WebhookStatus,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, OnceCell};
@@ -40,6 +61,7 @@ use tracing::{info, warn};
 
 use crate::clock::Clock;
 use crate::cursors::{Cursor, Cursors};
+use crate::destination;
 use crate::engine::Engine;
 use crate::error::ApiError;
 use crate::facts::Facts;
@@ -59,6 +81,14 @@ enum Entry {
     },
     /// The webhook was deleted.
     Deleted { id: WebhookId, at: Timestamp },
+    /// The webhook's secret was replaced. The one it replaced signs
+    /// deliveries too until `previous_until`.
+    Rotated {
+        id: WebhookId,
+        secret: WebhookSecret,
+        previous_until: Timestamp,
+        at: Timestamp,
+    },
 }
 
 impl Entry {
@@ -163,23 +193,59 @@ impl Streak {
     }
 }
 
-/// A registered webhook and its secret.
+/// The secrets a webhook's deliveries are signed with.
+#[derive(Debug, Clone)]
+struct Signing {
+    current: WebhookSecret,
+    /// The secret that was replaced, and until when (unix milliseconds) it
+    /// signs too.
+    previous: Option<(WebhookSecret, i64)>,
+}
+
+impl Signing {
+    /// The signature header for `body` sent at `now` (unix milliseconds).
+    fn header(&self, now: i64, body: &[u8]) -> String {
+        let mut secrets = vec![&self.current];
+        if let Some((previous, until)) = &self.previous
+            && now < *until
+        {
+            secrets.push(previous);
+        }
+        sign_many(&secrets, now.div_euclid(1000), body)
+    }
+}
+
+/// A registered webhook and its secrets.
 #[derive(Debug, Clone)]
 struct Record {
     webhook: Webhook,
-    secret: WebhookSecret,
+    signing: Signing,
+}
+
+fn millis(duration: Duration) -> i64 {
+    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
 /// What a failed request says, without the address it was sent to: an address
 /// can carry a secret of the receiver's own.
 fn describe(error: &reqwest::Error, timeout: Duration) -> String {
-    if error.is_timeout() {
+    if destination::was_refused(error) {
+        destination::REFUSED.to_owned()
+    } else if error.is_timeout() {
         format!("no answer within {}s", timeout.as_secs())
     } else if error.is_connect() {
         "could not connect".to_owned()
     } else {
         "the request failed".to_owned()
     }
+}
+
+/// The scheme, host and port of an address, without a user name, path, query
+/// or fragment, any of which can hold a secret of the receiver's own.
+fn origin_of(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .map(|parsed| parsed.origin().ascii_serialization())
+        .unwrap_or_default()
 }
 
 /// Check an address a webhook may be sent to: at most `max` bytes, `http` or
@@ -214,9 +280,16 @@ struct Delivery {
     /// How many messages to read at a time.
     page: u32,
     status: StdMutex<HashMap<WebhookId, WebhookStatus>>,
+    /// What each webhook's deliveries are signed with now, which a rotation
+    /// changes under a task that is running.
+    signing: StdMutex<HashMap<WebhookId, Signing>>,
 }
 
 impl Delivery {
+    fn signing(&self) -> MutexGuard<'_, HashMap<WebhookId, Signing>> {
+        self.signing.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn status(&self) -> MutexGuard<'_, HashMap<WebhookId, WebhookStatus>> {
         self.status.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -238,7 +311,7 @@ impl Delivery {
 
     /// Follow the webhook's topic for as long as the task lives: start where
     /// its position says it stopped, and deliver what comes in order.
-    async fn follow(self: Arc<Self>, webhook: Webhook, secret: WebhookSecret) {
+    async fn follow(self: Arc<Self>, webhook: Webhook) {
         let poll = self.stream.poll;
         let cursor = Cursor::Webhook(webhook.id);
         let mut streak = Streak::new("reading where it stopped", webhook.id);
@@ -278,7 +351,7 @@ impl Delivery {
                 Ok(batch) => {
                     streak.ok();
                     for stored in batch {
-                        self.deliver(&webhook, &secret, &stored).await;
+                        self.deliver(&webhook, &stored).await;
                     }
                 }
                 // The topic is made by the first publish to it, which may
@@ -297,9 +370,9 @@ impl Delivery {
 
     /// Deliver one envelope: try until the receiver accepts it or the
     /// attempts are used, then move past it either way.
-    async fn deliver(&self, webhook: &Webhook, secret: &WebhookSecret, stored: &Stored) {
+    async fn deliver(&self, webhook: &Webhook, stored: &Stored) {
         let outcome = match stored.envelope.to_json_vec() {
-            Ok(body) => self.attempts(webhook, secret, stored, &body).await,
+            Ok(body) => self.attempts(webhook, stored, &body).await,
             Err(error) => Err((1, format!("the envelope cannot be written: {error}"))),
         };
         if let Err((attempts, error)) = &outcome {
@@ -324,14 +397,13 @@ impl Delivery {
     async fn attempts(
         &self,
         webhook: &Webhook,
-        secret: &WebhookSecret,
         stored: &Stored,
         body: &[u8],
     ) -> Result<(), (u32, String)> {
         let mut attempt = 0_u32;
         loop {
             attempt += 1;
-            let Err(message) = self.post(webhook, secret, body).await else {
+            let Err(message) = self.post(webhook, body).await else {
                 return Ok(());
             };
             self.failed(webhook.id, stored.offset, message.clone());
@@ -356,16 +428,22 @@ impl Delivery {
     }
 
     /// One attempt: whether the receiver answered with a 2xx.
-    async fn post(
-        &self,
-        webhook: &Webhook,
-        secret: &WebhookSecret,
-        body: &[u8],
-    ) -> Result<(), String> {
+    async fn post(&self, webhook: &Webhook, body: &[u8]) -> Result<(), String> {
         let Some(http) = &self.http else {
             return Err("the HTTP client could not be made".to_owned());
         };
-        let signature = sign(secret, self.clock.now_millis().div_euclid(1000), body);
+        // A host name is judged when the client resolves it; an IP address
+        // is not resolved, so it is judged here.
+        if !self.settings.allow_private_destinations
+            && destination::literal_is_internal(&webhook.url)
+        {
+            return Err(destination::REFUSED.to_owned());
+        }
+        let signing = self.signing().get(&webhook.id).cloned();
+        let Some(signing) = signing else {
+            return Err("the webhook has no signing secret".to_owned());
+        };
+        let signature = signing.header(self.clock.now_millis(), body);
         let response = http
             .post(&webhook.url)
             .header(reqwest::header::CONTENT_TYPE, CONTENT_TYPE)
@@ -437,6 +515,9 @@ pub struct Webhooks {
     /// How the load is going, held while it is tried.
     loading: AsyncMutex<Loading>,
     workers: StdMutex<HashMap<WebhookId, JoinHandle<()>>>,
+    /// Held while a secret is rotated, so that two rotations of a webhook are
+    /// written to the log in the order they take effect.
+    rotating: AsyncMutex<()>,
 }
 
 impl std::fmt::Debug for Webhooks {
@@ -475,9 +556,16 @@ impl Webhooks {
     ) -> Self {
         // A client that follows no redirect: a delivery is signed for the
         // address it was made for, and goes nowhere else.
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(settings.timeout)
+            .timeout(settings.timeout);
+        if !settings.allow_private_destinations {
+            // The guard judges the address the webhook's host resolves to, so
+            // the request must be made to that host and not through a proxy
+            // named in the environment, which would resolve it instead.
+            builder = builder.no_proxy().dns_resolver(destination::Guard);
+        }
+        let http = builder
             .build()
             .inspect_err(
                 |reason| tracing::error!(%reason, "the webhook HTTP client could not be made"),
@@ -498,12 +586,14 @@ impl Webhooks {
                 stream,
                 page,
                 status: StdMutex::default(),
+                signing: StdMutex::default(),
             }),
             page,
             registry: StdMutex::default(),
             loaded: OnceCell::new(),
             loading: AsyncMutex::default(),
             workers: StdMutex::default(),
+            rotating: AsyncMutex::default(),
         }
     }
 
@@ -608,10 +698,31 @@ impl Webhooks {
                 })?;
                 match entry {
                     Entry::Created { webhook, secret } => {
-                        records.insert(webhook.id, Record { webhook, secret });
+                        records.insert(
+                            webhook.id,
+                            Record {
+                                webhook,
+                                signing: Signing {
+                                    current: secret,
+                                    previous: None,
+                                },
+                            },
+                        );
                     }
                     Entry::Deleted { id, .. } => {
                         records.remove(&id);
+                    }
+                    Entry::Rotated {
+                        id,
+                        secret,
+                        previous_until,
+                        ..
+                    } => {
+                        if let Some(record) = records.get_mut(&id) {
+                            let until = previous_until.unix_millis().unwrap_or(0);
+                            let old = std::mem::replace(&mut record.signing.current, secret);
+                            record.signing.previous = Some((old, until));
+                        }
                     }
                 }
             }
@@ -621,6 +732,20 @@ impl Webhooks {
             offset = next;
         }
         info!(webhooks = records.len(), "webhooks loaded");
+        if self.delivery.engine.shared() && !records.is_empty() {
+            warn!(
+                webhooks = records.len(),
+                "servers share this broker (MANSIO_OWNER_TTL_SECONDS is set) and webhooks exist: every server that holds a webhook delivers it, so a receiver gets each delivery once per server, and a position committed on one server is not seen by the others"
+            );
+        }
+        if self.delivery.engine.shared()
+            && let Some(named @ 1..) = self.delivery.cursors.named().await
+        {
+            warn!(
+                named_consumers = named,
+                "servers share this broker (MANSIO_OWNER_TTL_SECONDS is set) and named consumers have positions: a position committed on one server is not seen by the others, so a consumer that moves between servers may read again from an older position"
+            );
+        }
         *self.registry() = records;
         Ok(())
     }
@@ -652,13 +777,19 @@ impl Webhooks {
             }
             keep
         });
+        // The secrets first, so that a task started below finds its own.
+        {
+            let mut signing = self.delivery.signing();
+            signing.retain(|id, _| registry.contains_key(id));
+            for (id, record) in registry.iter() {
+                signing.insert(*id, record.signing.clone());
+            }
+        }
         for (id, record) in registry.iter() {
             if workers.get(id).is_some_and(|task| !task.is_finished()) {
                 continue;
             }
-            let task = tokio::spawn(
-                Arc::clone(&self.delivery).follow(record.webhook.clone(), record.secret.clone()),
-            );
+            let task = tokio::spawn(Arc::clone(&self.delivery).follow(record.webhook.clone()));
             workers.insert(*id, task);
         }
         let mut status = self.delivery.status();
@@ -678,15 +809,71 @@ impl Webhooks {
 
     // ---- the admin API ------------------------------------------------------
 
+    /// The next offset of the topic: where a webhook that starts at `next`
+    /// begins. It reads the topic through, a page at a time.
+    async fn topic_end(&self, webhook: &Webhook) -> Result<u64, ApiError> {
+        let mut tail = Tail::new(
+            Arc::clone(&self.broker),
+            webhook.tenant.clone(),
+            webhook.topic.clone(),
+            0,
+            self.page,
+        );
+        loop {
+            match tail.read(&Caller::Admin).await {
+                Ok(batch) if batch.is_empty() => return Ok(tail.next()),
+                Ok(_) => {}
+                // A topic nobody has published to yet: the next message is
+                // the first.
+                Err(BrokerError::NotFound(_)) => return Ok(tail.next()),
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    /// Record the change to a webhook in the sink and on `facts.webhook`.
+    async fn record_change(
+        &self,
+        by: &Principal,
+        event: WebhookEvent,
+        webhook: &Webhook,
+        start: Option<StartPosition>,
+        previous_secret_valid_until: Option<Timestamp>,
+    ) -> Result<(), ApiError> {
+        let data = WebhookChange {
+            webhook_id: webhook.id,
+            topic: webhook.topic.clone(),
+            origin: origin_of(&webhook.url),
+            start,
+            previous_secret_valid_until,
+        };
+        let fact = self.delivery.facts.webhook_change(
+            &webhook.tenant,
+            event,
+            by,
+            self.clock.now_millis(),
+            &data,
+        )?;
+        self.delivery.engine.record(fact).await.map(|_| ())
+    }
+
     /// Make a webhook: `webhooks_create`. The secret it returns is shown this
     /// once.
+    ///
+    /// The creation is recorded as `mansio.webhook.created` before the
+    /// registry is written. A webhook that starts at `next` gets its position
+    /// set to the last message the topic holds, before it is registered.
     ///
     /// # Errors
     ///
     /// Returns 400 for an address that cannot be used or a topic that must not
     /// be delivered, and 502 or 503 if the registry cannot be written. Nothing
     /// is made then.
-    pub(crate) async fn create(&self, request: CreateWebhook) -> Result<WebhookCreated, ApiError> {
+    pub(crate) async fn create(
+        &self,
+        by: &Principal,
+        request: CreateWebhook,
+    ) -> Result<WebhookCreated, ApiError> {
         self.load().await?;
         check_url(&request.url, self.delivery.settings.url_max_bytes)?;
         if request.topic == Topic::facts_webhook() {
@@ -703,6 +890,25 @@ impl Webhooks {
             created_at: Timestamp::from_unix_millis(self.clock.now_millis())
                 .map_err(|_| ApiError::Internal)?,
         };
+        if request.start == StartPosition::Next
+            && let Some(last) = self.topic_end(&webhook).await?.checked_sub(1)
+        {
+            // The position is the last message handled, so the task starts
+            // at the one after it. Set before the webhook is registered, so
+            // that no task of it ever reads from the first.
+            self.delivery
+                .cursors
+                .set(Cursor::Webhook(webhook.id), last)
+                .await?;
+        }
+        self.record_change(
+            by,
+            WebhookEvent::Created,
+            &webhook,
+            Some(request.start),
+            None,
+        )
+        .await?;
         let secret = WebhookSecret::random();
         let entry = Entry::Created {
             webhook: webhook.clone(),
@@ -715,7 +921,10 @@ impl Webhooks {
             webhook.id,
             Record {
                 webhook: webhook.clone(),
-                secret: secret.clone(),
+                signing: Signing {
+                    current: secret.clone(),
+                    previous: None,
+                },
             },
         );
         self.sync();
@@ -723,6 +932,7 @@ impl Webhooks {
             webhook = %webhook.id,
             tenant = %webhook.tenant,
             topic = %webhook.topic,
+            start = %request.start,
             "webhook made"
         );
         Ok(WebhookCreated {
@@ -768,13 +978,14 @@ impl Webhooks {
     }
 
     /// Delete a webhook: `webhooks_delete`. Its task stops at once; what was
-    /// being delivered may or may not have arrived.
+    /// being delivered may or may not have arrived. The deletion is recorded
+    /// as `mansio.webhook.deleted` before the registry is written.
     ///
     /// # Errors
     ///
     /// Returns 404 if there is no such webhook, and 502 or 503 if the
     /// registry cannot be written, in which case the webhook stays.
-    pub(crate) async fn delete(&self, id: WebhookId) -> Result<Webhook, ApiError> {
+    pub(crate) async fn delete(&self, by: &Principal, id: WebhookId) -> Result<Webhook, ApiError> {
         self.load().await?;
         let found = self
             .registry()
@@ -786,6 +997,8 @@ impl Webhooks {
             at: Timestamp::from_unix_millis(self.clock.now_millis())
                 .map_err(|_| ApiError::Internal)?,
         };
+        self.record_change(by, WebhookEvent::Deleted, &found, None, None)
+            .await?;
         self.broker
             .system_append(SystemLog::Webhooks, &entry.encode()?)
             .await?;
@@ -793,6 +1006,62 @@ impl Webhooks {
         self.sync();
         info!(webhook = %id, "webhook deleted");
         Ok(found)
+    }
+
+    /// Replace a webhook's signing secret: `webhooks_rotate`. The new secret
+    /// is returned this once. Deliveries are signed with the new secret and
+    /// the old until `MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS` have passed, then
+    /// with the new one only. The rotation is recorded as
+    /// `mansio.webhook.rotated` before the registry is written.
+    ///
+    /// # Errors
+    ///
+    /// Returns 404 if there is no such webhook, and 502 or 503 if the
+    /// registry cannot be written, in which case the secret stays.
+    pub(crate) async fn rotate(
+        &self,
+        by: &Principal,
+        id: WebhookId,
+    ) -> Result<WebhookRotated, ApiError> {
+        self.load().await?;
+        let _rotating = self.rotating.lock().await;
+        let found = self
+            .registry()
+            .get(&id)
+            .map(|record| record.webhook.clone())
+            .ok_or_else(|| ApiError::NotFound(format!("no webhook {id}")))?;
+        let now = self.clock.now_millis();
+        let at = Timestamp::from_unix_millis(now).map_err(|_| ApiError::Internal)?;
+        let until_millis = now.saturating_add(millis(self.delivery.settings.rotation_grace));
+        let until = Timestamp::from_unix_millis(until_millis).map_err(|_| ApiError::Internal)?;
+        let secret = WebhookSecret::random();
+        self.record_change(by, WebhookEvent::Rotated, &found, None, Some(until.clone()))
+            .await?;
+        let entry = Entry::Rotated {
+            id,
+            secret: secret.clone(),
+            previous_until: until.clone(),
+            at,
+        };
+        self.broker
+            .system_append(SystemLog::Webhooks, &entry.encode()?)
+            .await?;
+        {
+            let mut registry = self.registry();
+            let Some(record) = registry.get_mut(&id) else {
+                // Deleted while the rotation was written: nothing to sign for.
+                return Err(ApiError::NotFound(format!("no webhook {id}")));
+            };
+            let old = std::mem::replace(&mut record.signing.current, secret.clone());
+            record.signing.previous = Some((old, until_millis));
+        }
+        self.sync();
+        info!(webhook = %id, "webhook secret rotated");
+        Ok(WebhookRotated {
+            webhook: self.info(&found),
+            secret,
+            previous_secret_valid_until: until,
+        })
     }
 }
 
@@ -968,6 +1237,11 @@ mod tests {
     /// Webhooks over a flaky broker and a clock moved by hand, with waits of
     /// a few milliseconds so that a test of what a task does over time is fast.
     fn rig(base: Duration, cap: Duration) -> Rig {
+        rig_with(base, cap, true)
+    }
+
+    /// As [`rig`], with delivery to private addresses allowed or refused.
+    fn rig_with(base: Duration, cap: Duration, allow_private_destinations: bool) -> Rig {
         let broker = Arc::new(Flaky::default());
         let clock = Arc::new(ManualClock::new(1_792_000_000_000));
         let engine = Arc::new(Engine::new(
@@ -989,6 +1263,8 @@ mod tests {
                 max_attempts: 3,
                 timeout: Duration::from_secs(1),
                 url_max_bytes: 2048,
+                allow_private_destinations,
+                rotation_grace: Duration::from_secs(60),
             },
             StreamSettings {
                 poll: Duration::from_millis(5),
@@ -1003,6 +1279,19 @@ mod tests {
         }
     }
 
+    fn admin() -> Principal {
+        "service:admin".parse().unwrap()
+    }
+
+    fn a_request(url: &str) -> CreateWebhook {
+        CreateWebhook {
+            tenant: "acme".parse().unwrap(),
+            topic: "facts.build".parse().unwrap(),
+            url: url.to_owned(),
+            start: StartPosition::First,
+        }
+    }
+
     fn created(webhook: &Webhook) -> Vec<u8> {
         Entry::Created {
             webhook: webhook.clone(),
@@ -1014,6 +1303,360 @@ mod tests {
 
     fn is_unavailable<T: std::fmt::Debug>(result: Result<T, ApiError>) -> bool {
         matches!(result, Err(ApiError::Unavailable(_)))
+    }
+
+    /// Publish `n` envelopes to `facts.build` of `acme`.
+    async fn publish(rig: &Rig, n: u32) {
+        let tenant: TenantId = "acme".parse().unwrap();
+        let topic: Topic = "facts.build".parse().unwrap();
+        rig.broker.ensure_tenant(&tenant).await.unwrap();
+        rig.broker.ensure_topic(&tenant, &topic).await.unwrap();
+        for _ in 0..n {
+            let envelope = Envelope::new(
+                mansio_core::EventId::generate(),
+                "test".parse().unwrap(),
+                "t".parse().unwrap(),
+                tenant.clone(),
+                topic.clone(),
+                admin(),
+            );
+            rig.broker.publish(&Caller::Admin, &envelope).await.unwrap();
+        }
+    }
+
+    async fn position(rig: &Rig, id: WebhookId) -> Option<u64> {
+        rig.webhooks
+            .delivery
+            .cursors
+            .get(&Cursor::Webhook(id))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_webhook_starts_at_the_first_message_or_after_the_last_one() {
+        let _serial = crate::testing::serial().await;
+        let rig = rig(Duration::from_secs(5), Duration::from_secs(8));
+        publish(&rig, 3).await;
+        let url = "http://127.0.0.1:9/hook";
+        let first = rig.webhooks.create(&admin(), a_request(url)).await.unwrap();
+        let next = rig
+            .webhooks
+            .create(
+                &admin(),
+                CreateWebhook {
+                    start: StartPosition::Next,
+                    ..a_request(url)
+                },
+            )
+            .await
+            .unwrap();
+        // A topic nobody has published to: the next message is the first.
+        let empty = rig
+            .webhooks
+            .create(
+                &admin(),
+                CreateWebhook {
+                    topic: "facts.deploy".parse().unwrap(),
+                    start: StartPosition::Next,
+                    ..a_request(url)
+                },
+            )
+            .await
+            .unwrap();
+        // The position is the last message handled: the task starts at the one
+        // after it.
+        assert_eq!(position(&rig, first.webhook.webhook.id).await, None);
+        assert_eq!(position(&rig, next.webhook.webhook.id).await, Some(2));
+        assert_eq!(position(&rig, empty.webhook.webhook.id).await, None);
+        rig.webhooks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_rotated_secret_signs_beside_the_old_for_the_grace_and_alone_after() {
+        use mansio_core::webhook::verify;
+
+        let _serial = crate::testing::serial().await;
+        let rig = rig(Duration::from_secs(5), Duration::from_secs(8));
+        let created = rig
+            .webhooks
+            .create(&admin(), a_request("https://example.com/hook"))
+            .await
+            .unwrap();
+        let id = created.webhook.webhook.id;
+        let old = created.secret;
+        let rotated = rig.webhooks.rotate(&admin(), id).await.unwrap();
+        assert!(
+            rotated.secret.expose() != old.expose(),
+            "the rotated secret is the same as the old one"
+        );
+        assert!(rotated.secret.expose().starts_with("whsec_"));
+
+        let now = rig.clock.now_millis();
+        let until = rotated.previous_secret_valid_until.unix_millis().unwrap();
+        assert_eq!(until, now + 60_000, "the grace is the setting");
+        let body = b"{}";
+        let signing = rig.webhooks.delivery.signing().get(&id).cloned().unwrap();
+
+        let inside = signing.header(now, body);
+        assert_eq!(inside.matches("v1=").count(), 2, "{inside}");
+        for secret in [&old, &rotated.secret] {
+            assert!(verify(secret, &inside, body, now / 1000, 300));
+        }
+        let after = signing.header(until, body);
+        assert_eq!(after.matches("v1=").count(), 1, "{after}");
+        assert!(verify(&rotated.secret, &after, body, until / 1000, 300));
+        assert!(!verify(&old, &after, body, until / 1000, 300));
+
+        // A server that starts again reads the rotation from the log.
+        rig.webhooks.rebuild().await.unwrap();
+        let rebuilt = rig.webhooks.registry().get(&id).unwrap().signing.clone();
+        assert_eq!(rebuilt.header(now, body), inside);
+        assert_eq!(rebuilt.header(until, body), after);
+
+        // A second rotation moves the first secret out of the grace.
+        let second = rig.webhooks.rotate(&admin(), id).await.unwrap();
+        let signing = rig.webhooks.delivery.signing().get(&id).cloned().unwrap();
+        let header = signing.header(now, body);
+        assert!(verify(&second.secret, &header, body, now / 1000, 300));
+        assert!(verify(&rotated.secret, &header, body, now / 1000, 300));
+        assert!(!verify(&old, &header, body, now / 1000, 300));
+
+        assert!(matches!(
+            rig.webhooks.rotate(&admin(), WebhookId::generate()).await,
+            Err(ApiError::NotFound(_))
+        ));
+        rig.webhooks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_facts_of_a_webhook_name_no_secret_and_no_secret_part_of_the_address() {
+        let _serial = crate::testing::serial().await;
+        let rig = rig(Duration::from_secs(5), Duration::from_secs(8));
+        let url = "https://user:hunter2@example.com:8443/hooks/path-secret?token=query-secret#fragment-secret";
+        let created = rig
+            .webhooks
+            .create(
+                &admin(),
+                CreateWebhook {
+                    start: StartPosition::Next,
+                    ..a_request(url)
+                },
+            )
+            .await
+            .unwrap();
+        let id = created.webhook.webhook.id;
+        let rotated = rig.webhooks.rotate(&admin(), id).await.unwrap();
+        rig.webhooks.delete(&admin(), id).await.unwrap();
+
+        let facts = rig
+            .broker
+            .poll(
+                &Caller::Admin,
+                &"acme".parse().unwrap(),
+                &Topic::facts_webhook(),
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        let values: Vec<serde_json::Value> = facts
+            .iter()
+            .map(|stored| serde_json::to_value(&stored.envelope).unwrap())
+            .collect();
+        let types: Vec<&str> = values
+            .iter()
+            .map(|value| value["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            types,
+            [
+                "mansio.webhook.created",
+                "mansio.webhook.rotated",
+                "mansio.webhook.deleted"
+            ]
+        );
+        for value in &values {
+            assert_eq!(value["subject"], id.to_string());
+            assert_eq!(value["principalkind"], "service");
+            assert_eq!(value["principalname"], "admin");
+            assert_eq!(value["data"]["webhook_id"], id.to_string());
+            assert_eq!(value["data"]["origin"], "https://example.com:8443");
+        }
+        assert_eq!(values[0]["data"]["start"], "next");
+        assert!(values[1]["data"]["previous_secret_valid_until"].is_string());
+
+        let everything = serde_json::to_string(&values).unwrap();
+        let searched = [
+            created.secret.expose(),
+            rotated.secret.expose(),
+            "whsec_",
+            "hunter2",
+            "path-secret",
+            "query-secret",
+            "fragment-secret",
+        ];
+        for (n, secret) in searched.into_iter().enumerate() {
+            assert!(
+                !everything.contains(secret),
+                "searched item {n} is in a webhook fact"
+            );
+        }
+        rig.webhooks.shutdown().await;
+    }
+
+    /// Answer one request with a 200 and hand back what its head said.
+    fn answer_once(listener: tokio::net::TcpListener) -> JoinHandle<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut seen = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            let head = loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                seen.extend_from_slice(&chunk[..n]);
+                if let Some(end) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break String::from_utf8_lossy(&seen[..end]).into_owned();
+                }
+                assert!(n > 0, "the request ended inside its head");
+            };
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            head
+        })
+    }
+
+    #[tokio::test]
+    async fn a_delivery_to_a_loopback_link_local_or_private_address_is_refused() {
+        let _serial = crate::testing::serial().await;
+        // The address as written, and a name that resolves to the loopback
+        // when the delivery is made. The webhook itself is accepted: the
+        // address is judged at delivery. Nothing listens on the port, so a
+        // delivery that was tried and not refused would say "could not
+        // connect".
+        for url in [
+            "http://127.0.0.1:9/hook",
+            "http://localhost:9/hook",
+            "http://[::1]:9/hook",
+            "http://169.254.169.254/latest/meta-data",
+            "http://10.1.2.3/hook",
+            "http://192.168.0.7:8080/hook",
+            "http://[fd00::1]/hook",
+        ] {
+            let rig = rig_with(Duration::from_secs(5), Duration::from_secs(8), false);
+            let created = rig.webhooks.create(&admin(), a_request(url)).await.unwrap();
+            let refused = rig
+                .webhooks
+                .delivery
+                .post(&created.webhook.webhook, b"{}")
+                .await;
+            assert_eq!(
+                refused,
+                Err(destination::REFUSED.to_owned()),
+                "a destination case was not refused"
+            );
+            assert!(!destination::REFUSED.contains("127.0.0.1"));
+            rig.webhooks.shutdown().await;
+        }
+
+        // Allowed by the setting, the same address is tried (and, with nothing
+        // listening, cannot be connected to).
+        let rig = rig_with(Duration::from_secs(5), Duration::from_secs(8), true);
+        let created = rig
+            .webhooks
+            .create(&admin(), a_request("http://127.0.0.1:9/hook"))
+            .await
+            .unwrap();
+        let tried = rig
+            .webhooks
+            .delivery
+            .post(&created.webhook.webhook, b"{}")
+            .await;
+        assert_eq!(tried, Err("could not connect".to_owned()));
+        rig.webhooks.shutdown().await;
+    }
+
+    /// The test binary is run again with a proxy in its environment, which a
+    /// test cannot set itself (`set_var` is unsafe), and `proxy_child` runs.
+    #[test]
+    fn a_proxy_in_the_environment_does_not_get_a_delivery_past_the_guard() {
+        let exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "webhooks::tests::proxy_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("MANSIO_TEST_PROXY_CHILD", "1")
+            .env("HTTP_PROXY", "http://203.0.113.9:3128")
+            .env("http_proxy", "http://203.0.113.9:3128")
+            .env("ALL_PROXY", "http://203.0.113.9:3128")
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Run by the test above, with a public proxy named in the environment: a
+    /// name that resolves to the loopback is still refused.
+    #[tokio::test]
+    async fn proxy_child() {
+        if std::env::var_os("MANSIO_TEST_PROXY_CHILD").is_none() {
+            return;
+        }
+        let rig = rig_with(Duration::from_secs(5), Duration::from_secs(8), false);
+        let created = rig
+            .webhooks
+            .create(&admin(), a_request("http://localhost:9/hook"))
+            .await
+            .unwrap();
+        let refused = rig
+            .webhooks
+            .delivery
+            .post(&created.webhook.webhook, b"{}")
+            .await;
+        assert_eq!(refused, Err(destination::REFUSED.to_owned()));
+        rig.webhooks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_delivery_that_is_allowed_is_signed_with_both_secrets_in_the_grace() {
+        let _serial = crate::testing::serial().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let rig = rig_with(Duration::from_secs(5), Duration::from_secs(8), true);
+        let created = rig
+            .webhooks
+            .create(
+                &admin(),
+                a_request(&format!("http://127.0.0.1:{port}/hook")),
+            )
+            .await
+            .unwrap();
+        rig.webhooks
+            .rotate(&admin(), created.webhook.webhook.id)
+            .await
+            .unwrap();
+        let answered = answer_once(listener);
+        let sent = rig
+            .webhooks
+            .delivery
+            .post(&created.webhook.webhook, b"{}")
+            .await;
+        assert_eq!(sent, Ok(()));
+        let head = answered.await.unwrap().to_ascii_lowercase();
+        assert_eq!(head.matches("v1=").count(), 2, "{head}");
+        rig.webhooks.shutdown().await;
     }
 
     #[tokio::test]
@@ -1038,13 +1681,17 @@ mod tests {
 
         assert!(is_unavailable(rig.webhooks.load().await));
         assert!(is_unavailable(rig.webhooks.list(None).await));
-        assert!(is_unavailable(rig.webhooks.delete(webhook.id).await));
-        let request = CreateWebhook {
-            tenant: "acme".parse().unwrap(),
-            topic: "facts.build".parse().unwrap(),
-            url: "https://example.com/hook".to_owned(),
-        };
-        assert!(is_unavailable(rig.webhooks.create(request).await));
+        assert!(is_unavailable(
+            rig.webhooks.delete(&admin(), webhook.id).await
+        ));
+        assert!(is_unavailable(
+            rig.webhooks.rotate(&admin(), webhook.id).await
+        ));
+        assert!(is_unavailable(
+            rig.webhooks
+                .create(&admin(), a_request("https://example.com/hook"))
+                .await
+        ));
         assert!(rig.webhooks.workers().is_empty(), "nothing was started");
         assert!(rig.webhooks.registry().is_empty());
 
@@ -1163,11 +1810,7 @@ mod tests {
         let rig = rig(Duration::from_millis(20), Duration::from_millis(40));
         let created = rig
             .webhooks
-            .create(CreateWebhook {
-                tenant: "acme".parse().unwrap(),
-                topic: "facts.build".parse().unwrap(),
-                url: "http://127.0.0.1:9/hook".to_owned(),
-            })
+            .create(&admin(), a_request("http://127.0.0.1:9/hook"))
             .await
             .unwrap();
         let lines = |what: &str| logs.text().matches(what).count();

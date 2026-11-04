@@ -37,6 +37,7 @@ pub use principal::{PrincipalEvent, PrincipalFact, PrincipalInfo, RevokeReason};
 pub use sink::{NoSink, Sink};
 pub use topic::{Topic, TopicKind};
 pub use webhook::{
-    Webhook, WebhookError, WebhookEvent, WebhookFact, WebhookInfo, WebhookSecret, WebhookStatus,
+    StartPosition, Webhook, WebhookChange, WebhookError, WebhookEvent, WebhookFact, WebhookInfo,
+    WebhookSecret, WebhookStatus,
 };
 pub use work::{AlertEvent, AlertFact, Next, WorkEvent, WorkFact};

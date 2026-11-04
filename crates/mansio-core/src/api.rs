@@ -9,7 +9,7 @@ use crate::envelope::{Envelope, Timestamp};
 use crate::id::{ConsumerName, LeaseId, PrincipalKind, PrincipalName, TenantId};
 use crate::principal::PrincipalInfo;
 use crate::topic::Topic;
-use crate::webhook::{WebhookInfo, WebhookSecret};
+use crate::webhook::{StartPosition, WebhookInfo, WebhookSecret};
 
 /// The answer to a publish: the envelope as stored, and where it landed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -191,6 +191,10 @@ pub struct CreateWebhook {
     pub topic: Topic,
     /// The `http` or `https` address each envelope is POSTed to.
     pub url: String,
+    /// Where in the topic the webhook starts: `first` (the default) delivers
+    /// the whole history, `next` only what is published after it is made.
+    #[serde(default)]
+    pub start: StartPosition,
 }
 
 /// The answer to `webhooks_create`: the webhook, and the secret its
@@ -201,6 +205,19 @@ pub struct WebhookCreated {
     pub webhook: WebhookInfo,
     /// The signing secret.
     pub secret: WebhookSecret,
+}
+
+/// The answer to `webhooks_rotate`: the new signing secret, which is shown this
+/// once, and until when deliveries are also signed with the old one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookRotated {
+    /// The webhook.
+    pub webhook: WebhookInfo,
+    /// The new signing secret.
+    pub secret: WebhookSecret,
+    /// Deliveries are signed with the old secret as well as the new until
+    /// this time, and with the new one only after it.
+    pub previous_secret_valid_until: Timestamp,
 }
 
 /// The answer to `webhooks_list`.
@@ -241,6 +258,10 @@ pub struct EffectiveSettings {
     /// `MANSIO_SNAPSHOT_INTERVAL_SECONDS`: how often the state of a tenant
     /// that has changed is written to a snapshot. 0 means never.
     pub snapshot_interval_seconds: u64,
+    /// `MANSIO_OWNER_TTL_SECONDS`: how long a tenant stays with a server
+    /// that has stopped renewing it before another server takes it over.
+    /// 0 means servers do not share a broker.
+    pub owner_ttl_seconds: u64,
     /// `MANSIO_MAX_BODY_BYTES`.
     pub max_body_bytes: u64,
     /// `MANSIO_POLL_DEFAULT_COUNT`.
@@ -256,6 +277,9 @@ pub struct EffectiveSettings {
     /// `MANSIO_CREDENTIAL_SWEEP_SECONDS`: how often expired principals are
     /// removed.
     pub credential_sweep_seconds: u64,
+    /// `MANSIO_CREDENTIAL_FOLLOW_MILLIS`: the soonest the principals log is
+    /// read again for a token the registry does not know.
+    pub credential_follow_millis: u64,
     /// `MANSIO_STREAM_POLL_MILLIS`: how often a stream or a webhook looks
     /// for new messages.
     pub stream_poll_millis: u64,
@@ -283,6 +307,12 @@ pub struct EffectiveSettings {
     pub webhook_timeout_seconds: u64,
     /// `MANSIO_WEBHOOK_URL_MAX_BYTES`: the longest address a webhook may have.
     pub webhook_url_max_bytes: u64,
+    /// `MANSIO_WEBHOOK_ALLOW_PRIVATE_DESTINATIONS`: whether a webhook may be
+    /// delivered to a loopback, link-local or private address.
+    pub webhook_allow_private_destinations: bool,
+    /// `MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS`: how long deliveries are
+    /// signed with the old secret too after a rotation.
+    pub webhook_rotation_grace_seconds: u64,
 }
 
 #[cfg(test)]
