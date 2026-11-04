@@ -20,17 +20,6 @@ use mansio_iggy::{
 use secrecy::SecretString;
 use thiserror::Error;
 
-/// `value`, or the error that names the variable if it is 0.
-fn at_least_one(name: &'static str, value: u64) -> Result<u64, SettingsError> {
-    if value == 0 {
-        return Err(SettingsError::Invalid {
-            name,
-            reason: "must be at least 1".to_owned(),
-        });
-    }
-    Ok(value)
-}
-
 /// Default listen address: loopback only. The container image listens on all
 /// interfaces.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7070";
@@ -40,6 +29,8 @@ pub const DEFAULT_TOKEN_PRINCIPAL: &str = "service:mansio";
 pub const DEFAULT_SINK_PATH: &str = "mansio-sink.jsonl";
 /// Whether the file sink syncs each record to disk by default.
 pub const DEFAULT_SINK_SYNC: bool = true;
+/// Most Iggy clients one credential may keep (`MANSIO_IGGY_SESSION_CLIENTS`).
+pub const MAX_SESSION_CLIENTS: usize = 64;
 
 /// Limits on what the API accepts and returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -659,28 +650,40 @@ impl Settings {
             "MANSIO_IGGY_CONNECT_TIMEOUT_SECONDS",
             DEFAULT_CONNECT_TIMEOUT.as_secs(),
         )?);
-        config.signin_timeout = Duration::from_secs(at_least_one(
+        let invalid = |name: &'static str, reason: &str| SettingsError::Invalid {
+            name,
+            reason: reason.to_owned(),
+        };
+        let signin_seconds = env.parse(
             "MANSIO_IGGY_SIGNIN_TIMEOUT_SECONDS",
-            env.parse(
+            DEFAULT_SIGNIN_TIMEOUT.as_secs(),
+        )?;
+        if signin_seconds == 0 {
+            return Err(invalid(
                 "MANSIO_IGGY_SIGNIN_TIMEOUT_SECONDS",
-                DEFAULT_SIGNIN_TIMEOUT.as_secs(),
-            )?,
-        )?);
-        config.session_idle = Duration::from_secs(at_least_one(
+                "must be at least 1",
+            ));
+        }
+        config.signin_timeout = Duration::from_secs(signin_seconds);
+        let idle_seconds = env.parse(
             "MANSIO_IGGY_SESSION_IDLE_SECONDS",
-            env.parse(
+            DEFAULT_SESSION_IDLE.as_secs(),
+        )?;
+        if idle_seconds == 0 {
+            return Err(invalid(
                 "MANSIO_IGGY_SESSION_IDLE_SECONDS",
-                DEFAULT_SESSION_IDLE.as_secs(),
-            )?,
-        )?);
-        config.session_clients = usize::try_from(at_least_one(
-            "MANSIO_IGGY_SESSION_CLIENTS",
-            env.parse(
+                "must be at least 1",
+            ));
+        }
+        config.session_idle = Duration::from_secs(idle_seconds);
+        let clients = env.parse("MANSIO_IGGY_SESSION_CLIENTS", DEFAULT_SESSION_CLIENTS)?;
+        if !(1..=MAX_SESSION_CLIENTS).contains(&clients) {
+            return Err(invalid(
                 "MANSIO_IGGY_SESSION_CLIENTS",
-                DEFAULT_SESSION_CLIENTS as u64,
-            )?,
-        )?)
-        .unwrap_or(usize::MAX);
+                "must be between 1 and 64",
+            ));
+        }
+        config.session_clients = clients;
         config.idempotency_expiry = idempotency_window;
         config.locate_window = env.parse("MANSIO_IGGY_LOCATE_WINDOW", DEFAULT_LOCATE_WINDOW)?;
         config.segment_size_bytes = env.parse("MANSIO_IGGY_SEGMENT_SIZE_BYTES", 0_u64)?;
@@ -1310,6 +1313,7 @@ mod tests {
             ("MANSIO_IGGY_SIGNIN_TIMEOUT_SECONDS", "0"),
             ("MANSIO_IGGY_SESSION_IDLE_SECONDS", "0"),
             ("MANSIO_IGGY_SESSION_CLIENTS", "0"),
+            ("MANSIO_IGGY_SESSION_CLIENTS", "65"),
             ("MANSIO_IGGY_DURABILITY", "fsync"),
             ("MANSIO_IGGY_PRESENCE_DURABILITY", "never"),
         ] {

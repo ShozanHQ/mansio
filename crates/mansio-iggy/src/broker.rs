@@ -255,7 +255,7 @@ impl IggyBroker {
             address: config.address,
             connect_timeout: config.connect_timeout,
             signin_timeout: config.signin_timeout,
-            session_clients: config.session_clients.max(1),
+            session_clients: config.session_clients,
             retention: config.retention,
             durability: config.durability,
             segment_size_bytes: config.segment_size_bytes,
@@ -286,41 +286,30 @@ impl IggyBroker {
     /// a reason that is about the token (see [`login_failure`]) means the
     /// credential is not valid: unknown, expired, or its user is gone.
     async fn sign_in(&self, credential: &Credential) -> Result<Session, BrokerError> {
-        let timed_out = || {
-            BrokerError::Unavailable(format!(
-                "no answer from Iggy at {} within {:?}",
-                self.address, self.signin_timeout
-            ))
-        };
         let client = new_client(&self.address)?;
-        match tokio::time::timeout(self.signin_timeout, client.connect()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                end(&client).await;
-                return Err(map_iggy(error));
-            }
-            Err(_) => {
-                end(&client).await;
-                return Err(timed_out());
-            }
-        }
-        let identity = tokio::time::timeout(
-            self.signin_timeout,
-            client.login_with_personal_access_token(credential.expose()),
-        )
-        .await;
-        match identity {
+        // One deadline for connecting and logging in together.
+        let steps = async {
+            client.connect().await.map_err(map_iggy)?;
+            client
+                .login_with_personal_access_token(credential.expose())
+                .await
+                .map_err(login_failure)
+        };
+        match tokio::time::timeout(self.signin_timeout, steps).await {
             Ok(Ok(identity)) => Ok(Session {
                 client: Arc::new(client),
                 user: BrokerUser(identity.user_id),
             }),
             Ok(Err(error)) => {
                 end(&client).await;
-                Err(login_failure(error))
+                Err(error)
             }
             Err(_) => {
                 end(&client).await;
-                Err(timed_out())
+                Err(BrokerError::Unavailable(format!(
+                    "no answer from Iggy at {} within {:?}",
+                    self.address, self.signin_timeout
+                )))
             }
         }
     }
