@@ -13,6 +13,13 @@ pub const DEFAULT_ADDRESS: &str = "127.0.0.1:8090";
 pub const DEFAULT_USERNAME: &str = "mansio";
 /// Default time to wait for Iggy at startup.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default time to wait for Iggy to sign a credential in: shorter than the
+/// connect timeout, so that a hung Iggy does not hold a request for a minute.
+pub const DEFAULT_SIGNIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default time a credential may go unused before its clients are closed.
+pub const DEFAULT_SESSION_IDLE: Duration = Duration::from_secs(300);
+/// Default most clients kept open for one credential.
+pub const DEFAULT_SESSION_CLIENTS: usize = 2;
 /// Default number of recent messages searched for a publish that Iggy
 /// accepted without reporting an offset.
 pub const DEFAULT_LOCATE_WINDOW: u32 = 100;
@@ -171,6 +178,15 @@ pub struct IggyConfig {
     pub password: SecretString,
     /// How long to keep trying to reach Iggy at startup.
     pub connect_timeout: Duration,
+    /// How long to wait for Iggy to connect and sign in a credential's client.
+    pub signin_timeout: Duration,
+    /// How long a credential may go unused before its clients are closed. The
+    /// next request signs in again.
+    pub session_idle: Duration,
+    /// The most clients kept open for one credential; at least 1. A client
+    /// answers one request at a time, so more let a credential's requests
+    /// run side by side.
+    pub session_clients: usize,
     /// How many recent messages to search when Iggy accepts a publish
     /// without reporting where it landed. Zero turns the search off.
     pub locate_window: u32,
@@ -208,6 +224,9 @@ impl IggyConfig {
             username: username.into(),
             password,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            signin_timeout: DEFAULT_SIGNIN_TIMEOUT,
+            session_idle: DEFAULT_SESSION_IDLE,
+            session_clients: DEFAULT_SESSION_CLIENTS,
             locate_window: DEFAULT_LOCATE_WINDOW,
             retention: Retention::default(),
             durability: DurabilityPolicy::default(),
@@ -302,6 +321,13 @@ mod tests {
             IggyConfig::new("h:1", "u", SecretString::from("p".to_owned())).segment_size_bytes,
             0
         );
+    }
+
+    #[test]
+    fn sign_in_has_its_own_shorter_timeout_and_a_credential_gets_a_pool() {
+        let config = IggyConfig::new("a", "u", SecretString::from(String::new()));
+        assert!(config.signin_timeout < config.connect_timeout);
+        assert!(config.session_clients >= 2);
     }
 
     #[test]
