@@ -13,8 +13,9 @@ use std::time::Duration;
 use mansio_core::Principal;
 use mansio_iggy::{
     DEFAULT_ADDRESS, DEFAULT_CONNECT_TIMEOUT, DEFAULT_LOCATE_WINDOW, DEFAULT_PRESENCE_RETENTION,
-    DEFAULT_PRESENCE_SEGMENT_SIZE_BYTES, DEFAULT_USERNAME, DurabilityPolicy, IggyConfig,
-    ProvisionConfig, Retention, check_segment_size,
+    DEFAULT_PRESENCE_SEGMENT_SIZE_BYTES, DEFAULT_SESSION_CLIENTS, DEFAULT_SESSION_IDLE,
+    DEFAULT_SIGNIN_TIMEOUT, DEFAULT_USERNAME, DurabilityPolicy, IggyConfig, ProvisionConfig,
+    Retention, check_segment_size,
 };
 use secrecy::SecretString;
 use thiserror::Error;
@@ -28,6 +29,8 @@ pub const DEFAULT_TOKEN_PRINCIPAL: &str = "service:mansio";
 pub const DEFAULT_SINK_PATH: &str = "mansio-sink.jsonl";
 /// Whether the file sink syncs each record to disk by default.
 pub const DEFAULT_SINK_SYNC: bool = true;
+/// Most Iggy clients one credential may keep (`MANSIO_IGGY_SESSION_CLIENTS`).
+pub const MAX_SESSION_CLIENTS: usize = 64;
 
 /// Limits on what the API accepts and returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -380,6 +383,10 @@ impl WebhookSettings {
 
 /// Which broker to run on (`MANSIO_BROKER`), with what it needs.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one value is built at startup; boxing would change a public field"
+)]
 pub enum Backend {
     /// Apache Iggy.
     Iggy(IggyConfig),
@@ -643,6 +650,40 @@ impl Settings {
             "MANSIO_IGGY_CONNECT_TIMEOUT_SECONDS",
             DEFAULT_CONNECT_TIMEOUT.as_secs(),
         )?);
+        let invalid = |name: &'static str, reason: &str| SettingsError::Invalid {
+            name,
+            reason: reason.to_owned(),
+        };
+        let signin_seconds = env.parse(
+            "MANSIO_IGGY_SIGNIN_TIMEOUT_SECONDS",
+            DEFAULT_SIGNIN_TIMEOUT.as_secs(),
+        )?;
+        if signin_seconds == 0 {
+            return Err(invalid(
+                "MANSIO_IGGY_SIGNIN_TIMEOUT_SECONDS",
+                "must be at least 1",
+            ));
+        }
+        config.signin_timeout = Duration::from_secs(signin_seconds);
+        let idle_seconds = env.parse(
+            "MANSIO_IGGY_SESSION_IDLE_SECONDS",
+            DEFAULT_SESSION_IDLE.as_secs(),
+        )?;
+        if idle_seconds == 0 {
+            return Err(invalid(
+                "MANSIO_IGGY_SESSION_IDLE_SECONDS",
+                "must be at least 1",
+            ));
+        }
+        config.session_idle = Duration::from_secs(idle_seconds);
+        let clients = env.parse("MANSIO_IGGY_SESSION_CLIENTS", DEFAULT_SESSION_CLIENTS)?;
+        if !(1..=MAX_SESSION_CLIENTS).contains(&clients) {
+            return Err(invalid(
+                "MANSIO_IGGY_SESSION_CLIENTS",
+                "must be between 1 and 64",
+            ));
+        }
+        config.session_clients = clients;
         config.idempotency_expiry = idempotency_window;
         config.locate_window = env.parse("MANSIO_IGGY_LOCATE_WINDOW", DEFAULT_LOCATE_WINDOW)?;
         config.segment_size_bytes = env.parse("MANSIO_IGGY_SEGMENT_SIZE_BYTES", 0_u64)?;
@@ -754,6 +795,9 @@ mod tests {
         assert_eq!(iggy.username, "mansio");
         assert_eq!(iggy.password.expose_secret(), "p");
         assert_eq!(iggy.connect_timeout, Duration::from_secs(60));
+        assert_eq!(iggy.signin_timeout, Duration::from_secs(10));
+        assert_eq!(iggy.session_idle, Duration::from_secs(300));
+        assert_eq!(iggy.session_clients, 2);
         assert_eq!(iggy.locate_window, 100);
         assert_eq!(iggy.segment_size_bytes, 0);
         assert_eq!(iggy.presence_segment_size_bytes, 1_048_576);
@@ -1266,6 +1310,10 @@ mod tests {
             ("MANSIO_POLL_DEFAULT_COUNT", "0"),
             ("MANSIO_POLL_DEFAULT_COUNT", "2000"),
             ("MANSIO_IGGY_CONNECT_TIMEOUT_SECONDS", "soon"),
+            ("MANSIO_IGGY_SIGNIN_TIMEOUT_SECONDS", "0"),
+            ("MANSIO_IGGY_SESSION_IDLE_SECONDS", "0"),
+            ("MANSIO_IGGY_SESSION_CLIENTS", "0"),
+            ("MANSIO_IGGY_SESSION_CLIENTS", "65"),
             ("MANSIO_IGGY_DURABILITY", "fsync"),
             ("MANSIO_IGGY_PRESENCE_DURABILITY", "never"),
         ] {

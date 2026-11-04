@@ -5,8 +5,8 @@
 //! permissions of the user the credential belongs to.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -21,11 +21,11 @@ use mansio_core::{
     Minted, Stored, SystemLog, SystemRecord, TenantId, Topic, TopicKind,
 };
 use tokio::sync::{Mutex as AsyncMutex, OnceCell};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::access::{Users, no_permissions, permissions};
 use crate::config::{Durability, DurabilityPolicy, IggyConfig, Retention};
-use crate::sessions::{Session, Sessions};
+use crate::sessions::{Checkout, Lease, Session, Sessions};
 
 /// The Iggy stream that holds the server's own records. Its name is not a
 /// valid tenant id, so no tenant can be given it and no principal's
@@ -127,6 +127,8 @@ pub struct IggyBroker {
     client: Arc<IggyClient>,
     address: String,
     connect_timeout: Duration,
+    signin_timeout: Duration,
+    session_clients: usize,
     retention: Retention,
     durability: DurabilityPolicy,
     segment_size_bytes: u64,
@@ -135,7 +137,7 @@ pub struct IggyBroker {
     locate_window: u32,
     ensured: Ensured,
     /// The clients signed in with a principal's credential.
-    sessions: Sessions,
+    sessions: Arc<Sessions>,
     /// The scopes of every user made, to apply again when a topic is made.
     users: Users,
     /// Held while permissions are worked out and applied, so that a user made
@@ -171,6 +173,53 @@ async fn end(client: &IggyClient) {
     let _ = client.shutdown().await;
 }
 
+/// The client a call is made on, held until the call is done.
+enum ClientLease {
+    Admin(Arc<IggyClient>),
+    Credential(Lease),
+}
+
+impl std::ops::Deref for ClientLease {
+    type Target = IggyClient;
+
+    fn deref(&self) -> &IggyClient {
+        match self {
+            ClientLease::Admin(client) => client,
+            ClientLease::Credential(lease) => lease,
+        }
+    }
+}
+
+async fn end_all(clients: Vec<Arc<IggyClient>>) {
+    for client in clients {
+        end(&client).await;
+    }
+}
+
+/// Close the clients of credentials that have gone unused for `idle`, about
+/// four times in that time, until the broker is dropped.
+fn spawn_reaper(sessions: Weak<Sessions>, idle: Duration) {
+    let every = (idle / 4).max(Duration::from_secs(1));
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let Some(sessions) = sessions.upgrade() else {
+                return;
+            };
+            let gone = sessions.evict_idle(Instant::now(), idle);
+            if !gone.is_empty() {
+                debug!(
+                    clients = gone.len(),
+                    "closed the clients of idle credentials"
+                );
+            }
+            end_all(gone).await;
+        }
+    });
+}
+
 impl IggyBroker {
     /// Connect to Iggy and sign in as the configured user. The connection
     /// reconnects and signs in again by itself if it drops.
@@ -199,10 +248,14 @@ impl IggyBroker {
             })?
             .map_err(connect_failure)?;
         info!(address = %config.address, user = %config.username, "connected to Iggy");
+        let sessions = Arc::new(Sessions::default());
+        spawn_reaper(Arc::downgrade(&sessions), config.session_idle);
         Ok(Self {
             client: Arc::new(client),
             address: config.address,
             connect_timeout: config.connect_timeout,
+            signin_timeout: config.signin_timeout,
+            session_clients: config.session_clients,
             retention: config.retention,
             durability: config.durability,
             segment_size_bytes: config.segment_size_bytes,
@@ -210,7 +263,7 @@ impl IggyBroker {
             idempotency_expiry: config.idempotency_expiry,
             locate_window: config.locate_window,
             ensured: Ensured::default(),
-            sessions: Sessions::default(),
+            sessions,
             users: Users::default(),
             permissions: AsyncMutex::new(()),
             system_ready: OnceCell::new(),
@@ -223,9 +276,7 @@ impl IggyBroker {
     ///
     /// Returns an error if Iggy cannot be told.
     pub async fn shutdown(&self) -> Result<(), BrokerError> {
-        for session in self.sessions.drain() {
-            end(&session.client).await;
-        }
+        end_all(self.sessions.drain()).await;
         self.client.shutdown().await.map_err(map_iggy)
     }
 
@@ -235,63 +286,62 @@ impl IggyBroker {
     /// a reason that is about the token (see [`login_failure`]) means the
     /// credential is not valid: unknown, expired, or its user is gone.
     async fn sign_in(&self, credential: &Credential) -> Result<Session, BrokerError> {
-        let timed_out = || {
-            BrokerError::Unavailable(format!(
-                "no answer from Iggy at {} within {:?}",
-                self.address, self.connect_timeout
-            ))
-        };
         let client = new_client(&self.address)?;
-        match tokio::time::timeout(self.connect_timeout, client.connect()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                end(&client).await;
-                return Err(map_iggy(error));
-            }
-            Err(_) => {
-                end(&client).await;
-                return Err(timed_out());
-            }
-        }
-        let identity = tokio::time::timeout(
-            self.connect_timeout,
-            client.login_with_personal_access_token(credential.expose()),
-        )
-        .await;
-        match identity {
+        // One deadline for connecting and logging in together.
+        let steps = async {
+            client.connect().await.map_err(map_iggy)?;
+            client
+                .login_with_personal_access_token(credential.expose())
+                .await
+                .map_err(login_failure)
+        };
+        match tokio::time::timeout(self.signin_timeout, steps).await {
             Ok(Ok(identity)) => Ok(Session {
                 client: Arc::new(client),
                 user: BrokerUser(identity.user_id),
             }),
             Ok(Err(error)) => {
                 end(&client).await;
-                Err(login_failure(error))
+                Err(error)
             }
             Err(_) => {
                 end(&client).await;
-                Err(timed_out())
+                Err(BrokerError::Unavailable(format!(
+                    "no answer from Iggy at {} within {:?}",
+                    self.address, self.signin_timeout
+                )))
             }
         }
     }
 
-    /// The credential's session: the one kept, or a new one that is kept.
-    async fn session(&self, credential: &Credential) -> Result<Session, BrokerError> {
+    /// A client of the credential for one request: an idle one that is kept,
+    /// or a new one that is kept while the pool has room. Credentials unused
+    /// for the idle time are closed by the reaper, not here.
+    async fn session(&self, credential: &Credential) -> Result<(Lease, BrokerUser), BrokerError> {
         let key = credential.digest();
-        if let Some(session) = self.sessions.get(&key) {
-            return Ok(session);
+        if let Checkout::Ready(lease, user) =
+            self.sessions
+                .checkout(&key, self.session_clients, Instant::now())
+        {
+            return Ok((lease, user));
         }
-        let (kept, spare) = self.sessions.insert(key, self.sign_in(credential).await?);
+        let signed_in = self.sign_in(credential).await?;
+        let (lease, user, spare) =
+            self.sessions
+                .add(key, signed_in, self.session_clients, Instant::now());
         if let Some(spare) = spare {
             end(&spare.client).await;
         }
-        Ok(kept)
+        Ok((lease, user))
     }
 
     /// The client a call is made on.
-    async fn client_for(&self, caller: &Caller<'_>) -> Result<Arc<IggyClient>, BrokerError> {
+    async fn client_for(&self, caller: &Caller<'_>) -> Result<ClientLease, BrokerError> {
         match caller {
-            Caller::Admin => Ok(Arc::clone(&self.client)),
-            Caller::Credential(credential) => Ok(self.session(credential).await?.client),
+            Caller::Admin => Ok(ClientLease::Admin(Arc::clone(&self.client))),
+            Caller::Credential(credential) => {
+                Ok(ClientLease::Credential(self.session(credential).await?.0))
+            }
         }
     }
 
@@ -308,10 +358,8 @@ impl IggyBroker {
             (Caller::Admin, Err(error)) => Err(map_iggy(error)),
             (Caller::Credential(credential), Err(error)) => {
                 let mapped = map_credential(error);
-                if matches!(mapped, BrokerError::Unauthenticated(_))
-                    && let Some(session) = self.sessions.remove(&credential.digest())
-                {
-                    end(&session.client).await;
+                if matches!(mapped, BrokerError::Unauthenticated(_)) {
+                    end_all(self.sessions.remove(&credential.digest())).await;
                 }
                 Err(mapped)
             }
@@ -1091,31 +1139,34 @@ impl Broker for IggyBroker {
             Err(error) => return Err(map_iggy(error)),
         }
         self.users.remove(user);
-        for session in self.sessions.remove_user(user) {
-            end(&session.client).await;
-        }
+        end_all(self.sessions.remove_user(user)).await;
         Ok(())
     }
 
     async fn identify(&self, credential: &Credential) -> Result<BrokerUser, BrokerError> {
-        let Some(open) = self.sessions.get(&credential.digest()) else {
-            return Ok(self.session(credential).await?.user);
+        let key = credential.digest();
+        let Some(kept) = self.sessions.user(&key) else {
+            return Ok(self.session(credential).await?.1);
         };
-        // The session is in use and must not be signed in again under the
-        // requests on it, so Iggy is asked on a client of its own.
+        // A kept client may be in use and must not be signed in again under
+        // the requests on it, so Iggy is asked on a new client. A credential
+        // that holds, keeps it: in the pool if there is room, in place of an
+        // idle client if not, so a recheck leaves no extra connection open.
         match self.sign_in(credential).await {
             Ok(checked) => {
-                end(&checked.client).await;
-                Ok(checked.user)
+                let user = checked.user;
+                let ended =
+                    self.sessions
+                        .refresh(key, checked, self.session_clients, Instant::now());
+                end_all(ended).await;
+                Ok(user)
             }
             Err(error @ BrokerError::Unauthenticated(_)) => {
-                if let Some(gone) = self.sessions.remove(&credential.digest()) {
-                    end(&gone.client).await;
-                }
+                end_all(self.sessions.remove(&key)).await;
                 Err(error)
             }
             Err(error) => {
-                warn!(user = %open.user, %error, "a credential could not be checked");
+                warn!(user = %kept, %error, "a credential could not be checked");
                 Err(error)
             }
         }
