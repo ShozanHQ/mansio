@@ -231,6 +231,9 @@ pub struct CredentialSettings {
     /// How often expired principals are revoked
     /// (`MANSIO_CREDENTIAL_SWEEP_SECONDS`).
     pub sweep: Duration,
+    /// The soonest the principals log is read again for a token the registry
+    /// does not know (`MANSIO_CREDENTIAL_FOLLOW_MILLIS`).
+    pub follow: Duration,
 }
 
 impl Default for CredentialSettings {
@@ -239,6 +242,7 @@ impl Default for CredentialSettings {
             agent_ttl: Duration::from_secs(3600),
             recheck: Duration::from_secs(30),
             sweep: Duration::from_secs(60),
+            follow: Duration::from_millis(1000),
         }
     }
 }
@@ -263,6 +267,9 @@ impl CredentialSettings {
         }
         if self.sweep < one {
             return Err(invalid("MANSIO_CREDENTIAL_SWEEP_SECONDS"));
+        }
+        if self.follow.is_zero() {
+            return Err(invalid("MANSIO_CREDENTIAL_FOLLOW_MILLIS"));
         }
         Ok(())
     }
@@ -579,6 +586,10 @@ impl Settings {
                 credential_defaults.recheck,
             )?,
             sweep: env.seconds("MANSIO_CREDENTIAL_SWEEP_SECONDS", credential_defaults.sweep)?,
+            follow: Duration::from_millis(env.parse(
+                "MANSIO_CREDENTIAL_FOLLOW_MILLIS",
+                u64::try_from(credential_defaults.follow.as_millis()).unwrap_or(u64::MAX),
+            )?),
         };
         credentials.validate()?;
 
@@ -1127,6 +1138,7 @@ mod tests {
         assert_eq!(credentials.agent_ttl, Duration::from_secs(3600));
         assert_eq!(credentials.recheck, Duration::from_secs(30));
         assert_eq!(credentials.sweep, Duration::from_secs(60));
+        assert_eq!(credentials.follow, Duration::from_millis(1000));
         assert_eq!(credentials.validate(), Ok(()));
     }
 
@@ -1138,6 +1150,7 @@ mod tests {
             ("MANSIO_AGENT_CREDENTIAL_TTL_SECONDS", "120"),
             ("MANSIO_CREDENTIAL_RECHECK_SECONDS", "5"),
             ("MANSIO_CREDENTIAL_SWEEP_SECONDS", "7"),
+            ("MANSIO_CREDENTIAL_FOLLOW_MILLIS", "250"),
         ])
         .unwrap();
         assert_eq!(
@@ -1146,6 +1159,7 @@ mod tests {
                 agent_ttl: Duration::from_secs(120),
                 recheck: Duration::from_secs(5),
                 sweep: Duration::from_secs(7),
+                follow: Duration::from_millis(250),
             }
         );
     }
@@ -1156,6 +1170,7 @@ mod tests {
             ("MANSIO_AGENT_CREDENTIAL_TTL_SECONDS", "0"),
             ("MANSIO_CREDENTIAL_RECHECK_SECONDS", "0"),
             ("MANSIO_CREDENTIAL_SWEEP_SECONDS", "0"),
+            ("MANSIO_CREDENTIAL_FOLLOW_MILLIS", "0"),
             ("MANSIO_CREDENTIAL_SWEEP_SECONDS", "often"),
         ] {
             let error = settings(&[

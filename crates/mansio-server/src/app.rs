@@ -519,6 +519,7 @@ async fn settings(
         agent_credential_ttl_seconds: seconds(credentials.agent_ttl),
         credential_recheck_seconds: seconds(credentials.recheck),
         credential_sweep_seconds: seconds(credentials.sweep),
+        credential_follow_millis: u64::try_from(credentials.follow.as_millis()).unwrap_or(u64::MAX),
         stream_poll_millis: u64::try_from(state.streams.poll.as_millis()).unwrap_or(u64::MAX),
         sse_keepalive_seconds: seconds(state.streams.sse_keepalive),
         shutdown_grace_seconds: seconds(state.streams.shutdown_grace),
@@ -1610,6 +1611,7 @@ mod tests {
             agent_ttl: std::time::Duration::from_secs(60),
             recheck: std::time::Duration::from_secs(30),
             sweep: std::time::Duration::from_secs(10),
+            follow: std::time::Duration::from_millis(1000),
         })
         .router();
 

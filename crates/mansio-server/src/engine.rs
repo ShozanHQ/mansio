@@ -208,6 +208,25 @@ impl Engine {
 
     // ---- state ------------------------------------------------------------
 
+    /// Whether other servers may share the broker (ownership is on).
+    pub(crate) fn shared(&self) -> bool {
+        self.ownership.is_some()
+    }
+
+    /// Whether this server may act for `tenant`: always without ownership,
+    /// and otherwise only while it owns the tenant (taking it if nobody does).
+    ///
+    /// # Errors
+    ///
+    /// Returns 503 if another server owns the tenant, or if the owners log
+    /// cannot be read or written.
+    pub(crate) async fn serves(&self, tenant: &TenantId) -> Result<(), ApiError> {
+        match &self.ownership {
+            Some(ownership) => ownership.acquire(tenant).await.map(|_| ()),
+            None => Ok(()),
+        }
+    }
+
     /// The tenant's state, locked and up to date. The first call for a tenant
     /// rebuilds it from the broker.
     async fn lock(&self, tenant: &TenantId) -> Result<Held, ApiError> {

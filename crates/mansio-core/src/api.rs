@@ -260,6 +260,9 @@ pub struct EffectiveSettings {
     /// `MANSIO_CREDENTIAL_SWEEP_SECONDS`: how often expired principals are
     /// removed.
     pub credential_sweep_seconds: u64,
+    /// `MANSIO_CREDENTIAL_FOLLOW_MILLIS`: the soonest the principals log is
+    /// read again for a token the registry does not know.
+    pub credential_follow_millis: u64,
     /// `MANSIO_STREAM_POLL_MILLIS`: how often a stream or a webhook looks
     /// for new messages.
     pub stream_poll_millis: u64,

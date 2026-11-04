@@ -37,11 +37,6 @@ use crate::facts::{ENGINE_PRINCIPAL, Facts};
 use crate::registry::{Entry, Record, Registry};
 use crate::settings::CredentialSettings;
 
-/// How soon after a read of the principals log a token nobody issued here may
-/// make the server read it again. The sweep reads it every
-/// `MANSIO_CREDENTIAL_SWEEP_SECONDS` whatever this says.
-const FOLLOW_MISS_MILLIS: i64 = 1_000;
-
 /// The kind of principal whose credential always expires.
 const AGENT: &str = "agent";
 
@@ -129,6 +124,11 @@ pub struct Credentials {
     /// How far the principals log has been read, and when it was last read
     /// for records another server may have written.
     followed: Mutex<Followed>,
+    /// Broker users no record owned when last looked at, with the time they
+    /// were first seen so. With several servers one may be a user another
+    /// server has made and not yet recorded, so it is deleted only if it is
+    /// still unowned `MANSIO_CREDENTIAL_FOLLOW_MILLIS` later.
+    unowned: StdMutex<HashMap<BrokerUser, i64>>,
 }
 
 /// Where the tail of the principals log stands.
@@ -172,6 +172,7 @@ impl Credentials {
             failed: Mutex::new(None),
             checked: StdMutex::default(),
             followed: Mutex::new(Followed::default()),
+            unowned: StdMutex::default(),
         }
     }
 
@@ -288,15 +289,15 @@ impl Credentials {
     /// this one last read it, so that a credential issued or revoked there is
     /// known here. Servers that share a broker each issue credentials, and the
     /// one that takes over a dead server's tenants must accept what it issued.
-    /// Unless `force`, the log is not read again within a second of the last
-    /// read, so that tokens that were never issued cannot make the server read
+    /// Unless `force`, the log is not read again within
+    /// `MANSIO_CREDENTIAL_FOLLOW_MILLIS` of the last read, so that tokens that were never issued cannot make the server read
     /// it at every request.
     /// Whether a record was applied is not reported; a failed read is tried
     /// again at the next call.
     async fn follow(&self, force: bool) {
         let mut followed = self.followed.lock().await;
         let now = self.clock.now_millis();
-        let wait = FOLLOW_MISS_MILLIS;
+        let wait = millis(self.settings.follow);
         if !force
             && followed
                 .at
@@ -351,9 +352,23 @@ impl Credentials {
             .iter()
             .map(|record| record.user)
             .collect();
+        let now = self.clock.now_millis();
+        let grace = millis(self.settings.follow);
+        let shared = self.engine.shared();
+        let mut seen = HashMap::new();
         for found in self.broker.list_users().await? {
             if !is_principal_user(&found.name) || owned.contains(&found.user) {
                 continue;
+            }
+            if shared {
+                let first = self
+                    .unowned
+                    .lock()
+                    .map_or(now, |known| known.get(&found.user).copied().unwrap_or(now));
+                seen.insert(found.user, first);
+                if now.saturating_sub(first) < grace {
+                    continue;
+                }
             }
             warn!(
                 user = %found.user,
@@ -364,6 +379,9 @@ impl Credentials {
                 warn!(user = %found.user, %error, "it could not be deleted; the next start tries again");
             }
         }
+        if shared && let Ok(mut known) = self.unowned.lock() {
+            *known = seen;
+        }
         Ok(())
     }
 
@@ -372,6 +390,15 @@ impl Credentials {
     /// token, which may still sign in. If that cannot be done the principal is
     /// kept, and the next start tries again.
     async fn withdraw_lost(&self, record: &Record) {
+        // Only the tenant's owner acts on a principal, as in `revoke`: the
+        // fact and the leases need it. The owner finds it at its own start.
+        if self.engine.serves(&record.info.tenant).await.is_err() {
+            warn!(
+                principal = %record.info.id,
+                "the broker has lost the user of a principal of a tenant another server owns; it is left to that server"
+            );
+            return;
+        }
         if let Err(error) = self.broker.delete_user(record.user).await {
             warn!(
                 principal = %record.info.id,
@@ -617,7 +644,9 @@ impl Credentials {
     /// # Errors
     ///
     /// Returns 404 if no principal has the id, and 502 or 503 if the broker
-    /// cannot delete the user, in which case the credential is still valid.
+    /// cannot delete the user, in which case the credential is still valid,
+    /// and 503 if another server owns the principal's tenant: the owner
+    /// records the revocation and ends the leases, so nothing is changed here.
     pub(crate) async fn revoke(
         &self,
         by: &Principal,
@@ -629,6 +658,9 @@ impl Credentials {
             .registry
             .get(id)
             .ok_or_else(|| ApiError::NotFound(format!("no principal {id}")))?;
+        // Only the tenant's owner may act on a principal, so that the
+        // revocation is never half done: the fact and the leases need it.
+        self.engine.serves(&found.info.tenant).await?;
         self.broker.delete_user(found.user).await?;
         let record = self
             .registry
@@ -711,9 +743,22 @@ impl Credentials {
             return;
         }
         self.follow(true).await;
+        if self.engine.shared()
+            && let Err(error) = self.delete_orphans().await
+        {
+            warn!(%error, "broker users that no principal owns could not be looked for");
+        }
         let now = self.clock.now_millis();
         let by = self.engine_principal();
         for id in self.registry.expired(now) {
+            // The tenant's owner revokes it; a server that does not own the
+            // tenant leaves it, so that no revocation loses its fact.
+            let Some(found) = self.registry.get(id) else {
+                continue;
+            };
+            if self.engine.serves(&found.info.tenant).await.is_err() {
+                continue;
+            }
             if let Err(error) = self.revoke(&by, id, RevokeReason::Expired).await {
                 warn!(principal = %id, ?error, "an expired credential could not be revoked");
             }
@@ -900,6 +945,7 @@ mod tests {
         CredentialSettings {
             agent_ttl: Duration::from_secs(60),
             recheck: Duration::from_secs(30),
+            follow: Duration::from_millis(1000),
             sweep: Duration::from_secs(10),
         }
     }
@@ -911,11 +957,16 @@ mod tests {
 
         /// A server over a broker and a clock that another may have used.
         fn over(broker: Arc<Spy>, clock: Arc<ManualClock>) -> Self {
+            Self::sharing(broker, clock, WorkSettings::default())
+        }
+
+        /// A server that shares its broker with others: tenants are owned.
+        fn sharing(broker: Arc<Spy>, clock: Arc<ManualClock>, work: WorkSettings) -> Self {
             let engine = Arc::new(Engine::new(
                 broker.clone(),
                 Arc::new(NoSink),
                 clock.clone(),
-                WorkSettings::default(),
+                work,
                 100,
             ));
             let credentials = Arc::new(Credentials::new(
@@ -1143,6 +1194,177 @@ mod tests {
             .await
             .unwrap_err();
         assert!(is(&error, &ApiError::Unauthorized), "{error:?}");
+    }
+
+    fn shared() -> WorkSettings {
+        WorkSettings {
+            owner_ttl: Duration::from_secs(600),
+            ..WorkSettings::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_server_that_does_not_own_the_tenant_leaves_its_principals_alone() {
+        let first = Rig::sharing(Arc::default(), Arc::new(ManualClock::new(START)), shared());
+        let second = Rig::sharing(first.broker.clone(), first.clock.clone(), shared());
+        let issued = first.issue("agent", "builder-1", None).await.unwrap();
+        second
+            .credentials
+            .authenticate(&token(&issued))
+            .await
+            .unwrap();
+
+        // Asked of the standby, a revoke answers 503 and changes nothing.
+        let error = second
+            .credentials
+            .revoke(&admin(), issued.principal.id, RevokeReason::Requested)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApiError::Unavailable(_)), "{error:?}");
+        assert!(
+            first
+                .broker
+                .inner
+                .identify(&issued.credential)
+                .await
+                .is_ok()
+        );
+        assert_eq!(first.credentials.list(None).await.unwrap().len(), 1);
+
+        // The standby's sweep leaves an expired credential to the owner.
+        first.clock.advance(Duration::from_secs(60));
+        second.credentials.sweep().await;
+        assert!(
+            first
+                .broker
+                .inner
+                .identify(&issued.credential)
+                .await
+                .is_ok()
+        );
+        assert_eq!(first.facts().await.len(), 1, "only the created fact");
+
+        // The owner's sweep revokes it and writes the fact.
+        first.credentials.sweep().await;
+        assert!(
+            first
+                .broker
+                .inner
+                .identify(&issued.credential)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            first.facts().await,
+            [
+                ("mansio.principal.created".to_owned(), None),
+                (
+                    "mansio.principal.revoked".to_owned(),
+                    Some("expired".to_owned())
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_server_leaves_a_user_that_is_not_recorded_yet() {
+        let first = Rig::sharing(Arc::default(), Arc::new(ManualClock::new(START)), shared());
+        // A user the first server has made and not yet recorded.
+        first.broker.inner.ensure_tenant(&tenant()).await.unwrap();
+        let pending = first
+            .broker
+            .inner
+            .create_user(&tenant(), &user_name(PrincipalId::generate()), &[], None)
+            .await
+            .unwrap();
+        let second = Rig::sharing(first.broker.clone(), first.clock.clone(), shared());
+        second.credentials.load().await.unwrap();
+        assert!(
+            first
+                .broker
+                .inner
+                .identify(&pending.credential)
+                .await
+                .is_ok()
+        );
+
+        // Seen again within the grace, it is still left.
+        second.credentials.sweep().await;
+        assert!(
+            first
+                .broker
+                .inner
+                .identify(&pending.credential)
+                .await
+                .is_ok()
+        );
+
+        // Still unowned after the grace, it is an orphan.
+        first.clock.advance(Duration::from_secs(2));
+        second.credentials.sweep().await;
+        assert!(
+            first
+                .broker
+                .inner
+                .identify(&pending.credential)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_user_that_gets_its_record_within_the_grace_is_kept() {
+        let first = Rig::sharing(Arc::default(), Arc::new(ManualClock::new(START)), shared());
+        let second = Rig::sharing(first.broker.clone(), first.clock.clone(), shared());
+        second.credentials.load().await.unwrap();
+        let issued = first.issue("person", "kept", None).await.unwrap();
+        second.credentials.sweep().await;
+        first.clock.advance(Duration::from_secs(2));
+        second.credentials.sweep().await;
+        assert!(
+            first
+                .broker
+                .inner
+                .identify(&issued.credential)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_does_not_own_the_tenant_leaves_a_lost_user_to_its_owner() {
+        let first = Rig::sharing(Arc::default(), Arc::new(ManualClock::new(START)), shared());
+        let issued = first.issue("person", "lost", None).await.unwrap();
+        // The broker loses the user.
+        let user = first
+            .credentials
+            .registry
+            .get(issued.principal.id)
+            .unwrap()
+            .user;
+        first.broker.inner.delete_user(user).await.unwrap();
+
+        // Started second, a server that does not own the tenant keeps the
+        // principal and writes no fact.
+        let second = Rig::sharing(first.broker.clone(), first.clock.clone(), shared());
+        second.credentials.load().await.unwrap();
+        assert_eq!(second.credentials.list(None).await.unwrap().len(), 1);
+        assert_eq!(first.facts().await.len(), 1, "only the created fact");
+
+        // Once the first server's term has run out, a server that takes the
+        // tenant withdraws it and writes the fact.
+        let owner = Rig::sharing(first.broker.clone(), first.clock.clone(), shared());
+        owner.engine.serves(&tenant()).await.unwrap_err();
+        first.clock.advance(Duration::from_secs(700));
+        owner.credentials.load().await.unwrap();
+        assert!(owner.credentials.list(None).await.unwrap().is_empty());
+        assert_eq!(
+            first.facts().await.last(),
+            Some(&(
+                "mansio.principal.revoked".to_owned(),
+                Some("failed".to_owned())
+            ))
+        );
     }
 
     #[tokio::test]

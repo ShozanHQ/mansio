@@ -18,9 +18,13 @@ All notable changes to mansio are listed here. The format follows
   their state from the broker, so no item is lost. `docker compose --profile ha`
   adds a second server, and CI runs two containers on one Iggy. The ownership
   times are measured on a monotonic clock. Each server tails the principals log
-  (at every sweep, and when shown a token it does not know), so a credential
-  issued through one works on the other, also after the first dies. Webhooks
-  and consumer positions are still per server.
+  (at every sweep, and when shown a token it does not know, at most once per
+  `MANSIO_CREDENTIAL_FOLLOW_MILLIS`, default 1000, `credential_follow_millis`
+  in `GET /v1/settings`), so a credential issued through one works on the
+  other, also after the first dies. Only a tenant's owner revokes its
+  principals: a revoke asked of another server answers `503`, and its sweep
+  leaves them to the owner. Webhooks and consumer positions are still per
+  server.
 - The engine writes a snapshot of each tenant's state (open items, leases,
   items owed a fact, ids of finished items, unacknowledged alerts, and the
   ids of acknowledged ones) with the offset of each topic it covers, and a

@@ -82,6 +82,7 @@ fn local_credential_settings() -> CredentialSettings {
         agent_ttl: Duration::from_secs(3),
         recheck: Duration::from_secs(1),
         sweep: Duration::from_secs(1),
+        follow: Duration::from_millis(1000),
     }
 }
 

@@ -715,8 +715,8 @@ claimable. Try it with `docker compose --profile ha up --build --wait`, which
 adds a second server on port 7071 (set the variable for both).
 
 Credentials follow the broker: a server reads new records of the principals log
-at every sweep (`MANSIO_CREDENTIAL_SWEEP_SECONDS`) and, at most once a second,
-when it is shown a token it does not know, so a credential issued through one
+at every sweep (`MANSIO_CREDENTIAL_SWEEP_SECONDS`) and, at most once per
+`MANSIO_CREDENTIAL_FOLLOW_MILLIS`, when it is shown a token it does not know, so a credential issued through one
 server works on the other, including after the first dies.
 
 Still per server: webhooks and consumer positions are read when a server
@@ -866,7 +866,8 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_TOKEN_PRINCIPAL` | `service:mansio` | The `kind:name` the admin token stands for. |
 | `MANSIO_AGENT_CREDENTIAL_TTL_SECONDS` | `3600` | How long an agent credential lasts when the request does not say. |
 | `MANSIO_CREDENTIAL_RECHECK_SECONDS` | `30` | The longest a credential is trusted without asking the broker again, so the longest a revocation the server did not see itself takes to apply. Also how long the server waits after a registry that could not be loaded before it tries again. |
-| `MANSIO_CREDENTIAL_SWEEP_SECONDS` | `60` | How often expired credentials are revoked. |
+| `MANSIO_CREDENTIAL_SWEEP_SECONDS` | `60` | How often expired credentials are revoked. With servers sharing a broker, only a tenant's owner revokes its principals; a revoke asked of another server answers 503. |
+| `MANSIO_CREDENTIAL_FOLLOW_MILLIS` | `1000` | The soonest the principals log is read again for a token the registry does not know, so that tokens never issued cannot make the server read it at every request. Also how long a broker user no record owns is left before it is deleted, when servers share a broker. |
 | `MANSIO_SINK_PATH` | `mansio-sink.jsonl` (`/data/sink.jsonl` in the image) | JSON Lines file that every durable publish is appended to before it is published. Empty turns the sink off. |
 | `MANSIO_SINK_SYNC` | `true` | `true` or `false`. Whether the sink syncs each record to disk before the publish goes on. `false` is for development: a crash can lose recent records. |
 | `MANSIO_MAX_BODY_BYTES` | `1048576` | Largest request body; a larger one is a 413. Iggy has a cap of its own on a message payload, 64 000 000 bytes (the stored envelope, not the body's `data` alone), and a body over it is refused by Iggy as a 502, which a client does not retry. A value above about 64 000 000 lets a body reach that refusal; a value below it makes this setting the limit. Raise it only when messages are that large: Iggy holds a whole message in memory. |
