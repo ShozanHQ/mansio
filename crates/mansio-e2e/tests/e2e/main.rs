@@ -295,6 +295,33 @@ async fn a_request_without_the_token_is_refused() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn a_wrong_method_is_refused_in_the_error_shape() -> anyhow::Result<()> {
+    let target = Target::start().await?;
+    let messages = target.messages_uri("alerts");
+    let routes = [
+        (Method::DELETE, messages),
+        (Method::GET, format!("{}/v1/principals/x", target.base)),
+        (Method::POST, format!("{}/healthz", target.base)),
+        (Method::PUT, format!("{}/v1/settings", target.base)),
+        (Method::POST, format!("{}/v1/events", target.base)),
+        (Method::GET, format!("{}/v1/webhooks/x", target.base)),
+    ];
+    for (method, uri) in routes {
+        for token in [Some(target.token.as_str()), None] {
+            let (status, response) = target.call(method.clone(), &uri, token, None).await?;
+            assert_eq!(
+                status,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {uri}: {response}"
+            );
+            assert_eq!(response["error"]["code"], "method_not_allowed");
+            assert!(response["error"]["message"].is_string(), "{response}");
+        }
+    }
+    Ok(())
+}
+
 /// The `mansio` binary, built once per test run so it is never stale.
 fn cli_binary() -> anyhow::Result<PathBuf> {
     static BINARY: OnceLock<Result<PathBuf, String>> = OnceLock::new();

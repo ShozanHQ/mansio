@@ -365,12 +365,21 @@ consumers still deduplicate on `id`. ARCHITECTURE.md has the whole rule.
 
 A refusal is `{"error":{"code":"...","message":"..."}}` with status 400, 401
 (no valid credential), 403 (a valid credential that may not do this, or a lease
-that is not yours), 404, 409, 413, 502 or 503. A 502 is a refusal the broker
+that is not yours), 404, 405 (the route does not take that method), 409, 413,
+500 (a fault in the server; the message is generic and the detail is in the
+log), 502 or 503. A 502 is a refusal the broker
 named before it stored anything: nothing was stored. A 503 is every other
 failure of the broker or the sink, including an answer from Iggy that does not
 say whether it applied the request, so a write that gets a 503 may have been
 stored: send it again with the same `id`. A 502 or 503 is also logged at `warn`
 with the tenant, the topic and what the broker or the sink said.
+
+Length limits are in bytes, and a value over its limit is a 400. Free-text
+attributes are not empty and hold no control characters: `source` and `subject`
+at most 1024; `type`, `correlationid`, `causationid`, `idempotencykey`, `itemid`
+and `recordid` at most 256. A tenant id and each part of a topic name are at
+most 63 (`[a-z0-9][a-z0-9_-]{0,62}`), a principal kind at most 32 and a
+principal or consumer name at most 128. `scope` is at most 128 characters from `[a-z0-9._*:-]`. In `budget` (`<amount> <unit>`) the amount is at most 24 characters and the unit at most 32.
 
 `GET /v1/settings` answers with the settings the server runs with, none of
 them secret: the work, credential, stream and webhook settings below and the
