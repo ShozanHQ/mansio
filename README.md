@@ -499,9 +499,12 @@ curl ... -d '{"lease_id":"<uuid>","consumer":"worker-1","reason":"out of memory"
   fails may still have been stored, so the server rebuilds the tenant from the
   topics after one; a stored item or acknowledgement is not lost or repeated.
   A message in a topic that cannot be read is skipped, with a warning. Keep
-  `MANSIO_RETENTION_FACTS_SECONDS` no shorter than `MANSIO_RETENTION_WORK_SECONDS`:
+  `MANSIO_RETENTION_FACTS_SECONDS` no shorter than `MANSIO_RETENTION_WORK_SECONDS`
+  (the server logs a warning at start when it is):
   an item whose facts were deleted while its message was not is claimable
-  again. Iggy deletes expired messages a whole segment at a time, and only
+  again. To start faster, the server writes a snapshot of each tenant's state
+  every `MANSIO_SNAPSHOT_INTERVAL_SECONDS` and a start replays only what came
+  after it. Iggy deletes expired messages a whole segment at a time, and only
   after the segment has filled and rolled (see `MANSIO_IGGY_SEGMENT_SIZE_BYTES`);
   Iggy 0.9 answers a read from offset 0 of a topic whose head it has deleted
   with the first message left, so the rebuild sees everything that remains.
@@ -848,6 +851,8 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_BACKOFF_BASE_SECONDS` | `5` | The wait before an item is republished after its first failure. It doubles with each attempt. |
 | `MANSIO_BACKOFF_CAP_SECONDS` | `300` | The longest that wait gets. At least the base. |
 | `MANSIO_RECOVERY_LOG_SECONDS` | `60` | While the broker will not list its tenants at startup (for example an Iggy user that may not list streams), the server asks again after a wait that doubles from one tick up to this many seconds, and logs the failure at most once per this interval. At least 1. |
+| `MANSIO_SNAPSHOT_INTERVAL_SECONDS` | `300` | How often the state of a tenant that has changed is written to a snapshot, which the next start reads instead of replaying every topic from offset 0 (see "Snapshots" in ARCHITECTURE.md). 0 writes none. |
+| `MANSIO_SNAPSHOT_DIR` | `mansio-snapshots` | The directory of the snapshots, one file per tenant; `/data/snapshots` in the container image. Empty keeps none. A snapshot that cannot be read is ignored with a warning and the start replays from offset 0. |
 | `MANSIO_ALERT_RESURFACE_SECONDS` | `3600` | How long an alert may go unacknowledged before it is surfaced again, and again after each further interval. |
 | `MANSIO_TICK_MILLIS` | `500` | How often the timer looks for leases to expire, items to republish and alerts to surface again. |
 | `MANSIO_IDEMPOTENCY_WINDOW_SECONDS` | `86400` | How long a publish's `idempotencykey` is remembered. A second publish to the same tenant and topic with the same key inside the window is answered 200 with the first envelope and offset and publishes nothing. At least `1`, at most `315360000` (ten years). |

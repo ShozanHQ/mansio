@@ -117,6 +117,7 @@ pub struct Server {
     credentials: CredentialSettings,
     streams: StreamSettings,
     webhooks: WebhookSettings,
+    snapshot_dir: Option<std::path::PathBuf>,
 }
 
 /// The server's timers, running as tasks: the engine's, the credential sweep
@@ -172,7 +173,17 @@ impl Server {
             credentials: CredentialSettings::default(),
             streams: StreamSettings::default(),
             webhooks: WebhookSettings::default(),
+            snapshot_dir: None,
         }
+    }
+
+    /// Keep a snapshot of each tenant's engine state in files in `dir`, and
+    /// start from them instead of replaying every topic from offset 0. How
+    /// often one is written is `MANSIO_SNAPSHOT_INTERVAL_SECONDS`.
+    #[must_use]
+    pub fn with_snapshot_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.snapshot_dir = Some(dir.into());
+        self
     }
 
     /// Record every durable publish in `sink` first.
@@ -249,13 +260,17 @@ impl Server {
     /// are called.
     pub fn build(self) -> Parts {
         let max_body = self.limits.max_body_bytes;
-        let engine = Arc::new(Engine::new(
+        let mut engine = Engine::new(
             Arc::clone(&self.broker),
             self.sink,
             Arc::clone(&self.clock),
             self.work,
             self.limits.poll_max_count,
-        ));
+        );
+        if let Some(dir) = self.snapshot_dir {
+            engine = engine.with_snapshot_dir(dir);
+        }
+        let engine = Arc::new(engine);
         let credentials = Arc::new(Credentials::new(
             Arc::clone(&self.broker),
             Arc::clone(&engine),
@@ -493,6 +508,7 @@ async fn settings(
         idempotency_window_seconds: seconds(work.idempotency_window),
         idempotency_max_keys: u64::try_from(work.idempotency_max_keys).unwrap_or(u64::MAX),
         recovery_log_seconds: seconds(work.recovery_log),
+        snapshot_interval_seconds: seconds(work.snapshot_interval),
         max_body_bytes: u64::try_from(limits.max_body_bytes).unwrap_or(u64::MAX),
         poll_default_count: limits.poll_default_count,
         poll_max_count: limits.poll_max_count,

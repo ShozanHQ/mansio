@@ -64,8 +64,10 @@ COPY --from=build /out/mansio-server /usr/local/bin/mansio-server
 USER mansio
 WORKDIR /data
 # Listen on every interface inside the container, and keep the sink file on
-# the /data volume. Everything else is set by the caller; see the README.
+# the /data volume, with the snapshots of the engine's state. Everything else
+# is set by the caller; see the README.
 ENV MANSIO_LISTEN=0.0.0.0:7070 \
-    MANSIO_SINK_PATH=/data/sink.jsonl
+    MANSIO_SINK_PATH=/data/sink.jsonl \
+    MANSIO_SNAPSHOT_DIR=/data/snapshots
 EXPOSE 7070
 ENTRYPOINT ["mansio-server"]
