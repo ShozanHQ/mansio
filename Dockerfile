@@ -22,7 +22,7 @@ COPY rust-toolchain.toml ./
 RUN rustup toolchain install \
  && channel="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" \
  && rustc --version | grep -F "rustc ${channel} " \
- && cargo install cargo-chef --version 0.1.68 --locked
+ && cargo install cargo-chef --version 0.1.78 --locked
 
 # The recipe lists the dependencies and nothing else, so it changes only when
 # Cargo.toml or Cargo.lock does, and the layer that builds them is kept until then.
