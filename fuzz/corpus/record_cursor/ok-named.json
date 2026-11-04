@@ -1,0 +1,1 @@
+{"op":"named","v":1,"tenant":"acme","topic":"facts.build","principal":"agent:builder-1","consumer":"dash","offset":4}

@@ -1,0 +1,1 @@
+{"kind":"agent","name":"builder-1","tenant":"acme","scopes":[{"topic":"facts.build","verbs":["publish"]}],"ttl_seconds":3600}

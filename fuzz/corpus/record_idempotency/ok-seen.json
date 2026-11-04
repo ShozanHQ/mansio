@@ -1,0 +1,1 @@
+{"op":"seen","v":1,"tenant":"acme","topic":"facts.build","key":"a1","at":1792000000123,"first":{"offset":3,"id":"0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b1","principal":"service:mansio"}}

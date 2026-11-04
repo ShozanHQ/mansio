@@ -1,0 +1,146 @@
+[package]
+name = "mansio-fuzz"
+description = "Fuzz targets for the decoders of untrusted input."
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Not a member of the root workspace: libFuzzer needs a nightly compiler, and
+# the workspace builds on the pinned stable one. Its lockfile, fuzz/Cargo.lock, is committed and CI checks it with --locked.
+# (Generate it with `cargo generate-lockfile` in fuzz/ whenever a dependency changes.)
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mansio-server = { path = "../crates/mansio-server", version = "0.1.0", features = ["fuzzing"] }
+
+[[bin]]
+name = "envelope"
+path = "fuzz_targets/envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "body_publish"
+path = "fuzz_targets/body_publish.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "body_work_item"
+path = "fuzz_targets/body_work_item.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "body_principal"
+path = "fuzz_targets/body_principal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "body_webhook"
+path = "fuzz_targets/body_webhook.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "body_commit"
+path = "fuzz_targets/body_commit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "body_pull"
+path = "fuzz_targets/body_pull.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "body_extend"
+path = "fuzz_targets/body_extend.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "body_ack"
+path = "fuzz_targets/body_ack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "body_fail"
+path = "fuzz_targets/body_fail.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "record_principal"
+path = "fuzz_targets/record_principal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "record_cursor"
+path = "fuzz_targets/record_cursor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "record_webhook"
+path = "fuzz_targets/record_webhook.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "record_idempotency"
+path = "fuzz_targets/record_idempotency.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "record_ownership"
+path = "fuzz_targets/record_ownership.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "record_snapshot"
+path = "fuzz_targets/record_snapshot.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "record_work_fact"
+path = "fuzz_targets/record_work_fact.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "record_alert_fact"
+path = "fuzz_targets/record_alert_fact.rs"
+test = false
+doc = false
+bench = false
