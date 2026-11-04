@@ -11,6 +11,12 @@ updates:
       interval: weekly
     open-pull-requests-limit: 3
     groups:
+      # A minor bump of the iggy SDK is breaking for a 0.x crate, so it gets its
+      # own pull request. A dependency joins the first group it matches, so this
+      # one comes before the catch-all; iggy patches still go with the rest.
+      cargo-iggy-minor:
+        patterns: ["iggy*"]
+        update-types: [minor]
       cargo-minor-patch:
         patterns: ["*"]
         update-types: [minor, patch]
