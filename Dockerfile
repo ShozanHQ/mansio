@@ -14,6 +14,11 @@
 # compiler that will build is not the one the file names. The tag below is not
 # the pin and need not move with it.
 FROM rust:1.99.0-slim-trixie@sha256:2752b332db73fdbb7dc576f06c82ed1f312005784ef913d7e04a28f5f55dc581 AS toolchain
+# cargo-chef is installed with `cargo install`, which Dependabot's docker
+# ecosystem does not read and cargo-deny (workspace only) does not see. Its
+# version is written here and nowhere else, and is moved by hand when a new
+# release is wanted (https://crates.io/crates/cargo-chef).
+ARG CARGO_CHEF_VERSION=0.1.78
 RUN apt-get update \
  && apt-get install -y --no-install-recommends build-essential cmake pkg-config \
  && rm -rf /var/lib/apt/lists/*
@@ -21,8 +26,9 @@ WORKDIR /src
 COPY rust-toolchain.toml ./
 RUN rustup toolchain install \
  && channel="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" \
- && rustc --version | grep -F "rustc ${channel} " \
- && cargo install cargo-chef --version 0.1.78 --locked
+ && { rustc --version | grep -F "rustc ${channel} " \
+      || { echo "rust-toolchain.toml pins channel '${channel}' but rustc is '$(rustc --version)'; the channel must be a full X.Y.Z version" >&2; exit 1; }; } \
+ && cargo install cargo-chef --version "${CARGO_CHEF_VERSION}" --locked
 
 # The recipe lists the dependencies and nothing else, so it changes only when
 # Cargo.toml or Cargo.lock does, and the layer that builds them is kept until then.
@@ -34,8 +40,10 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM toolchain AS build
 COPY --from=planner /src/recipe.json recipe.json
 # The dependencies: cached in this layer until the recipe changes. No cache
-# mount on target, so that the compiled dependencies stay in the layer, where a
-# registry cache can carry them to the next CI run.
+# mount on target, so that the compiled dependencies stay in the layer, where
+# GitHub's Actions cache can carry them to the next CI run. The cost: a local
+# rebuild after a source change recompiles the workspace crates (not the
+# dependencies, which this layer keeps).
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo chef cook --locked --release --package mansio-server --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock ./

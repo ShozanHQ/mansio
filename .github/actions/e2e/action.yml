@@ -5,21 +5,6 @@ description: >-
   use it, so that they run the same thing. The caller checks out the repository,
   installs the toolchain and sets up the cache first.
 
-inputs:
-  cache-ref:
-    description: >-
-      A registry reference (for example ghcr.io/owner/repo/build-cache) that
-      holds the image's build cache, so the dependency layer is built once and
-      reused across runs. Empty builds without a shared cache.
-    default: ""
-  registry-token:
-    description: >-
-      A token that can read packages, to sign in to ghcr.io with for cache-ref.
-      Empty skips the sign-in. The action only reads the cache: a separate job
-      on a push to main writes it (image-cache in ci.yml), so no token that can
-      write is ever handed to code from a branch.
-    default: ""
-
 runs:
   using: composite
   steps:
@@ -82,35 +67,41 @@ runs:
       run: |
         mkdir -p "$RUNNER_TEMP/mansio-state"
         echo "MANSIO_E2E_STATE_DIR=$RUNNER_TEMP/mansio-state" >> "$GITHUB_ENV"
-    # The image is built here, before compose, so that the build can use a
-    # shared cache and be timed on its own. compose finds mansio-server:dev and
-    # does not build it again.
-    - name: Build the mansio-server image, reusing the cached dependency layer
+    # The image is built here, before compose, so that the build can use GitHub's
+    # Actions cache and be timed on its own. compose finds mansio-server:dev and
+    # does not build it again. The cache is scoped per branch: a run writes its
+    # branch's scope and reads it, then main's. The weekly run in scheduled.yml
+    # runs on main, so it shares main's scope and this code.
+    - name: Name the cache scope and start the clock
+      id: cache
       shell: bash
       env:
-        CACHE_REF: ${{ inputs.cache-ref }}
-        REGISTRY_TOKEN: ${{ inputs.registry-token }}
+        REF_NAME: ${{ github.ref_name }}
       run: |
-        set -euo pipefail
-        start=$SECONDS
-        # A builder of its own name, so a second run in one job, or a reused
-        # runner, does not collide with an existing one. The trap is set before
-        # the login, so a failure anywhere after it still logs out.
-        trap 'docker logout ghcr.io >/dev/null 2>&1 || true; [ -z "${builder:-}" ] || docker buildx rm "$builder" >/dev/null 2>&1 || true' EXIT
-        args=()
-        if [ -n "$CACHE_REF" ]; then
-          ref="${CACHE_REF,,}"
-          if [ -n "$REGISTRY_TOKEN" ]; then
-            printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin \
-              || echo "::warning::could not sign in to ghcr.io, so the build cache is read anonymously if at all"
-          fi
-          args+=(--cache-from "type=registry,ref=$ref")
-        fi
-        builder="$(docker buildx create --driver docker-container --bootstrap)"
-        docker buildx build --builder "$builder" --load --tag mansio-server:dev "${args[@]}" .
-        elapsed=$((SECONDS - start))
-        echo "Image build step: ${elapsed}s (cache: ${CACHE_REF:-none})"
-        echo "Image build step: ${elapsed}s (cache: ${CACHE_REF:-none})" >> "$GITHUB_STEP_SUMMARY"
+        scope="mansio-server-$(printf '%s' "$REF_NAME" | tr -c 'A-Za-z0-9._-' '-')"
+        echo "scope=$scope" >> "$GITHUB_OUTPUT"
+        echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
+    - name: Set up Buildx
+      uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+    - name: Build the mansio-server image, reusing the cached dependency layer
+      uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+      with:
+        context: .
+        load: true
+        push: false
+        tags: mansio-server:dev
+        cache-from: |
+          type=gha,scope=${{ steps.cache.outputs.scope }}
+          type=gha,scope=mansio-server-main
+        cache-to: type=gha,mode=max,scope=${{ steps.cache.outputs.scope }}
+    - name: Time the image build step
+      shell: bash
+      env:
+        STARTED: ${{ steps.cache.outputs.started }}
+      run: |
+        elapsed=$(( $(date +%s) - STARTED ))
+        echo "Image build step: ${elapsed}s"
+        echo "Image build step: ${elapsed}s" >> "$GITHUB_STEP_SUMMARY"
     - name: Start Iggy, make mansio's Iggy user, and start mansio-server
       shell: bash
       run: docker compose up --wait
@@ -121,7 +112,7 @@ runs:
     # server is restarted, and a second pass checks what the new server made
     # of them. They are #[ignore]d and selected by name, and they fail
     # without a live server and a state directory.
-    - name: A server with pages of 5, a lease of 30 s, a segment of 1 MiB, alerts kept 5 s and keys kept 10 min
+    - name: A server with pages of 5, a lease of 30 s, a segment of 1 MiB, alerts and presence kept 5 s and keys kept 10 min
       shell: bash
       run: |
         # Set here, in the command's own environment, over the 2 s lease above.
@@ -130,12 +121,21 @@ runs:
         export MANSIO_POLL_MAX_COUNT=5
         export MANSIO_IGGY_SEGMENT_SIZE_BYTES=1048576
         export MANSIO_RETENTION_ALERTS_SECONDS=5
+        # presence has its own segment setting, set here so the run uses it. It is
+        # 512 bytes over the general one, close enough that the e2e rolls both
+        # after the same fillers: the unit tests in config.rs and the server
+        # check which setting each kind of topic takes, not this step.
+        export MANSIO_IGGY_PRESENCE_SEGMENT_SIZE_BYTES=1049088
+        export MANSIO_RETENTION_PRESENCE_SECONDS=5
         # Long enough that a key outlasts the restart below.
         export MANSIO_IDEMPOTENCY_WINDOW_SECONDS=600
         docker compose up --detach --wait --no-deps --force-recreate mansio-server
     - name: Retention, first pass (alerts lose their head to Iggy, then another is published)
       shell: bash
       run: cargo test -p mansio-e2e --locked -- --ignored retention_first_pass
+    - name: Presence retention (a heartbeat is gone after its retention and one segment roll)
+      shell: bash
+      run: cargo test -p mansio-e2e --locked -- --ignored presence_retention
     - name: Restart, first pass (a queue longer than a page, one item claimed)
       shell: bash
       run: cargo test -p mansio-e2e --locked -- --ignored restart_first_pass

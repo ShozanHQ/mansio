@@ -18,7 +18,7 @@ use iggy::prelude::{
 };
 use mansio_core::{
     Broker, BrokerError, BrokerUser, BrokerUserInfo, Caller, Credential, Envelope, EventId, Grant,
-    Minted, Stored, SystemLog, SystemRecord, TenantId, Topic,
+    Minted, Stored, SystemLog, SystemRecord, TenantId, Topic, TopicKind,
 };
 use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use tracing::{info, warn};
@@ -130,6 +130,7 @@ pub struct IggyBroker {
     retention: Retention,
     durability: DurabilityPolicy,
     segment_size_bytes: u64,
+    presence_segment_size_bytes: u64,
     idempotency_expiry: Duration,
     locate_window: u32,
     ensured: Ensured,
@@ -205,6 +206,7 @@ impl IggyBroker {
             retention: config.retention,
             durability: config.durability,
             segment_size_bytes: config.segment_size_bytes,
+            presence_segment_size_bytes: config.presence_segment_size_bytes,
             idempotency_expiry: config.idempotency_expiry,
             locate_window: config.locate_window,
             ensured: Ensured::default(),
@@ -463,7 +465,11 @@ impl IggyBroker {
         let options = topic_options(
             &self.retention,
             &self.durability,
-            self.segment_size_bytes,
+            segment_size_for(
+                topic.kind(),
+                self.segment_size_bytes,
+                self.presence_segment_size_bytes,
+            ),
             topic,
         );
         let made = self
@@ -761,6 +767,15 @@ fn iggy_durability(durability: Durability) -> IggyDurability {
     match durability {
         Durability::Replicated => IggyDurability::Replicated,
         Durability::Persisted => IggyDurability::Persisted,
+    }
+}
+
+/// The segment size a topic of this kind is created with: `presence` has its
+/// own setting, every other kind takes the general one. Zero leaves it to Iggy.
+fn segment_size_for(kind: TopicKind, general: u64, presence: u64) -> u64 {
+    match kind {
+        TopicKind::Presence => presence,
+        _ => general,
     }
 }
 
@@ -1112,7 +1127,7 @@ mod tests {
     use std::time::Duration;
 
     use iggy::prelude::IggyMessageHeader;
-    use mansio_core::{Principal, TopicKind};
+    use mansio_core::Principal;
 
     use super::*;
 
@@ -1499,6 +1514,21 @@ mod tests {
             topic_options(&retention, &policy, 1024 * 1024, &topic).segment_size,
             Some(IggyByteSize::new(1024 * 1024))
         );
+    }
+
+    #[test]
+    fn presence_takes_its_own_segment_size_and_every_other_kind_the_general_one() {
+        let (general, presence) = (4 * 1024 * 1024, 1024 * 1024);
+        assert_eq!(
+            segment_size_for(Topic::Presence.kind(), general, presence),
+            presence
+        );
+        for name in ["alerts", "dead", "facts.build", "work.builds"] {
+            let topic: Topic = name.parse().unwrap();
+            assert_eq!(segment_size_for(topic.kind(), general, presence), general);
+        }
+        assert_eq!(segment_size_for(Topic::Presence.kind(), general, 0), 0);
+        assert_eq!(segment_size_for(Topic::Alerts.kind(), 0, presence), 0);
     }
 
     #[test]

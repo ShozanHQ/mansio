@@ -11,13 +11,19 @@ updates:
       interval: weekly
     open-pull-requests-limit: 3
     groups:
+      # A minor bump of the iggy SDK is breaking for a 0.x crate, so it gets its
+      # own pull request. A dependency joins the first group it matches, so this
+      # one comes before the catch-all; iggy patches still go with the rest.
+      cargo-iggy-minor:
+        patterns: ["iggy*"]
+        update-types: [minor]
       cargo-minor-patch:
         patterns: ["*"]
         update-types: [minor, patch]
 
   # The actions in the workflows. The versions are in comments beside the
-  # commits they are pinned to, and Dependabot moves both. The local action
-  # has no steps from elsewhere today; the second directory is for when it does.
+  # commits they are pinned to, and Dependabot moves both. The second directory
+  # covers the local e2e action, which uses the Buildx and build-push actions.
   - package-ecosystem: github-actions
     directories:
       - /

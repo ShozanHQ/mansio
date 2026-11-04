@@ -860,7 +860,8 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_IGGY_PASSWORD` | none, required with `iggy` | Its password. If Iggy refuses it at startup, the server exits with a message that names this variable and `MANSIO_IGGY_USERNAME`. |
 | `MANSIO_IGGY_CONNECT_TIMEOUT_SECONDS` | `60` | How long startup waits for Iggy. |
 | `MANSIO_IGGY_LOCATE_WINDOW` | `100` | How many recent messages to search, by message id, when Iggy accepts a publish without saying where it landed. 0 turns the search off. A message that is not found is still answered with 201, without an offset. |
-| `MANSIO_IGGY_SEGMENT_SIZE_BYTES` | `0` | The segment size Iggy gives the topics mansio creates. 0 leaves it to Iggy, which uses 1 GiB. Otherwise a multiple of 512 from 1048576 (1 MiB) to 1073741824. Iggy applies retention to whole segments that have filled and rolled, never to the one it is writing, so this is how coarsely the `MANSIO_RETENTION_*` settings trim a topic. Applied when a topic is created. |
+| `MANSIO_IGGY_SEGMENT_SIZE_BYTES` | `0` | The segment size Iggy gives the topics mansio creates, except `presence` (next row). 0 leaves it to Iggy, which uses 1 GiB. Otherwise a multiple of 512 from 1048576 (1 MiB) to 1073741824. Iggy applies retention to whole segments that have filled and rolled, never to the one it is writing, so this is how coarsely the `MANSIO_RETENTION_*` settings trim a topic. Applied when a topic is created. |
+| `MANSIO_IGGY_PRESENCE_SEGMENT_SIZE_BYTES` | `1048576` | The same for `presence`, which is ephemeral: 1 MiB by default, so a heartbeat is deleted soon after `MANSIO_RETENTION_PRESENCE_SECONDS` instead of waiting for a 1 GiB segment to fill. 0 leaves it to Iggy. Applied when a topic is created. |
 | `MANSIO_IGGY_DURABILITY` | `persisted` | When Iggy confirms a write to `facts.*`, `work.*`, `alerts` and `dead`: `persisted` or `replicated`. See [Durability](#durability). |
 | `MANSIO_IGGY_PRESENCE_DURABILITY` | `replicated` | The same for `presence`, which is ephemeral. |
 | `MANSIO_RETENTION_FACTS_SECONDS` | `0` | How long Iggy keeps `facts.*` messages. 0 keeps them forever. |
@@ -870,8 +871,15 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_RETENTION_PRESENCE_SECONDS` | `3600` | The same for `presence`. |
 | `RUST_LOG` | `info` | Log filter. |
 
-Retention and durability are applied when a topic is created; a topic that
-already exists keeps the ones it was created with.
+Retention is a minimum, not a deadline, for every kind of topic. Iggy deletes
+only segments that have filled and rolled, never the one it is writing, so a
+message lives until its retention has passed and its segment has rolled. A
+quiet topic with large segments can keep a message far longer than its
+retention; the segment size (`MANSIO_IGGY_SEGMENT_SIZE_BYTES`, and
+`MANSIO_IGGY_PRESENCE_SEGMENT_SIZE_BYTES` for `presence`) bounds how long.
+
+Retention, durability and segment size are applied when a topic is created; a
+topic that already exists keeps the ones it was created with.
 
 #### The Iggy user
 
@@ -990,8 +998,10 @@ and `retention_second_pass` in `crates/mansio-e2e/tests/e2e/passes.rs`, and
 skip, without `MANSIO_E2E_URL` or `MANSIO_E2E_STATE_DIR`. The `e2e` job in
 `.github/workflows/ci.yml`, through the action in `.github/actions/e2e`, runs
 them in order: it recreates mansio-server with
-pages of 5, a lease of 30 s, a segment of 1 MiB, alerts kept for 5 s and an
-idempotency window of 600 s, runs the three first passes, restarts mansio-server
+pages of 5, a lease of 30 s, a segment of 1 MiB, alerts and presence kept for
+5 s, a presence segment of about 1 MiB
+(`MANSIO_IGGY_PRESENCE_SEGMENT_SIZE_BYTES`) and an idempotency window of 600 s,
+runs the three first passes and `presence_retention`, restarts mansio-server
 (`docker compose restart`), and runs the three second passes. The idempotency
 pair publishes with a key, and after the restart checks that the same key is
 answered 200 with the first envelope and offset and that the topic holds one
@@ -1003,7 +1013,10 @@ retried exactly once after that and that every other item can be claimed
 once. The retention pair fills and rolls a
 segment of `alerts`, waits for Iggy to delete it, publishes another alert, and
 after the restart checks that the server's rebuild, which reads from offset 0,
-finds the alerts that are left. The same checks as the restart pair run in one
+finds the alerts that are left. `presence_retention` is a single pass with no
+restart: it publishes a `presence` heartbeat, fills and rolls the segment, and
+checks that the first heartbeat is gone once the 5 s retention has passed while
+the one in the open segment is still there. The same checks as the restart pair run in one
 process, against the in-process server, on every `cargo test`.
 
 The `offline` job runs `tests/offline/run.sh` against a compose stack of its own;
