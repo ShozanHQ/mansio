@@ -25,6 +25,8 @@ pub const DEFAULT_LISTEN: &str = "127.0.0.1:7070";
 pub const DEFAULT_TOKEN_PRINCIPAL: &str = "service:mansio";
 /// Default file for the JSON Lines sink.
 pub const DEFAULT_SINK_PATH: &str = "mansio-sink.jsonl";
+/// Whether the file sink syncs each record to disk by default.
+pub const DEFAULT_SINK_SYNC: bool = true;
 
 /// Limits on what the API accepts and returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -406,6 +408,9 @@ pub struct Settings {
     pub token_principal: Principal,
     /// The JSON Lines sink file (`MANSIO_SINK_PATH`); `None` records nothing.
     pub sink_path: Option<PathBuf>,
+    /// Whether the sink syncs each record to disk before the publish goes on
+    /// (`MANSIO_SINK_SYNC`, default `true`). Turn it off for development only.
+    pub sink_sync: bool,
     /// API limits.
     pub limits: Limits,
     /// The work and alert engine.
@@ -549,6 +554,7 @@ impl Settings {
                 Some(path) if path.is_empty() => None,
                 Some(path) => Some(PathBuf::from(path)),
             },
+            sink_sync: env.parse("MANSIO_SINK_SYNC", DEFAULT_SINK_SYNC)?,
             limits,
             work,
             credentials,
@@ -1086,6 +1092,24 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(settings.sink_path, None);
+    }
+
+    #[test]
+    fn the_sink_syncs_unless_told_not_to() {
+        let base = [("MANSIO_TOKEN", "t"), ("MANSIO_BROKER", "memory")];
+        assert!(settings(&base).unwrap().sink_sync);
+        let mut off = base.to_vec();
+        off.push(("MANSIO_SINK_SYNC", "false"));
+        assert!(!settings(&off).unwrap().sink_sync);
+        let mut bad = base.to_vec();
+        bad.push(("MANSIO_SINK_SYNC", "maybe"));
+        assert!(matches!(
+            settings(&bad).unwrap_err(),
+            SettingsError::Invalid {
+                name: "MANSIO_SINK_SYNC",
+                ..
+            }
+        ));
     }
 
     #[test]

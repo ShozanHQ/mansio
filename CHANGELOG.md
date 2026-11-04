@@ -7,6 +7,8 @@ All notable changes to mansio are listed here. The format follows
 
 ### Added
 
+- `MANSIO_SINK_SYNC` (default `true`) is a setting. The file sink calls `sync_data` after every record before
+  `record` returns; `false` skips it, for development only.
 - A publish with an `idempotencykey` that the tenant's topic has already seen
   inside a window answers 200 with the first envelope and offset and publishes
   nothing (a first publish is still 201). The window
@@ -151,6 +153,12 @@ All notable changes to mansio are listed here. The format follows
   CLI and the MCP tools, on the memory and Iggy backends. Only the whitespace
   outside strings is removed, so a record stays on one line.
 
+- The file sink writes each record as one whole line and syncs it to disk
+  before `record` returns (set `MANSIO_SINK_SYNC=false` to skip the sync). A
+  failed write is cut back to the last whole line; if that fails, the sink
+  refuses every record until a restart. The server now refuses to start when
+  the sink file ends in a torn line (no final newline), naming the file and the
+  byte offset; repair or truncate the file to that offset and start again.
 - A `work_pull` by a consumer that holds a live lease on the queue returns that
   lease again instead of claiming another item, so a claim whose answer was
   lost can be asked for again. A server restarted since the claim cannot say
