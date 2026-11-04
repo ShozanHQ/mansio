@@ -241,7 +241,7 @@ mod tests {
 
     #[test]
     fn presence_gets_a_small_segment_by_default() {
-        let config = IggyConfig::new("a", "u", SecretString::from("p"));
+        let config = IggyConfig::new("a", "u", SecretString::from(String::new()));
         assert_eq!(config.presence_segment_size_bytes, MIN_SEGMENT_SIZE_BYTES);
         assert_eq!(config.segment_size_bytes, 0);
         assert_eq!(
