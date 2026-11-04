@@ -52,6 +52,37 @@ tree() {
   report "$1" "$2" "$got"
 }
 
+# history: a scratch repository in which one commit adds a file with a ticket
+# id and the next removes it. The final tree is clean; the first commit is not.
+history() {
+  local repo got=0 first out
+  repo=$(mktemp -d "${TMPDIR:-/tmp}/names-test.XXXXXX")
+  git -C "$repo" init -q
+  git -C "$repo" config user.email test@example.com
+  git -C "$repo" config user.name test
+  git -C "$repo" config commit.gpgsign false
+  printf 'clean\n' >"$repo/clean.txt"
+  printf 'Fixes %s.\n' "$id" >"$repo/stray.txt"
+  git -C "$repo" add .
+  git -C "$repo" commit -q -m one
+  first=$(git -C "$repo" rev-parse HEAD)
+  git -C "$repo" rm -q stray.txt
+  git -C "$repo" commit -q -m two
+  (cd "$repo" && bash "$names" tree >/dev/null 2>&1) || got=$?
+  report 0 "history: the final tree passes" "$got"
+  got=0
+  out=$(cd "$repo" && bash "$names" tree "$first" 2>&1) || got=$?
+  report 1 "history: the commit that adds the file fails" "$got"
+  case $out in
+    *"$first"*stray.txt*) echo "ok    history: the output names the commit and the path" ;;
+    *) echo "FAIL  history: the output names the commit and the path"; failed=1 ;;
+  esac
+  got=0
+  (cd "$repo" && bash "$names" tree HEAD >/dev/null 2>&1) || got=$?
+  report 0 "history: the commit that removes it passes" "$got"
+  rm -rf "$repo"
+}
+
 text 1 "text: a ticket id fails" <<<"Fixes ${id} in the lease code"
 text 1 "text: a ticket id in capitals fails" <<<"Fixes $(upper "$id") in the lease code"
 text 1 "text: a ticket id on a later line fails" <<<$'A clean line.\n'"Closes ${id}."
@@ -66,5 +97,7 @@ tree 1 "tree: a file with a ticket id fails" "Fixes ${id}."
 tree 1 "tree: a file with the tracker's host fails" "See https://${host}/team/issue"
 tree 0 "tree: a file with the product name passes" "Built with Shozan."
 tree 0 "tree: a clean file passes" "Retry with backoff, then a dead topic."
+
+history
 
 exit "$failed"

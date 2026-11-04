@@ -3,8 +3,10 @@
 # it carries nothing that is a dead end to anyone outside: no internal ticket
 # id, and no link to the issue tracker, which its host gives away. Run as
 #
-#   names.sh tree            on the tracked files of the checkout, binary ones
-#                            included, and on their paths
+#   names.sh tree [<commit>] on the tracked files of the checkout, or of the
+#                            tree of <commit>, binary ones included, and on
+#                            their paths; a commit's lines start with its id
+#                            and the path
 #   names.sh text <label>    on text from stdin, such as a commit message or a
 #                            pull request title or body; <label> says which
 #
@@ -40,12 +42,27 @@ strays() {
 
 case "${1:-}" in
   tree)
-    label="the tree"
+    commit=${2:-}
+    if [ -n "$commit" ]; then
+      label="commit $commit"
+      git rev-parse --verify --quiet "${commit}^{tree}" >/dev/null || {
+        echo "names.sh: no such commit: $commit" >&2
+        exit 2
+      }
+      pathlabel="path in $commit"
+    else
+      label="the tree"
+      pathlabel="path"
+    fi
     # -a reads a binary file as text: without it git grep only says that a
     # binary file matches, and nothing here would test it. The first pass
     # over-matches; strays() is the test.
-    contents=$({ git grep -a -i -n -E "${ID}|${c}${d}\\.${e}" || [ $? -eq 1 ]; } | strays "")
-    paths=$(git ls-files | strays "path")
+    contents=$({ git grep -a -i -n -E "${ID}|${c}${d}\\.${e}" ${commit:+"$commit"} || [ $? -eq 1 ]; } | strays "")
+    if [ -n "$commit" ]; then
+      paths=$(git ls-tree -r --name-only "$commit" | strays "$pathlabel")
+    else
+      paths=$(git ls-files | strays "$pathlabel")
+    fi
     stray=$(printf '%s\n%s\n' "$paths" "$contents" | sed '/^$/d')
     ;;
   text)
@@ -53,7 +70,7 @@ case "${1:-}" in
     stray=$(cat | strays "$label")
     ;;
   *)
-    echo "usage: names.sh tree | names.sh text <label>" >&2
+    echo "usage: names.sh tree [<commit>] | names.sh text <label>" >&2
     exit 2
     ;;
 esac
