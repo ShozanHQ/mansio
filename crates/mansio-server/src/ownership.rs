@@ -369,9 +369,23 @@ impl Ownership {
             let now = self.clock.monotonic_millis();
             for stored in &batch {
                 match serde_json::from_slice::<Record>(&stored.payload) {
-                    Ok(record) => log.apply(record, now),
+                    Ok(record) => {
+                        log.apply(record, now);
+                        log.next = stored.offset.saturating_add(1);
+                    }
                     Err(error) => {
-                        warn!(offset = stored.offset, %error, "a record of the owners log was not read");
+                        // Ownership is a fold over one shared order: a server
+                        // that skipped a record would see a different view
+                        // from one that read it. Stop here, apply nothing from
+                        // it on, and fail the round, so this server takes no
+                        // tenant until the record can be read.
+                        // The error returned below reaches `maintain`, which
+                        // logs the first failure; this line repeats every round.
+                        debug!(offset = stored.offset, %error, "a record of the owners log was not read; the round stops at it");
+                        return Err(BrokerError::Unavailable(format!(
+                            "owners log record at offset {} cannot be read: {error}",
+                            stored.offset
+                        )));
                     }
                 }
             }
@@ -529,6 +543,45 @@ mod tests {
                 "exactly one owns it: {first:?} {second:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_record_that_cannot_be_read_stops_the_round_and_grants_nothing() {
+        let broker = Arc::new(MemoryBroker::new());
+        let clock = Arc::new(ManualClock::new(1_000_000));
+        let a = server(&broker, &clock);
+        let acme = tenant("acme");
+        broker
+            .system_append(SystemLog::Owners, b"{\"op\":\"from_a_newer_server\"}")
+            .await
+            .unwrap();
+
+        assert!(a.acquire(&acme).await.is_err());
+        assert!(a.epoch_of(&acme).is_none());
+        // Still stopped at the record on the next round, not past it.
+        a.maintain(std::slice::from_ref(&acme), true).await;
+        assert!(a.epoch_of(&acme).is_none());
+    }
+
+    #[tokio::test]
+    async fn an_owner_keeps_its_grant_until_it_runs_out_when_a_record_cannot_be_read() {
+        let broker = Arc::new(MemoryBroker::new());
+        let clock = Arc::new(ManualClock::new(1_000_000));
+        let a = server(&broker, &clock);
+        let acme = vec![tenant("acme")];
+        a.acquire(&acme[0]).await.unwrap();
+        broker
+            .system_append(SystemLog::Owners, b"{\"op\":\"from_a_newer_server\"}")
+            .await
+            .unwrap();
+
+        // The round fails, so nothing renews, but the grant it holds stands.
+        pass(&clock, 1, &[(&a, &acme)]).await;
+        assert!(a.epoch_of(&acme[0]).is_some());
+
+        // It runs out on its own, and the tenant is not served after that.
+        pass(&clock, TTL.as_secs() + 1, &[(&a, &acme)]).await;
+        assert!(a.epoch_of(&acme[0]).is_none());
     }
 
     #[tokio::test]
