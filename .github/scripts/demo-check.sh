@@ -103,8 +103,10 @@ runner="$work/run.sh"
 {
   echo '__demo_block=0'
   echo 'set -eEuo pipefail'
+  printf '__demo_file=%s\n' "$(printf %q "$demo")"
+  # Only the main shell reports, so a failure inside $(...) prints once.
   # shellcheck disable=SC2016
-  echo 'trap '"'"'echo "demo-check: FAIL in bash block $__demo_block of '"$demo"': $BASH_COMMAND" >&2'"'"' ERR'
+  echo 'trap '"'"'[ "$BASH_SUBSHELL" -eq 0 ] && echo "demo-check: FAIL in bash block $__demo_block of $__demo_file: $BASH_COMMAND" >&2'"'"' ERR'
   cat "$work/blocks.sh"
 } >"$runner"
 
