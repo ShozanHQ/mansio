@@ -36,6 +36,7 @@ mod recover;
 mod registry;
 mod settings;
 mod sink;
+mod snapshot;
 mod state;
 mod stream_limits;
 mod tail;
@@ -54,8 +55,8 @@ pub use engine::{Engine, Holder};
 pub use error::ApiError;
 pub use settings::{
     Backend, CredentialSettings, DEFAULT_LISTEN, DEFAULT_SINK_PATH, DEFAULT_SINK_SYNC,
-    DEFAULT_TOKEN_PRINCIPAL, Limits, Settings, SettingsError, StreamSettings, WebhookSettings,
-    WorkSettings,
+    DEFAULT_SNAPSHOT_DIR, DEFAULT_SNAPSHOT_INTERVAL_SECONDS, DEFAULT_TOKEN_PRINCIPAL, Limits,
+    Settings, SettingsError, StreamSettings, WebhookSettings, WorkSettings, retention_warning,
 };
 pub use sink::{FileSink, SinkOpenError};
 pub use webhooks::Webhooks;

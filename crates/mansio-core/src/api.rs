@@ -238,6 +238,9 @@ pub struct EffectiveSettings {
     /// `MANSIO_RECOVERY_LOG_SECONDS`: how often a recovery that keeps failing
     /// is logged.
     pub recovery_log_seconds: u64,
+    /// `MANSIO_SNAPSHOT_INTERVAL_SECONDS`: how often the state of a tenant
+    /// that has changed is written to a snapshot. 0 means never.
+    pub snapshot_interval_seconds: u64,
     /// `MANSIO_MAX_BODY_BYTES`.
     pub max_body_bytes: u64,
     /// `MANSIO_POLL_DEFAULT_COUNT`.

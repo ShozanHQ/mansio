@@ -10,21 +10,42 @@ All notable changes to mansio are listed here. The format follows
 - The timer finds due leases, retries, owed facts and resurfacing alerts
   through a due-time index instead of scanning every open item and alert, so
   a tick with nothing due does constant work and holds the tenant lock for
-  the same short time at any queue depth Mean time per tick with nothing
+  the same short time at any queue depth. Mean time per tick with nothing
   due, one tenant, release build, from `tick_benchmark`
   (`cargo test -p mansio-server --release -- --ignored --nocapture tick_benchmark`);
   the lock hold is the tenant lock held across the tick's pass:
 
   | Open items | Tick before | Tick after | Lock hold before | Lock hold after |
   | ---------- | ----------- | ---------- | ---------------- | --------------- |
-  | 1k         | 1.4 µs      | 0.13 µs    | 1.3 µs           | 0.05 µs         |
-  | 10k        | 26 µs       | 0.8 µs     | 13 µs            | 0.06 µs         |
-  | 100k       | 1120 µs     | 0.08 µs    | 1025 µs          | 0.07 µs         |
+  | 1k         | 1.4 µs      | 0.17 µs    | 1.3 µs           | 0.07 µs         |
+  | 10k        | 26 µs       | 0.5 µs     | 13 µs            | 0.07 µs         |
+  | 100k       | 1120 µs     | 0.09 µs    | 1025 µs          | 0.05 µs         |
 
-  "Before" is origin/main with the same benchmark; "after" is this change.
+  "Before" is origin/main with the same benchmark; "after" is this change on the tree merged with main, snapshot
+  checks and pruning included.
 
 ### Added
 
+- The engine writes a snapshot of each tenant's state (open items, leases,
+  items owed a fact, ids of finished items, unacknowledged alerts, and the
+  ids of acknowledged ones) with the offset of each topic it covers, and a
+  start replays only the messages after those offsets instead of every topic
+  from offset 0. `MANSIO_SNAPSHOT_INTERVAL_SECONDS` (default 300, 0 for none;
+  `snapshot_interval_seconds` in `GET /v1/settings`) says how often a
+  tenant whose state changed is written, and `MANSIO_SNAPSHOT_DIR` (default
+  `mansio-snapshots`, `/data/snapshots` in the image, empty for none) where.
+  A snapshot that cannot be read, or does not fit the topics, is ignored with
+  a warning and the start replays from offset 0. The server also logs a
+  warning at start when `MANSIO_RETENTION_FACTS_SECONDS` is shorter than
+  `MANSIO_RETENTION_WORK_SECONDS`.
+- Credential sessions on Iggy are bounded. `MANSIO_IGGY_SESSION_IDLE_SECONDS`
+  (default 300) closes the clients of a credential that has gone unused, and
+  the next request signs in again. `MANSIO_IGGY_SESSION_CLIENTS` (default 2)
+  keeps up to that many clients per credential, so an open event stream and a
+  pull by the same credential do not wait for each other. A recheck of a
+  credential keeps its new client in the pool instead of closing it.
+  `MANSIO_IGGY_SIGNIN_TIMEOUT_SECONDS` (default 10) bounds signing a
+  credential in, in place of the 60 s connect timeout.
 - `MANSIO_SSE_MAX_PER_CREDENTIAL` (default 10) and `MANSIO_SSE_MAX` (default
   1000) limit open event streams: the next `GET /v1/events` gets 429 for a
   credential at its limit and 503 when the server is at its own. Both are in

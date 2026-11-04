@@ -20,7 +20,8 @@ pub use broker::{
 };
 pub use config::{
     DEFAULT_ADDRESS, DEFAULT_CONNECT_TIMEOUT, DEFAULT_LOCATE_WINDOW, DEFAULT_PRESENCE_RETENTION,
-    DEFAULT_PRESENCE_SEGMENT_SIZE_BYTES, DEFAULT_USERNAME, Durability, DurabilityPolicy,
-    IggyConfig, MAX_SEGMENT_SIZE_BYTES, MIN_SEGMENT_SIZE_BYTES, Retention, check_segment_size,
+    DEFAULT_PRESENCE_SEGMENT_SIZE_BYTES, DEFAULT_SESSION_CLIENTS, DEFAULT_SESSION_IDLE,
+    DEFAULT_SIGNIN_TIMEOUT, DEFAULT_USERNAME, Durability, DurabilityPolicy, IggyConfig,
+    MAX_SEGMENT_SIZE_BYTES, MIN_SEGMENT_SIZE_BYTES, Retention, check_segment_size,
 };
 pub use provision::{ProvisionConfig, Provisioned, provision_admin};

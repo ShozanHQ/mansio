@@ -474,6 +474,7 @@ async fn the_settings_are_served_and_need_the_token() -> anyhow::Result<()> {
         "idempotency_window_seconds",
         "idempotency_max_keys",
         "recovery_log_seconds",
+        "snapshot_interval_seconds",
         "agent_credential_ttl_seconds",
         "credential_recheck_seconds",
         "credential_sweep_seconds",

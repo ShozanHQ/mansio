@@ -13,8 +13,9 @@ use std::time::Duration;
 use mansio_core::Principal;
 use mansio_iggy::{
     DEFAULT_ADDRESS, DEFAULT_CONNECT_TIMEOUT, DEFAULT_LOCATE_WINDOW, DEFAULT_PRESENCE_RETENTION,
-    DEFAULT_PRESENCE_SEGMENT_SIZE_BYTES, DEFAULT_USERNAME, DurabilityPolicy, IggyConfig,
-    ProvisionConfig, Retention, check_segment_size,
+    DEFAULT_PRESENCE_SEGMENT_SIZE_BYTES, DEFAULT_SESSION_CLIENTS, DEFAULT_SESSION_IDLE,
+    DEFAULT_SIGNIN_TIMEOUT, DEFAULT_USERNAME, DurabilityPolicy, IggyConfig, ProvisionConfig,
+    Retention, check_segment_size,
 };
 use secrecy::SecretString;
 use thiserror::Error;
@@ -28,6 +29,13 @@ pub const DEFAULT_TOKEN_PRINCIPAL: &str = "service:mansio";
 pub const DEFAULT_SINK_PATH: &str = "mansio-sink.jsonl";
 /// Whether the file sink syncs each record to disk by default.
 pub const DEFAULT_SINK_SYNC: bool = true;
+/// Default directory of the snapshots (`MANSIO_SNAPSHOT_DIR`).
+pub const DEFAULT_SNAPSHOT_DIR: &str = "mansio-snapshots";
+/// Default interval between snapshots, in seconds
+/// (`MANSIO_SNAPSHOT_INTERVAL_SECONDS`).
+pub const DEFAULT_SNAPSHOT_INTERVAL_SECONDS: u64 = 300;
+/// Most Iggy clients one credential may keep (`MANSIO_IGGY_SESSION_CLIENTS`).
+pub const MAX_SESSION_CLIENTS: usize = 64;
 
 /// Limits on what the API accepts and returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +105,11 @@ pub struct WorkSettings {
     /// between its attempts, which back off from one tick to this
     /// (`MANSIO_RECOVERY_LOG_SECONDS`).
     pub recovery_log: Duration,
+    /// How often the state of a tenant that has changed is written to a
+    /// snapshot, which a start reads instead of replaying every topic from
+    /// offset 0 (`MANSIO_SNAPSHOT_INTERVAL_SECONDS`). Zero turns snapshots
+    /// off.
+    pub snapshot_interval: Duration,
 }
 
 impl Default for WorkSettings {
@@ -112,6 +125,7 @@ impl Default for WorkSettings {
             idempotency_window: Duration::from_secs(86_400),
             idempotency_max_keys: 10_000,
             recovery_log: Duration::from_secs(60),
+            snapshot_interval: Duration::from_secs(DEFAULT_SNAPSHOT_INTERVAL_SECONDS),
         }
     }
 }
@@ -380,6 +394,10 @@ impl WebhookSettings {
 
 /// Which broker to run on (`MANSIO_BROKER`), with what it needs.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one value is built at startup; boxing would change a public field"
+)]
 pub enum Backend {
     /// Apache Iggy.
     Iggy(IggyConfig),
@@ -418,6 +436,28 @@ pub enum SettingsError {
     },
 }
 
+/// What is wrong with a `facts` retention shorter than that of `work`, or
+/// `None` if nothing is.
+///
+/// The engine rebuilds a work item from its message on `work.<queue>` and the
+/// transitions recorded on `facts.work`. When Iggy has deleted the facts of an
+/// item and kept its message, a rebuild finds an item nobody has touched and
+/// offers it again, though it was finished; a snapshot reads the facts after
+/// its offsets and can do nothing for the ones that are gone.
+#[must_use]
+pub fn retention_warning(retention: &Retention) -> Option<String> {
+    let facts = retention.facts?;
+    match retention.work {
+        Some(work) if facts >= work => None,
+        work => Some(format!(
+            "MANSIO_RETENTION_FACTS_SECONDS ({}) is shorter than MANSIO_RETENTION_WORK_SECONDS ({}), so facts.work can lose the transitions of an item whose message work.<queue> still holds; \
+             a start then offers a finished item again. Keep facts at least as long as work",
+            facts.as_secs(),
+            work.map_or_else(|| "forever".to_owned(), |work| work.as_secs().to_string()),
+        )),
+    }
+}
+
 /// Everything the binary is configured with.
 #[derive(Debug)]
 pub struct Settings {
@@ -434,6 +474,10 @@ pub struct Settings {
     /// Whether the sink syncs each record to disk before the publish goes on
     /// (`MANSIO_SINK_SYNC`, default `true`). Turn it off for development only.
     pub sink_sync: bool,
+    /// The directory of the snapshots of each tenant's state
+    /// (`MANSIO_SNAPSHOT_DIR`); `None` keeps none, and every start replays
+    /// every topic from offset 0.
+    pub snapshot_dir: Option<PathBuf>,
     /// API limits.
     pub limits: Limits,
     /// The work and alert engine.
@@ -503,6 +547,10 @@ impl Settings {
                 work_defaults.idempotency_max_keys,
             )?,
             recovery_log: env.seconds("MANSIO_RECOVERY_LOG_SECONDS", work_defaults.recovery_log)?,
+            snapshot_interval: env.seconds(
+                "MANSIO_SNAPSHOT_INTERVAL_SECONDS",
+                work_defaults.snapshot_interval,
+            )?,
         };
         work.validate()?;
 
@@ -584,6 +632,11 @@ impl Settings {
                 Some(path) => Some(PathBuf::from(path)),
             },
             sink_sync: env.parse("MANSIO_SINK_SYNC", DEFAULT_SINK_SYNC)?,
+            snapshot_dir: match env.raw("MANSIO_SNAPSHOT_DIR") {
+                None => Some(PathBuf::from(DEFAULT_SNAPSHOT_DIR)),
+                Some(dir) if dir.is_empty() => None,
+                Some(dir) => Some(PathBuf::from(dir)),
+            },
             limits,
             work,
             credentials,
@@ -643,6 +696,40 @@ impl Settings {
             "MANSIO_IGGY_CONNECT_TIMEOUT_SECONDS",
             DEFAULT_CONNECT_TIMEOUT.as_secs(),
         )?);
+        let invalid = |name: &'static str, reason: &str| SettingsError::Invalid {
+            name,
+            reason: reason.to_owned(),
+        };
+        let signin_seconds = env.parse(
+            "MANSIO_IGGY_SIGNIN_TIMEOUT_SECONDS",
+            DEFAULT_SIGNIN_TIMEOUT.as_secs(),
+        )?;
+        if signin_seconds == 0 {
+            return Err(invalid(
+                "MANSIO_IGGY_SIGNIN_TIMEOUT_SECONDS",
+                "must be at least 1",
+            ));
+        }
+        config.signin_timeout = Duration::from_secs(signin_seconds);
+        let idle_seconds = env.parse(
+            "MANSIO_IGGY_SESSION_IDLE_SECONDS",
+            DEFAULT_SESSION_IDLE.as_secs(),
+        )?;
+        if idle_seconds == 0 {
+            return Err(invalid(
+                "MANSIO_IGGY_SESSION_IDLE_SECONDS",
+                "must be at least 1",
+            ));
+        }
+        config.session_idle = Duration::from_secs(idle_seconds);
+        let clients = env.parse("MANSIO_IGGY_SESSION_CLIENTS", DEFAULT_SESSION_CLIENTS)?;
+        if !(1..=MAX_SESSION_CLIENTS).contains(&clients) {
+            return Err(invalid(
+                "MANSIO_IGGY_SESSION_CLIENTS",
+                "must be between 1 and 64",
+            ));
+        }
+        config.session_clients = clients;
         config.idempotency_expiry = idempotency_window;
         config.locate_window = env.parse("MANSIO_IGGY_LOCATE_WINDOW", DEFAULT_LOCATE_WINDOW)?;
         config.segment_size_bytes = env.parse("MANSIO_IGGY_SEGMENT_SIZE_BYTES", 0_u64)?;
@@ -754,6 +841,9 @@ mod tests {
         assert_eq!(iggy.username, "mansio");
         assert_eq!(iggy.password.expose_secret(), "p");
         assert_eq!(iggy.connect_timeout, Duration::from_secs(60));
+        assert_eq!(iggy.signin_timeout, Duration::from_secs(10));
+        assert_eq!(iggy.session_idle, Duration::from_secs(300));
+        assert_eq!(iggy.session_clients, 2);
         assert_eq!(iggy.locate_window, 100);
         assert_eq!(iggy.segment_size_bytes, 0);
         assert_eq!(iggy.presence_segment_size_bytes, 1_048_576);
@@ -830,6 +920,7 @@ mod tests {
         assert_eq!(work.alert_resurface, Duration::from_secs(3600));
         assert_eq!(work.tick, Duration::from_millis(500));
         assert_eq!(work.recovery_log, Duration::from_secs(60));
+        assert_eq!(work.snapshot_interval, Duration::from_secs(300));
         assert_eq!(work.validate(), Ok(()));
     }
 
@@ -863,8 +954,53 @@ mod tests {
                 idempotency_window: Duration::from_secs(90),
                 idempotency_max_keys: 50,
                 recovery_log: Duration::from_secs(9),
+                snapshot_interval: Duration::from_secs(300),
             }
         );
+    }
+
+    #[test]
+    fn the_snapshot_interval_and_directory_are_settings() {
+        let defaults = settings(&[("MANSIO_TOKEN", "t"), ("MANSIO_BROKER", "memory")]).unwrap();
+        assert_eq!(defaults.work.snapshot_interval, Duration::from_secs(300));
+        assert_eq!(
+            defaults.snapshot_dir,
+            Some(PathBuf::from("mansio-snapshots"))
+        );
+
+        let set = settings(&[
+            ("MANSIO_TOKEN", "t"),
+            ("MANSIO_BROKER", "memory"),
+            ("MANSIO_SNAPSHOT_INTERVAL_SECONDS", "0"),
+            ("MANSIO_SNAPSHOT_DIR", "/data/snapshots"),
+        ])
+        .unwrap();
+        assert_eq!(set.work.snapshot_interval, Duration::ZERO);
+        assert_eq!(set.snapshot_dir, Some(PathBuf::from("/data/snapshots")));
+
+        let off = settings(&[
+            ("MANSIO_TOKEN", "t"),
+            ("MANSIO_BROKER", "memory"),
+            ("MANSIO_SNAPSHOT_DIR", ""),
+        ])
+        .unwrap();
+        assert_eq!(off.snapshot_dir, None);
+    }
+
+    #[test]
+    fn a_facts_retention_shorter_than_work_is_a_warning() {
+        let hours = |n: u64| Some(Duration::from_secs(n * 3600));
+        let with = |facts, work| Retention {
+            facts,
+            work,
+            ..Retention::default()
+        };
+        assert!(retention_warning(&with(None, None)).is_none());
+        assert!(retention_warning(&with(None, hours(1))).is_none());
+        assert!(retention_warning(&with(hours(2), hours(1))).is_none());
+        assert!(retention_warning(&with(hours(1), hours(1))).is_none());
+        assert!(retention_warning(&with(hours(1), hours(2))).is_some());
+        assert!(retention_warning(&with(hours(1), None)).is_some());
     }
 
     #[test]
@@ -1266,6 +1402,10 @@ mod tests {
             ("MANSIO_POLL_DEFAULT_COUNT", "0"),
             ("MANSIO_POLL_DEFAULT_COUNT", "2000"),
             ("MANSIO_IGGY_CONNECT_TIMEOUT_SECONDS", "soon"),
+            ("MANSIO_IGGY_SIGNIN_TIMEOUT_SECONDS", "0"),
+            ("MANSIO_IGGY_SESSION_IDLE_SECONDS", "0"),
+            ("MANSIO_IGGY_SESSION_CLIENTS", "0"),
+            ("MANSIO_IGGY_SESSION_CLIENTS", "65"),
             ("MANSIO_IGGY_DURABILITY", "fsync"),
             ("MANSIO_IGGY_PRESENCE_DURABILITY", "never"),
         ] {

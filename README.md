@@ -499,9 +499,12 @@ curl ... -d '{"lease_id":"<uuid>","consumer":"worker-1","reason":"out of memory"
   fails may still have been stored, so the server rebuilds the tenant from the
   topics after one; a stored item or acknowledgement is not lost or repeated.
   A message in a topic that cannot be read is skipped, with a warning. Keep
-  `MANSIO_RETENTION_FACTS_SECONDS` no shorter than `MANSIO_RETENTION_WORK_SECONDS`:
+  `MANSIO_RETENTION_FACTS_SECONDS` no shorter than `MANSIO_RETENTION_WORK_SECONDS`
+  (the server logs a warning at start when it is):
   an item whose facts were deleted while its message was not is claimable
-  again. Iggy deletes expired messages a whole segment at a time, and only
+  again. To start faster, the server writes a snapshot of each tenant's state
+  every `MANSIO_SNAPSHOT_INTERVAL_SECONDS` and a start replays only what came
+  after it. Iggy deletes expired messages a whole segment at a time, and only
   after the segment has filled and rolled (see `MANSIO_IGGY_SEGMENT_SIZE_BYTES`);
   Iggy 0.9 answers a read from offset 0 of a topic whose head it has deleted
   with the first message left, so the rebuild sees everything that remains.
@@ -848,6 +851,8 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_BACKOFF_BASE_SECONDS` | `5` | The wait before an item is republished after its first failure. It doubles with each attempt. |
 | `MANSIO_BACKOFF_CAP_SECONDS` | `300` | The longest that wait gets. At least the base. |
 | `MANSIO_RECOVERY_LOG_SECONDS` | `60` | While the broker will not list its tenants at startup (for example an Iggy user that may not list streams), the server asks again after a wait that doubles from one tick up to this many seconds, and logs the failure at most once per this interval. At least 1. |
+| `MANSIO_SNAPSHOT_INTERVAL_SECONDS` | `300` | How often the state of a tenant that has changed is written to a snapshot, which the next start reads instead of replaying every topic from offset 0 (see "Snapshots" in ARCHITECTURE.md). 0 writes none. |
+| `MANSIO_SNAPSHOT_DIR` | `mansio-snapshots` | The directory of the snapshots, one file per tenant; `/data/snapshots` in the container image. Empty keeps none. A snapshot that cannot be read is ignored with a warning and the start replays from offset 0. |
 | `MANSIO_ALERT_RESURFACE_SECONDS` | `3600` | How long an alert may go unacknowledged before it is surfaced again, and again after each further interval. |
 | `MANSIO_TICK_MILLIS` | `500` | How often the timer looks for leases to expire, items to republish and alerts to surface again. |
 | `MANSIO_IDEMPOTENCY_WINDOW_SECONDS` | `86400` | How long a publish's `idempotencykey` is remembered. A second publish to the same tenant and topic with the same key inside the window is answered 200 with the first envelope and offset and publishes nothing. At least `1`, at most `315360000` (ten years). |
@@ -866,6 +871,9 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_IGGY_USERNAME` | `mansio` | The Iggy user mansio-server acts as. It manages users and streams and reads and writes topics; it is not Iggy's root user. |
 | `MANSIO_IGGY_PASSWORD` | none, required with `iggy` | Its password. If Iggy refuses it at startup, the server exits with a message that names this variable and `MANSIO_IGGY_USERNAME`. |
 | `MANSIO_IGGY_CONNECT_TIMEOUT_SECONDS` | `60` | How long startup waits for Iggy. |
+| `MANSIO_IGGY_SIGNIN_TIMEOUT_SECONDS` | `10` | How long signing a credential in to Iggy may take (connecting and logging in), so that a hung Iggy holds a credentialed request for this long and not for `MANSIO_IGGY_CONNECT_TIMEOUT_SECONDS`. At least `1`. |
+| `MANSIO_IGGY_SESSION_IDLE_SECONDS` | `300` | How long a credential may go unused before its Iggy clients are closed. The next request signs in again. At least `1`. |
+| `MANSIO_IGGY_SESSION_CLIENTS` | `2` | The most Iggy clients kept for one credential. A client answers one request at a time, so with more than one an open event stream and a pull by the same credential do not wait for each other. Past this number, requests share the least busy client. From `1` to `64`. |
 | `MANSIO_IGGY_LOCATE_WINDOW` | `100` | How many recent messages to search, by message id, when Iggy accepts a publish without saying where it landed. 0 turns the search off. A message that is not found is still answered with 201, without an offset. |
 | `MANSIO_IGGY_SEGMENT_SIZE_BYTES` | `0` | The segment size Iggy gives the topics mansio creates, except `presence` (next row). 0 leaves it to Iggy, which uses 1 GiB. Otherwise a multiple of 512 from 1048576 (1 MiB) to 1073741824. Iggy applies retention to whole segments that have filled and rolled, never to the one it is writing, so this is how coarsely the `MANSIO_RETENTION_*` settings trim a topic. Applied when a topic is created. |
 | `MANSIO_IGGY_PRESENCE_SEGMENT_SIZE_BYTES` | `1048576` | The same for `presence`, which is ephemeral: 1 MiB by default, so a heartbeat is deleted soon after `MANSIO_RETENTION_PRESENCE_SECONDS` instead of waiting for a 1 GiB segment to fill. 0 leaves it to Iggy. Applied when a topic is created. |

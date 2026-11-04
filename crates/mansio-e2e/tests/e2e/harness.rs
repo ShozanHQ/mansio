@@ -20,6 +20,7 @@ use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail, ensure};
@@ -69,6 +70,7 @@ fn local_work_settings() -> WorkSettings {
         idempotency_window: Duration::from_secs(4),
         idempotency_max_keys: 20,
         recovery_log: Duration::from_secs(60),
+        snapshot_interval: Duration::from_secs(1),
     }
 }
 
@@ -134,7 +136,7 @@ impl Default for LocalSettings {
 /// server over it starts its tasks interleaved the way they are against Iggy:
 /// one that begins reading a log is not done when the next one begins. The
 /// memory broker alone answers at once and hides that.
-struct Yielding(Arc<MemoryBroker>);
+struct Yielding(Arc<MemoryBroker>, Arc<AtomicU64>);
 
 #[async_trait]
 impl Broker for Yielding {
@@ -176,7 +178,12 @@ impl Broker for Yielding {
         max: u32,
     ) -> Result<Vec<Stored>, BrokerError> {
         tokio::task::yield_now().await;
-        self.0.poll(caller, tenant, topic, offset, max).await
+        let found = self.0.poll(caller, tenant, topic, offset, max).await?;
+        self.1.fetch_add(
+            u64::try_from(found.len()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
+        Ok(found)
     }
 
     async fn system_append(&self, log: SystemLog, record: &[u8]) -> Result<(), BrokerError> {
@@ -242,7 +249,9 @@ struct LocalServer {
 impl LocalServer {
     async fn start(
         broker: &Arc<MemoryBroker>,
+        read: &Arc<AtomicU64>,
         sink: &Path,
+        snapshots: &Path,
         settings: LocalSettings,
     ) -> anyhow::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -251,7 +260,8 @@ impl LocalServer {
             SecretString::from(LOCAL_TOKEN.to_owned()),
             PRINCIPAL.parse()?,
         );
-        let server = Server::new(Arc::new(Yielding(broker.clone())), auth)
+        let server = Server::new(Arc::new(Yielding(broker.clone(), read.clone())), auth)
+            .with_snapshot_dir(snapshots)
             .with_sink(Arc::new(FileSink::open(sink, true).await?))
             .with_limits(settings.limits)
             .with_work_settings(settings.work)?
@@ -299,6 +309,10 @@ pub struct Target {
     pub tenant: String,
     pub settings: EffectiveSettings,
     sink: Option<PathBuf>,
+    /// Where the in-process server keeps its snapshots.
+    snapshots: Option<PathBuf>,
+    /// How many messages the in-process server has read from its broker.
+    read: Arc<AtomicU64>,
     /// The in-process broker and server, if there is one, and what the server
     /// runs with.
     local: Option<(Arc<MemoryBroker>, Option<LocalServer>, LocalSettings)>,
@@ -308,6 +322,9 @@ impl Drop for Target {
     fn drop(&mut self) {
         if let (Some(path), Some(_)) = (&self.sink, &self.local) {
             let _ = std::fs::remove_file(path);
+        }
+        if let (Some(dir), Some(_)) = (&self.snapshots, &self.local) {
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 }
@@ -359,6 +376,8 @@ impl Target {
                 tenant,
                 settings: effective,
                 sink,
+                snapshots: None,
+                read: Arc::default(),
                 local: None,
             });
         }
@@ -367,8 +386,10 @@ impl Target {
             "MANSIO_E2E_URL is not set: this test runs against a live server and Iggy"
         );
         let sink = std::env::temp_dir().join(format!("mansio-{tenant}.jsonl"));
+        let snapshots = std::env::temp_dir().join(format!("mansio-snapshots-{tenant}"));
         let broker = Arc::new(MemoryBroker::new());
-        let server = LocalServer::start(&broker, &sink, settings).await?;
+        let read = Arc::new(AtomicU64::new(0));
+        let server = LocalServer::start(&broker, &read, &sink, &snapshots, settings).await?;
         let effective = read_settings(&http, &server.base, LOCAL_TOKEN).await?;
         Ok(Self {
             base: server.base.clone(),
@@ -377,6 +398,8 @@ impl Target {
             tenant,
             settings: effective,
             sink: Some(sink),
+            snapshots: Some(snapshots),
+            read,
             local: Some((broker, Some(server), settings)),
         })
     }
@@ -402,11 +425,62 @@ impl Target {
     /// the last one used.
     pub async fn start_server(&mut self) -> anyhow::Result<()> {
         let sink = self.sink.clone().context("no sink file")?;
+        let snapshots = self.snapshots.clone().context("no snapshot directory")?;
         let (broker, server, settings) = self.local.as_mut().context("the server is not local")?;
         ensure!(server.is_none(), "the server is running");
-        let started = LocalServer::start(broker, &sink, *settings).await?;
+        let started = LocalServer::start(broker, &self.read, &sink, &snapshots, *settings).await?;
         self.base = started.base.clone();
         *server = Some(started);
+        Ok(())
+    }
+
+    /// How many messages the in-process server has read from its broker since
+    /// the test began, restarts included.
+    pub fn messages_read(&self) -> u64 {
+        self.read.load(Ordering::SeqCst)
+    }
+
+    /// Wait until the server has written a snapshot of the tenant after
+    /// `since`, and return what it holds.
+    pub async fn snapshot_after(&self, since: std::time::SystemTime) -> anyhow::Result<Vec<u8>> {
+        let path = self
+            .snapshots
+            .as_ref()
+            .context("no snapshot directory")?
+            .join(format!("{}.json", self.tenant));
+        let deadline = Instant::now() + SLACK;
+        loop {
+            if let Ok(modified) = std::fs::metadata(&path).and_then(|meta| meta.modified())
+                && modified > since
+                && let Ok(bytes) = std::fs::read(&path)
+            {
+                return Ok(bytes);
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "no snapshot was written to {} within {SLACK:?}",
+                path.display()
+            );
+            tokio::time::sleep(LOOK_AGAIN).await;
+        }
+    }
+
+    /// Remove the snapshots, so that the next server starts from offset 0.
+    pub fn forget_snapshots(&self) -> anyhow::Result<()> {
+        if let Some(dir) = &self.snapshots {
+            match std::fs::remove_dir_all(dir) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Replace the tenant's snapshot with `bytes`.
+    pub fn put_snapshot(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        let dir = self.snapshots.as_ref().context("no snapshot directory")?;
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(dir.join(format!("{}.json", self.tenant)), bytes)?;
         Ok(())
     }
 

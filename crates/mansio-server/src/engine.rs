@@ -13,7 +13,10 @@
 //! fails, nothing happened.
 //!
 //! The state is a projection of the tenant's topics and [`crate::recover`]
-//! rebuilds it on start, so none of it needs saving.
+//! rebuilds it on start, so none of it needs saving. A start is shortened by
+//! a snapshot ([`crate::snapshot`]), which the timer writes every
+//! `MANSIO_SNAPSHOT_INTERVAL_SECONDS` and which is only a cache: without a
+//! usable one the state is rebuilt from offset 0.
 //!
 //! # Two-step transitions
 //!
@@ -45,6 +48,7 @@ use crate::idempotency::{self, Keys};
 use crate::records;
 use crate::recover;
 use crate::settings::WorkSettings;
+use crate::snapshot::{FileSnapshots, Restored, Snapshot, Snapshots};
 pub use crate::state::Holder;
 use crate::state::{Due, Item, Lease, Phase, Remembered, TenantState, Then, backoff, held_lease};
 
@@ -109,6 +113,8 @@ pub struct Engine {
     /// The idempotency keys the log holds, read once, until each tenant takes
     /// its own.
     seeded_keys: Mutex<Option<HashMap<TenantId, Keys>>>,
+    /// Where snapshots of each tenant's state are kept, if they are.
+    snapshots: Option<Arc<dyn Snapshots>>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -140,7 +146,24 @@ impl Engine {
             tenants: StdMutex::default(),
             discovered: AtomicBool::new(false),
             seeded_keys: Mutex::new(None),
+            snapshots: None,
         }
+    }
+
+    /// Keep snapshots of each tenant's state in files in `dir`, one per
+    /// tenant, written every `MANSIO_SNAPSHOT_INTERVAL_SECONDS`, and start
+    /// from them.
+    #[must_use]
+    pub fn with_snapshot_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.snapshots = Some(Arc::new(FileSnapshots::new(dir)));
+        self
+    }
+
+    /// Keep snapshots in `store`.
+    #[cfg(test)]
+    pub(crate) fn with_snapshots(mut self, store: Arc<dyn Snapshots>) -> Self {
+        self.snapshots = Some(store);
+        self
     }
 
     /// The tenants the engine holds state for, in order. A tenant is held from
@@ -255,10 +278,38 @@ impl Engine {
             Err(BrokerError::NotFound(_)) => Vec::new(),
             Err(error) => return Err(error.into()),
         };
-        let logs = recover::read_logs(&self.broker, tenant, &topics, self.page).await?;
-        let rebuilt = recover::replay(tenant, &logs, &self.facts, self.clock.now_millis())?;
+        let restored = self.restore(tenant).await;
+        let (base, from, taken_at) = match restored {
+            Some(restored) => (
+                Some(recover::Rebuilt {
+                    queues: restored.queues,
+                    alerts: restored.alerts,
+                    acknowledged_alerts: restored.acknowledged_alerts,
+                }),
+                restored.offsets,
+                Some(restored.taken_at),
+            ),
+            None => (None, HashMap::new(), None),
+        };
+        let logs = recover::read_logs(&self.broker, tenant, &topics, self.page, &from).await?;
+        let replayed = logs.len();
+        let rebuilt = recover::replay(tenant, &logs, &self.facts, self.clock.now_millis(), base)?;
         let items: usize = rebuilt.queues.values().map(crate::state::Queue::len).sum();
-        info!(%tenant, items, alerts = rebuilt.alerts.len(), "state rebuilt");
+        info!(
+            %tenant,
+            items,
+            alerts = rebuilt.alerts.len(),
+            replayed,
+            from_snapshot = taken_at.is_some(),
+            "state rebuilt"
+        );
+        let mut covered = from;
+        covered.extend(logs.ends);
+        state.covered = Some(covered);
+        // A state rebuilt from the start waits one interval for its first
+        // snapshot, as one rebuilt from a snapshot does for its next.
+        state.snapshot_at = Some(taken_at.unwrap_or_else(|| self.clock.now_millis()));
+        state.changed = taken_at.is_none() || replayed > 0;
         // An alert the state already holds keeps the time it was accepted or
         // last surfaced, unless the log says later: the log only has the
         // producer's time for one that was never surfaced.
@@ -273,6 +324,62 @@ impl Engine {
         state.acknowledged_alerts = rebuilt.acknowledged_alerts;
         state.loaded = true;
         Ok(())
+    }
+
+    /// The snapshot the tenant's state is to be rebuilt from, if there is one
+    /// that can be used. One that cannot be read, is not of this format or
+    /// does not fit the topics as they are is dropped with a warning, and the
+    /// state is rebuilt from offset 0.
+    async fn restore(&self, tenant: &TenantId) -> Option<Restored> {
+        let store = self.snapshots.as_ref()?;
+        let bytes = match store.read(tenant).await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return None,
+            Err(error) => {
+                warn!(%tenant, %error, "the snapshot could not be read; the state is rebuilt from the start of the topics");
+                return None;
+            }
+        };
+        let restored = match Snapshot::decode(tenant, &bytes) {
+            Ok(restored) => restored,
+            Err(why) => {
+                warn!(%tenant, %why, "the snapshot could not be used; the state is rebuilt from the start of the topics");
+                return None;
+            }
+        };
+        if let Err(why) = recover::check_offsets(&self.broker, tenant, &restored.offsets).await {
+            warn!(%tenant, %why, "the snapshot does not fit the topics; the state is rebuilt from the start of them");
+            return None;
+        }
+        Some(restored)
+    }
+
+    /// The bytes of a snapshot of the tenant's state, if one is due at `now`:
+    /// the interval since the last has passed, the state has changed since,
+    /// and it knows which messages it covers. Taking it marks the state as
+    /// saved; [`Engine::tick`] marks it changed again if the write fails.
+    fn snapshot_due(&self, tenant: &TenantId, held: &mut TenantState, now: i64) -> Option<Vec<u8>> {
+        let interval = millis(self.settings.snapshot_interval);
+        if self.snapshots.is_none() || interval == 0 || !held.loaded || !held.changed {
+            return None;
+        }
+        if held
+            .snapshot_at
+            .is_some_and(|at| now.saturating_sub(at) < interval)
+        {
+            return None;
+        }
+        let snapshot = Snapshot::of(tenant, held, now)?;
+        let bytes = match snapshot.encode() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(%tenant, %error, "a snapshot could not be made");
+                return None;
+            }
+        };
+        held.snapshot_at = Some(now);
+        held.changed = false;
+        Some(bytes)
     }
 
     /// Take up every tenant the broker holds: rebuild its state, so that its
@@ -356,6 +463,7 @@ impl Engine {
                 return Err(error.into());
             }
         };
+        note_published(held, &envelope.topic, offset);
         Ok(Published { offset, envelope })
     }
 
@@ -900,7 +1008,7 @@ impl Engine {
                 .collect()
         };
         for (tenant, cell) in cells {
-            let mut held = cell.lock_owned().await;
+            let mut held = Arc::clone(&cell).lock_owned().await;
             if !held.loaded
                 && let Err(error) = self.load(&tenant, &mut held).await
             {
@@ -908,6 +1016,15 @@ impl Engine {
                 continue;
             }
             self.tick_tenant(&mut held, &tenant).await;
+            let due = self.snapshot_due(&tenant, &mut held, self.clock.now_millis());
+            // The write is not made with the lock held.
+            drop(held);
+            if let (Some(bytes), Some(store)) = (due, &self.snapshots)
+                && let Err(error) = store.write(&tenant, &bytes).await
+            {
+                warn!(%tenant, %error, "a snapshot could not be written; it is tried again after the next interval");
+                cell.lock().await.changed = true;
+            }
         }
     }
 
@@ -1230,6 +1347,28 @@ impl Engine {
 /// `Unavailable` may: a refusal the broker named, a missing topic and an
 /// invalid envelope all come before anything is stored, and a broker maps
 /// every error that does not say so to `Unavailable`.
+/// Note that a message was published in the state: the state has changed, and
+/// if the message landed where the state expected it, it covers the message.
+/// A message that landed elsewhere, or where the broker did not say, leaves
+/// the state not knowing what it covers, so it is not snapshotted until it is
+/// rebuilt.
+fn note_published(held: &mut TenantState, topic: &Topic, offset: Option<u64>) {
+    held.changed = true;
+    if !recover::is_replayed(topic) {
+        return;
+    }
+    let Some(covered) = held.covered.as_mut() else {
+        return;
+    };
+    let expected = covered.get(topic).copied().unwrap_or(0);
+    match offset {
+        Some(offset) if offset == expected => {
+            covered.insert(topic.clone(), offset.saturating_add(1));
+        }
+        _ => held.covered = None,
+    }
+}
+
 fn outcome_unknown(error: &BrokerError) -> bool {
     matches!(error, BrokerError::Unavailable(_))
 }

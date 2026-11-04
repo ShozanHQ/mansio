@@ -25,6 +25,7 @@ fn settings() -> WorkSettings {
         idempotency_window: Duration::from_secs(60),
         idempotency_max_keys: 3,
         recovery_log: Duration::from_secs(30),
+        snapshot_interval: Duration::from_secs(60),
     }
 }
 
@@ -60,6 +61,8 @@ struct FlakyBroker {
     /// The broker refuses to list its tenants, and counts the asks.
     tenants_refused: std::sync::atomic::AtomicBool,
     tenants_asked: AtomicU64,
+    /// How many messages polls have returned.
+    read: AtomicU64,
 }
 
 impl FlakyBroker {
@@ -173,7 +176,12 @@ impl Broker for FlakyBroker {
                 "offset {at} of {topic} in {tenant}: injected"
             )));
         }
-        self.inner.poll(caller, tenant, topic, offset, max).await
+        let found = self.inner.poll(caller, tenant, topic, offset, max).await?;
+        self.read.fetch_add(
+            u64::try_from(found.len()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
+        Ok(found)
     }
 
     async fn system_append(&self, log: SystemLog, record: &[u8]) -> Result<(), BrokerError> {
@@ -2849,7 +2857,9 @@ async fn a_tick_with_nothing_due_does_constant_work_at_100k_open_items() {
     let now = rig.clock.now_millis();
     let (tasks, looked) = rig.engine.due_counted(&held, now);
     assert!(tasks.is_empty());
-    // Leases and backoffs of the one queue, and the alerts.
+    // Leases and backoffs of the one queue, and the alerts. Owed entries
+    // count as due work, since an owed fact is due at once; none are owed
+    // here, so they add nothing.
     assert_eq!(looked, 3);
     rig.engine.tick_tenant(&mut held, &tenant()).await;
 }
@@ -2895,4 +2905,421 @@ async fn tick_benchmark() {
             (hold / TICKS).as_nanos()
         );
     }
+}
+
+// ---- snapshots -------------------------------------------------------------
+
+/// Snapshots kept in memory.
+#[derive(Debug, Default)]
+struct MemorySnapshots {
+    kept: StdMutex<std::collections::HashMap<TenantId, Vec<u8>>>,
+}
+
+impl MemorySnapshots {
+    fn put(&self, bytes: &[u8]) {
+        self.kept.lock().unwrap().insert(tenant(), bytes.to_vec());
+    }
+
+    fn get(&self) -> Option<Vec<u8>> {
+        self.kept.lock().unwrap().get(&tenant()).cloned()
+    }
+}
+
+#[async_trait]
+impl Snapshots for MemorySnapshots {
+    async fn read(&self, tenant: &TenantId) -> std::io::Result<Option<Vec<u8>>> {
+        Ok(self.kept.lock().unwrap().get(tenant).cloned())
+    }
+
+    async fn write(&self, tenant: &TenantId, bytes: &[u8]) -> std::io::Result<()> {
+        self.kept
+            .lock()
+            .unwrap()
+            .insert(tenant.clone(), bytes.to_vec());
+        Ok(())
+    }
+}
+
+impl Rig {
+    /// A server on a broker, sink and clock that others may have used, which
+    /// keeps its snapshots in `store` if it is given one.
+    fn over_with(
+        broker: Arc<FlakyBroker>,
+        sink: Arc<LogSink>,
+        clock: Arc<ManualClock>,
+        store: Option<Arc<MemorySnapshots>>,
+    ) -> Self {
+        let mut engine = Engine::new(broker.clone(), sink.clone(), clock.clone(), settings(), 3);
+        if let Some(store) = store {
+            engine = engine.with_snapshots(store);
+        }
+        Self {
+            broker,
+            sink,
+            clock,
+            engine: Arc::new(engine),
+            pulls: AtomicU64::new(0),
+        }
+    }
+
+    /// Everything the engine holds for the tenant, without what only the
+    /// process remembers and without the numbers that stand for a position in
+    /// a queue: the queues in order, the alerts and the ids of the finished.
+    async fn picture(&self) -> Value {
+        let held = self.engine.lock(&tenant()).await.unwrap();
+        let mut queues = serde_json::Map::new();
+        for (name, queue) in &held.queues {
+            let mut record = serde_json::to_value(queue.to_record()).unwrap();
+            record.as_object_mut().unwrap().remove("next_order");
+            for pair in record["items"].as_array_mut().unwrap() {
+                pair[1].as_object_mut().unwrap().remove("order");
+            }
+            queues.insert(name.to_string(), record);
+        }
+        let mut alerts: Vec<_> = held.alerts.iter().collect();
+        alerts.sort();
+        let mut acknowledged: Vec<_> = held.acknowledged_alerts.iter().collect();
+        acknowledged.sort();
+        json!({ "queues": queues, "alerts": alerts, "acknowledged": acknowledged })
+    }
+
+    /// How many messages of the topics the engine replays the broker holds.
+    async fn replayable(&self) -> u64 {
+        let mut all = 0;
+        for topic in [
+            Topic::Work(queue()),
+            Topic::facts_work(),
+            Topic::Dead,
+            Topic::Alerts,
+            Topic::facts_alert(),
+        ] {
+            all += self.read(&topic).await.len() as u64;
+        }
+        all
+    }
+}
+
+/// A restart: the same broker, sink and clock under a new engine, which
+/// rebuilds the tenant's state with the snapshots in `store` if it is given
+/// them. The picture of the state and the number of messages it read.
+async fn restarted(rig: &Rig, store: Option<&Arc<MemorySnapshots>>) -> (Value, u64) {
+    let before = rig.broker.read.load(Ordering::SeqCst);
+    let engine = Rig::over_with(
+        rig.broker.clone(),
+        rig.sink.clone(),
+        rig.clock.clone(),
+        store.cloned(),
+    );
+    engine.engine.recover().await.unwrap();
+    let read = rig.broker.read.load(Ordering::SeqCst) - before;
+    (engine.picture().await, read)
+}
+
+/// A rig with a lot in it: an item acknowledged, one failed and waiting out
+/// its backoff, one under a long lease, one claimable, one dead, an alert
+/// acknowledged and one still open. Then a snapshot is taken.
+async fn rig_with_a_snapshot(store: &Arc<MemorySnapshots>) -> (Rig, ItemId, ItemId, ItemId) {
+    let rig = Rig::over_with(
+        Arc::default(),
+        Arc::default(),
+        Arc::new(ManualClock::new(START)),
+        Some(store.clone()),
+    );
+    // An item that fails past the cap and goes to `dead`.
+    let dead = rig.publish_item("dead").await;
+    for backoff in [2, 4, 0] {
+        let claim = rig.pull("two").await.unwrap();
+        rig.fail("two", &dead, &claim.lease_id).await.unwrap();
+        rig.pass(backoff).await;
+    }
+    rig.pass(1).await;
+    assert_eq!(rig.read(&Topic::Dead).await.len(), 1);
+
+    let acked = rig.publish_item("acked").await;
+    let claim = rig.pull("one").await.unwrap();
+    rig.ack("one", &acked, &claim.lease_id).await.unwrap();
+
+    let failing = rig.publish_item("failing").await;
+    let claim = rig.pull("one").await.unwrap();
+    rig.fail("one", &failing, &claim.lease_id).await.unwrap();
+
+    let held = rig.publish_item("held").await;
+    let claim = rig.pull("one").await.unwrap();
+    rig.extend("one", &held, &claim.lease_id, Some(100))
+        .await
+        .unwrap();
+
+    rig.publish_item("waiting").await;
+
+    publish_alert(&rig).await;
+    let answered = publish_alert(&rig).await;
+    rig.engine
+        .alerts_ack(&tenant(), answered, &agent("pat"))
+        .await
+        .unwrap();
+
+    // No snapshot until an interval has passed.
+    assert!(store.get().is_none());
+    rig.pass(61).await;
+    assert!(store.get().is_some(), "a snapshot after an interval");
+    (rig, held, failing, dead)
+}
+
+/// What happens after the snapshot, which a restart must read: an item the
+/// snapshot holds as claimable is claimed and acknowledged, one that was
+/// waiting out a backoff comes back and fails again, the lease the snapshot
+/// holds is extended, new items arrive and one is claimed, an alert comes and
+/// one goes, and time passes enough for a retry and an expiry.
+async fn more_happens(rig: &Rig, held: &ItemId, failing: &ItemId) {
+    let claim = rig.pull("three").await.unwrap();
+    let id = claim.item.item_id.clone().unwrap();
+    assert!(&id != held && &id != failing);
+    rig.ack("three", &id, &claim.lease_id).await.unwrap();
+
+    let claim = rig.pull("three").await.unwrap();
+    assert_eq!(claim.item.item_id.as_ref(), Some(failing));
+    assert_eq!(claim.item.attempt, Some(2));
+    rig.fail("three", failing, &claim.lease_id).await.unwrap();
+
+    rig.publish_item("new one").await;
+    rig.publish_item("new two").await;
+    let _taken = rig.pull("four").await.unwrap();
+    let alert = publish_alert(rig).await;
+    rig.pass(5).await;
+    rig.pass(12).await;
+    rig.engine
+        .alerts_ack(&tenant(), alert, &agent("pat"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_restart_from_a_snapshot_reads_fewer_messages_and_reaches_the_same_state() {
+    let store = Arc::new(MemorySnapshots::default());
+    let (rig, held, failing, _dead) = rig_with_a_snapshot(&store).await;
+    more_happens(&rig, &held, &failing).await;
+    let total = rig.replayable().await;
+    assert!(total > 20, "{total} messages is not much of a history");
+
+    let (from_start, read_all) = restarted(&rig, None).await;
+    let (from_snapshot, read_some) = restarted(&rig, Some(&store)).await;
+
+    assert!(
+        read_all >= total,
+        "a rebuild from the start reads all {total}, read {read_all}"
+    );
+    assert!(
+        read_some < total,
+        "a rebuild from a snapshot reads fewer than {total}, read {read_some}"
+    );
+    assert_eq!(from_snapshot, from_start);
+    // And the engine that is still running agrees with both.
+    assert_eq!(rig.picture().await, from_start);
+}
+
+/// A restart from a snapshot finds the leases and backoffs the snapshot holds
+/// through the due-time index: the lease expires and the retry comes back
+/// once the clock passes them, with no message replayed to put them there.
+#[tokio::test]
+async fn a_restart_from_a_snapshot_still_expires_its_leases_and_retries_its_backoffs() {
+    let store = Arc::new(MemorySnapshots::default());
+    let rig = Rig::over_with(
+        Arc::default(),
+        Arc::default(),
+        Arc::new(ManualClock::new(START)),
+        Some(store.clone()),
+    );
+    let failing = rig.publish_item("failing").await;
+    let held = rig.publish_item("held").await;
+    rig.pass(59).await;
+    let claim = rig.pull("one").await.unwrap();
+    assert_eq!(claim.item.item_id.as_ref(), Some(&failing));
+    rig.fail("one", &failing, &claim.lease_id).await.unwrap();
+    let claim = rig.pull("one").await.unwrap();
+    assert_eq!(claim.item.item_id.as_ref(), Some(&held));
+    // The snapshot is taken at the interval, with one item backing off and
+    // the other leased.
+    rig.pass(1).await;
+    assert!(store.get().is_some(), "a snapshot at the interval");
+    let restored = Rig::over_with(
+        rig.broker.clone(),
+        rig.sink.clone(),
+        rig.clock.clone(),
+        Some(store.clone()),
+    );
+    restored.engine.recover().await.unwrap();
+    {
+        let state = restored.engine.lock(&tenant()).await.unwrap();
+        let item_queue = &state.queues[&queue()];
+        assert!(matches!(
+            item_queue.get(&held).unwrap().phase,
+            Phase::Leased(_)
+        ));
+        assert!(matches!(
+            item_queue.get(&failing).unwrap().phase,
+            Phase::Backoff { .. }
+        ));
+    }
+    // Past the long lease and every backoff.
+    restored.pass(400).await;
+    let state = restored.engine.lock(&tenant()).await.unwrap();
+    let item_queue = &state.queues[&queue()];
+    assert!(
+        !matches!(item_queue.get(&held).unwrap().phase, Phase::Leased(_)),
+        "the restored lease expired"
+    );
+    assert!(
+        !matches!(
+            item_queue.get(&failing).unwrap().phase,
+            Phase::Backoff { .. }
+        ),
+        "the restored retry was republished"
+    );
+}
+
+#[tokio::test]
+async fn a_snapshot_keeps_when_a_lease_began_across_an_extension_after_it() {
+    let store = Arc::new(MemorySnapshots::default());
+    let (rig, held, failing, _) = rig_with_a_snapshot(&store).await;
+    more_happens(&rig, &held, &failing).await;
+    // The lease is extended after the snapshot, and the item is rebuilt.
+    let lease = {
+        let state = rig.engine.lock(&tenant()).await.unwrap();
+        match &state.queues[&queue()].get(&held).unwrap().phase {
+            Phase::Leased(lease) => lease.clone(),
+            other => panic!("{other:?}"),
+        }
+    };
+    let (picture, _) = restarted(&rig, Some(&store)).await;
+    let (full, _) = restarted(&rig, None).await;
+    assert_eq!(picture, full);
+    let text = picture.to_string();
+    assert!(text.contains(&format!("\"claimed_at\":{}", lease.claimed_at)));
+}
+
+#[tokio::test]
+async fn a_snapshot_that_cannot_be_read_is_replaced_by_a_full_rebuild() {
+    let store = Arc::new(MemorySnapshots::default());
+    let (rig, held, failing, _) = rig_with_a_snapshot(&store).await;
+    more_happens(&rig, &held, &failing).await;
+    let total = rig.replayable().await;
+    let (full, _) = restarted(&rig, None).await;
+
+    for broken in [
+        b"not a snapshot".to_vec(),
+        Vec::new(),
+        br#"{"format":99,"tenant":"acme","taken_at":0,"offsets":[],"queues":[],"alerts":[],"acknowledged_alerts":[]}"#.to_vec(),
+        br#"{"format":1,"tenant":"other","taken_at":0,"offsets":[],"queues":[],"alerts":[],"acknowledged_alerts":[]}"#.to_vec(),
+        br#"{"format":1,"tenant":"acme","taken_at":0,"offsets":[["not a topic",1]],"queues":[],"alerts":[],"acknowledged_alerts":[]}"#.to_vec(),
+    ] {
+        store.put(&broken);
+        let (picture, read) = restarted(&rig, Some(&store)).await;
+        assert_eq!(picture, full, "{}", String::from_utf8_lossy(&broken));
+        assert!(read >= total, "a full rebuild reads all {total}: {read}");
+    }
+}
+
+#[tokio::test]
+async fn a_snapshot_of_topics_that_are_not_the_ones_there_now_is_not_used() {
+    let store = Arc::new(MemorySnapshots::default());
+    let (rig, _, _, _) = rig_with_a_snapshot(&store).await;
+
+    // The same snapshot over a broker that holds nothing: it covers offsets
+    // that are not there.
+    let empty = Rig::over_with(
+        Arc::default(),
+        Arc::default(),
+        rig.clock.clone(),
+        Some(store.clone()),
+    );
+    empty.engine.recover().await.unwrap();
+    let held = empty.engine.lock(&tenant()).await.unwrap();
+    assert!(held.queues.values().all(|queue| queue.len() == 0));
+    assert!(held.alerts.is_empty());
+}
+
+#[tokio::test]
+async fn nothing_is_written_when_nothing_changed_or_the_interval_has_not_passed() {
+    let store = Arc::new(MemorySnapshots::default());
+    let rig = Rig::over_with(
+        Arc::default(),
+        Arc::default(),
+        Arc::new(ManualClock::new(START)),
+        Some(store.clone()),
+    );
+    rig.publish_item("job").await;
+    rig.pass(30).await;
+    assert!(store.get().is_none(), "not before the interval is over");
+    rig.pass(31).await;
+    let first = store.get().expect("a snapshot once the interval is over");
+
+    // Nothing changed: no new snapshot, however long it is.
+    rig.pass(100).await;
+    rig.pass(100).await;
+    assert!(store.get().unwrap() == first);
+
+    // A change after a long quiet is written at the next tick, as the
+    // interval is long over.
+    rig.publish_item("later").await;
+    rig.pass(1).await;
+    let second = store.get().unwrap();
+    assert!(second != first);
+
+    // A change is not written before the interval since the last is over.
+    rig.publish_item("later still").await;
+    rig.pass(10).await;
+    assert!(store.get().unwrap() == second);
+    rig.pass(60).await;
+    assert!(store.get().unwrap() != second);
+}
+
+#[tokio::test]
+async fn a_snapshot_taken_while_an_item_waits_to_go_dead_finds_its_copy_after_it() {
+    let store = Arc::new(MemorySnapshots::default());
+    let rig = Rig::over_with(
+        Arc::default(),
+        Arc::default(),
+        Arc::new(ManualClock::new(START)),
+        Some(store.clone()),
+    );
+    let item = rig.publish_item("doomed").await;
+    for backoff in [2, 4, 0] {
+        let claim = rig.pull("one").await.unwrap();
+        // The last failure sends it to `dead`, which refuses the copy.
+        if backoff == 0 {
+            rig.broker.refuse("dead");
+        }
+        rig.fail("one", &item, &claim.lease_id).await.unwrap();
+        rig.pass(backoff).await;
+    }
+    rig.pass(61).await;
+    let kept = store.get().expect("a snapshot");
+    assert!(
+        String::from_utf8_lossy(&kept).contains(r#""next":"dead""#),
+        "the snapshot holds the item waiting for its copy to be published"
+    );
+    assert!(rig.read(&Topic::Dead).await.is_empty());
+
+    // The copy is published after the snapshot, and the fact for it.
+    rig.broker.heal();
+    rig.pass(1).await;
+    assert_eq!(rig.read(&Topic::Dead).await.len(), 1);
+    assert_eq!(rig.transitions().await.last().unwrap(), "dead");
+
+    let (from_snapshot, read) = restarted(&rig, Some(&store)).await;
+    let (from_start, _) = restarted(&rig, None).await;
+    assert_eq!(from_snapshot, from_start);
+    assert!(read < rig.replayable().await);
+    let text = from_snapshot.to_string();
+    assert!(text.contains(&item.to_string()), "its id is kept: {text}");
+    assert!(!text.contains("Backoff"), "and it is finished: {text}");
+}
+
+#[tokio::test]
+async fn an_engine_without_a_store_keeps_no_snapshot_and_still_restarts() {
+    let rig = Rig::new();
+    rig.publish_item("job").await;
+    rig.pass(1_000).await;
+    let (picture, _) = restarted(&rig, None).await;
+    assert_eq!(picture, rig.picture().await);
 }

@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use mansio_core::{
     ConsumerName, Envelope, EventId, ItemId, LeaseFingerprint, LeaseId, Next, Principal, Segment,
+    Topic,
 };
+use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use crate::error::ApiError;
@@ -27,7 +29,7 @@ impl std::fmt::Debug for Remembered {
 }
 
 /// The right to work on an item until `expires_at`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Lease {
     /// Of the lease id, which only the holder has: the facts say which lease
     /// this is and nothing more.
@@ -35,7 +37,8 @@ pub(crate) struct Lease {
     /// The lease id itself, while this process has been up since the lease was
     /// given. A consumer that asks again for the lease it holds is told it
     /// again. A lease read back from the facts has none, as the facts do not
-    /// say it.
+    /// say it. A snapshot does not keep it either.
+    #[serde(skip)]
     pub(crate) id: Option<Remembered>,
     pub(crate) holder: Principal,
     pub(crate) consumer: ConsumerName,
@@ -49,7 +52,7 @@ pub(crate) struct Lease {
 }
 
 /// What becomes of an item once the fact it owes is recorded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Then {
     /// It is claimable again.
     Ready,
@@ -58,7 +61,7 @@ pub(crate) enum Then {
 }
 
 /// Where an item stands.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) enum Phase {
     /// Claimable.
     Ready,
@@ -73,7 +76,7 @@ pub(crate) enum Phase {
 }
 
 /// A work item: its current message and where it stands.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Item {
     /// The current version of the item: the message with the highest attempt.
     pub(crate) message: Envelope,
@@ -191,7 +194,60 @@ pub(crate) struct Queue {
     timers: Timers,
 }
 
+/// A queue as a snapshot keeps it: the open items in the order they stand in,
+/// and the ids of the finished ones.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct QueueRecord {
+    items: Vec<(ItemId, Item)>,
+    finished: Vec<ItemId>,
+    next_order: u64,
+}
+
 impl Queue {
+    /// The queue as a record, to write in a snapshot.
+    pub(crate) fn to_record(&self) -> QueueRecord {
+        let mut items: Vec<(ItemId, Item)> = self
+            .items
+            .iter()
+            .map(|(id, item)| (id.clone(), item.clone()))
+            .collect();
+        items.sort_by_key(|(_, item)| item.order);
+        let mut finished: Vec<ItemId> = self.finished.other.iter().cloned().collect();
+        finished.extend(self.finished.uuids.iter().filter_map(|uuid| {
+            EventId::from_u128(*uuid)
+                .ok()
+                .and_then(|id| id.to_string().parse::<ItemId>().ok())
+        }));
+        finished.sort();
+        QueueRecord {
+            items,
+            finished,
+            next_order: self.next_order,
+        }
+    }
+
+    /// The queue a record was made from.
+    pub(crate) fn from_record(record: QueueRecord) -> Self {
+        let mut queue = Self {
+            next_order: record.next_order,
+            ..Self::default()
+        };
+        for id in &record.finished {
+            queue.finished.insert(id);
+        }
+        for (id, item) in record.items {
+            // An order past `next_order` would let a later addition stand
+            // before an earlier one.
+            queue.next_order = queue.next_order.max(item.order.saturating_add(1));
+            if item.phase == Phase::Ready {
+                queue.ready.insert((item.order, id.clone()));
+            }
+            queue.timers.add(&id, &item.phase);
+            queue.items.insert(id, item);
+        }
+        queue
+    }
+
     pub(crate) fn get(&self, id: &ItemId) -> Option<&Item> {
         self.items.get(id)
     }
@@ -352,6 +408,15 @@ impl Alerts {
         self.surfaced.keys()
     }
 
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&EventId, &i64)> {
+        self.surfaced.iter()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.surfaced.is_empty()
+    }
+
     /// Set when the alert was published or last surfaced.
     pub(crate) fn insert(&mut self, alert: EventId, at: i64) -> Option<i64> {
         let old = self.surfaced.insert(alert, at);
@@ -411,6 +476,15 @@ pub(crate) struct TenantState {
     /// the log of keys, and a reload of the rest keeps them.
     pub(crate) keys: Keys,
     pub(crate) keys_loaded: bool,
+    /// For each topic the state is made from, the offset the next message
+    /// will have if the state covers every message before it. `None` when it
+    /// is not known to, so that no snapshot is taken of it.
+    pub(crate) covered: Option<HashMap<Topic, u64>>,
+    /// When the last snapshot of this state was taken or read, in
+    /// milliseconds since the Unix epoch.
+    pub(crate) snapshot_at: Option<i64>,
+    /// Whether the state has changed since that snapshot.
+    pub(crate) changed: bool,
 }
 
 impl TenantState {
