@@ -4,9 +4,9 @@
 use std::str::FromStr;
 
 use mansio_core::{
-    AlertEvent, AlertFact, CausationId, DataContentType, Envelope, EventId, EventType, ItemId,
-    Principal, PrincipalEvent, PrincipalFact, Segment, Source, Subject, TenantId, Timestamp, Topic,
-    WebhookEvent, WebhookFact, WorkEvent, WorkFact,
+    AlertEvent, AlertFact, CausationId, Data, DataContentType, Envelope, EventId, EventType,
+    ItemId, Principal, PrincipalEvent, PrincipalFact, Segment, Source, Subject, TenantId,
+    Timestamp, Topic, WebhookEvent, WebhookFact, WorkEvent, WorkFact,
 };
 use tracing::error;
 
@@ -103,7 +103,7 @@ impl Facts {
         item: &ItemId,
         data: &WorkFact,
     ) -> Result<Envelope, ApiError> {
-        let value = serde_json::to_value(data).map_err(|reason| {
+        let value = Data::new(data).map_err(|reason| {
             error!(%reason, "a work fact did not serialize");
             ApiError::Internal
         })?;
@@ -163,7 +163,7 @@ impl Facts {
         at: i64,
         data: &AlertFact,
     ) -> Result<Envelope, ApiError> {
-        let value = serde_json::to_value(data).map_err(|reason| {
+        let value = Data::new(data).map_err(|reason| {
             error!(%reason, "an alert fact did not serialize");
             ApiError::Internal
         })?;
@@ -189,7 +189,7 @@ impl Facts {
         at: i64,
         data: &PrincipalFact,
     ) -> Result<Envelope, ApiError> {
-        let value = serde_json::to_value(data).map_err(|reason| {
+        let value = Data::new(data).map_err(|reason| {
             error!(%reason, "a principal fact did not serialize");
             ApiError::Internal
         })?;
@@ -220,7 +220,7 @@ impl Facts {
         at: i64,
         data: &WebhookFact,
     ) -> Result<Envelope, ApiError> {
-        let value = serde_json::to_value(data).map_err(|reason| {
+        let value = Data::new(data).map_err(|reason| {
             error!(%reason, "a webhook fact did not serialize");
             ApiError::Internal
         })?;
@@ -283,7 +283,7 @@ mod tests {
         message.item_id = Some("item-1".parse().unwrap());
         message.attempt = Some(2);
         message.correlation_id = Some("run-9".parse().unwrap());
-        message.data = Some(serde_json::json!({"sha": "abc"}));
+        message.data = Some(Data::new(&serde_json::json!({"sha": "abc"})).unwrap());
         message.record = Some(mansio_core::Record {
             id: "rec-1".parse().unwrap(),
             prev_hash: "a".repeat(64).parse().unwrap(),
@@ -362,7 +362,7 @@ mod tests {
         assert_eq!(fact.event_type.as_str(), "mansio.principal.created");
         assert_eq!(fact.subject.as_ref().unwrap().as_str(), info.id.to_string());
         assert_eq!(fact.principal, by);
-        let back: PrincipalFact = serde_json::from_value(fact.data.unwrap()).unwrap();
+        let back: PrincipalFact = fact.data.unwrap().parse().unwrap();
         assert_eq!(back, data);
     }
 
@@ -388,7 +388,7 @@ mod tests {
             data.webhook_id.to_string()
         );
         assert_eq!(fact.principal.to_string(), ENGINE_PRINCIPAL);
-        let back: WebhookFact = serde_json::from_value(fact.data.clone().unwrap()).unwrap();
+        let back: WebhookFact = fact.data.as_ref().unwrap().parse().unwrap();
         assert_eq!(back, data);
 
         // Giving up on the same message again makes the same fact, and another
@@ -433,11 +433,21 @@ mod tests {
         assert_eq!(first.item_id, next.item_id);
         assert_eq!(first.event_type.as_str(), "mansio.work.retried");
         assert_eq!(
-            first.data.as_ref().unwrap()["message_id"],
+            first
+                .data
+                .as_ref()
+                .unwrap()
+                .parse::<serde_json::Value>()
+                .unwrap()["message_id"],
             next.id.to_string()
         );
         assert_eq!(
-            first.data.as_ref().unwrap()["previous_message_id"],
+            first
+                .data
+                .as_ref()
+                .unwrap()
+                .parse::<serde_json::Value>()
+                .unwrap()["previous_message_id"],
             current.id.to_string()
         );
         // And another message owes another fact.

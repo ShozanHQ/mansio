@@ -5,7 +5,7 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use mansio_core::{MemoryBroker, Record, SinkError, Stored, SystemRecord};
+use mansio_core::{Data, MemoryBroker, Record, SinkError, Stored, SystemRecord};
 use serde_json::{Value, json};
 
 use super::*;
@@ -426,12 +426,12 @@ fn item_envelope(id: EventId, name: &str) -> Envelope {
     message.item_id = Some(id.to_string().parse().unwrap());
     message.attempt = Some(1);
     message.subject = Some(name.parse().unwrap());
-    message.data = Some(json!({"name": name}));
+    message.data = Some(Data::new(&json!({"name": name})).unwrap());
     message
 }
 
 fn data(fact: &Envelope) -> Value {
-    fact.data.clone().unwrap()
+    fact.data.as_ref().unwrap().parse().unwrap()
 }
 
 #[tokio::test]
@@ -1228,7 +1228,7 @@ async fn concurrent_publishes_reach_the_sink_in_the_order_they_reach_the_topic()
                 "facts.build".parse().unwrap(),
                 agent("one"),
             );
-            message.data = Some(json!({"n": n}));
+            message.data = Some(Data::new(&json!({"n": n})).unwrap());
             engine.publish(message).await.unwrap();
         }));
     }
@@ -2055,7 +2055,7 @@ async fn a_log_that_cannot_be_read_fails_keyed_publishes_and_forgets_nothing() {
 async fn a_repeat_reads_the_first_body_back_and_the_server_keeps_none() {
     let rig = Rig::new();
     let mut message = keyed("big", "facts.build");
-    message.data = Some(serde_json::json!({ "blob": "x".repeat(200_000) }));
+    message.data = Some(Data::new(&serde_json::json!({ "blob": "x".repeat(200_000) })).unwrap());
     let (first, _) = rig.engine.publish_once(message.clone()).await.unwrap();
     // What is remembered is a pointer, however large the body.
     let held = rig.engine.lock(&tenant()).await.unwrap();

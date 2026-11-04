@@ -126,7 +126,7 @@ fn work_facts(stored: &[Stored], now: i64) -> HashMap<(Segment, ItemId), Vec<Fac
         let data = envelope
             .data
             .clone()
-            .and_then(|data| serde_json::from_value::<WorkFact>(data).ok());
+            .and_then(|data| data.parse::<WorkFact>().ok());
         let (Some(item), Some(data)) = (item, data) else {
             warn!(offset = message.offset, "a work fact could not be read");
             continue;
@@ -340,7 +340,7 @@ pub(crate) fn replay(
         let Some(data) = envelope
             .data
             .clone()
-            .and_then(|data| serde_json::from_value::<AlertFact>(data).ok())
+            .and_then(|data| data.parse::<AlertFact>().ok())
         else {
             warn!(offset = message.offset, "an alert fact could not be read");
             continue;

@@ -148,6 +148,11 @@ All notable changes to mansio are listed here. The format follows
 
 ### Changed
 
+- An envelope's `data` comes back exactly as published: an integer wider than
+  64 bits, `1e2` and a long decimal keep their digits, through the HTTP API, the
+  CLI and the MCP tools, on the memory and Iggy backends. Only the whitespace
+  outside strings is removed, so a record stays on one line.
+
 - The file sink writes each record as one whole line and syncs it to disk
   before `record` returns (set `MANSIO_SINK_SYNC=false` to skip the sync). A
   failed write is cut back to the last whole line; if that fails, the sink

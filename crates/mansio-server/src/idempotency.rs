@@ -339,7 +339,9 @@ mod tests {
         // The most the server accepts in one body is large; what a key holds
         // must not grow with it, in memory or in the log.
         let mut big = full(0);
-        big.envelope.data = Some(serde_json::json!({ "blob": "x".repeat(1_000_000) }));
+        big.envelope.data = Some(
+            mansio_core::Data::new(&serde_json::json!({ "blob": "x".repeat(1_000_000) })).unwrap(),
+        );
         let first = First::of(&big);
         let entry = Entry::seen("acme".parse().unwrap(), key(1), 0, &big);
         let written = records::encode(&entry).unwrap();
