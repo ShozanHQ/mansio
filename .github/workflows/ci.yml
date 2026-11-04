@@ -35,6 +35,10 @@ jobs:
         run: cargo build --workspace --locked
       - name: Test
         run: cargo test --workspace --locked
+      # Replays fuzz/corpus and fuzz/regressions through the fuzz targets, so a
+      # crash that was fixed stays fixed. The fuzzing itself is fuzz.yml.
+      - name: Test the fuzz targets on their seeds and regressions
+        run: 'cargo test -p mansio-server --features fuzzing --locked fuzz::'
 
   deny:
     name: deny
@@ -45,6 +49,12 @@ jobs:
           persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
+          command: check
+          arguments: --all-features --locked
+      # fuzz/ is its own workspace with its own lockfile (fuzz.yml).
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: fuzz/Cargo.toml
           command: check
           arguments: --all-features --locked
 
@@ -132,6 +142,30 @@ jobs:
       - name: Stop the stack
         if: always()
         run: docker compose down --volumes
+
+  # The newest walkthrough in docs/demos/, run against a fresh memory-broker
+  # server, so a step that no longer works as written fails here.
+  demo:
+    name: demo
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Run the newest demo
+        run: |
+          newest=$(ls docs/demos/*.md 2>/dev/null | sort | tail -n 1)
+          if [ -z "$newest" ]; then
+            echo "no demo found in docs/demos/" >&2
+            exit 1
+          fi
+          .github/scripts/demo-check.sh "$newest"
+      - name: The checker fails on a failing block and names it
+        run: .github/scripts/demo-check-test.sh
 
   # The steps and the settings of the throwaway stack are in
   # .github/actions/e2e, which the weekly run against Iggy's edge build in

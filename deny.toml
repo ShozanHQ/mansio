@@ -21,6 +21,12 @@ allow = [
 ]
 confidence-threshold = 0.93
 
+# libFuzzer is LLVM code under NCSA, a permissive OSI licence. Only the fuzz
+# crate (fuzz/, never published) depends on it, so nothing mansio ships does.
+[[licenses.exceptions]]
+crate = "libfuzzer-sys"
+allow = ["NCSA"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"

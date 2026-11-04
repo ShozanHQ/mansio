@@ -19,6 +19,9 @@ a [command line](#the-cli) and an [MCP server](#mcp) for agents, [server-sent
 events](#server-sent-events) for a dashboard, and [signed
 webhooks](#webhooks) for software that will not hold a connection.
 
+What shipped each week, with steps you can run on your own machine without
+Docker, is in [`docs/demos/`](docs/demos/). CI runs the newest one.
+
 ## The contract
 
 ### Envelope

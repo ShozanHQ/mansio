@@ -485,6 +485,17 @@ impl Ownership {
     }
 }
 
+/// Read a line of the owners log and fold it into an empty view, as a round
+/// does. For the fuzz targets.
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_record(bytes: &[u8]) -> bool {
+    let Ok(record) = serde_json::from_slice::<Record>(bytes) else {
+        return false;
+    };
+    Log::default().apply(record, 0);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use mansio_core::MemoryBroker;
