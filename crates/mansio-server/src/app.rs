@@ -34,9 +34,12 @@ use crate::cursors::Cursors;
 use crate::engine::Engine;
 use crate::error::ApiError;
 use crate::events_api;
+use crate::metrics::{self, Metrics};
 use crate::principals_api;
+use crate::request_log;
 use crate::settings::{
-    CredentialSettings, Limits, SettingsError, StreamSettings, WebhookSettings, WorkSettings,
+    CredentialSettings, DEFAULT_METRICS, Limits, SettingsError, StreamSettings, WebhookSettings,
+    WorkSettings,
 };
 use crate::stream_limits::StreamLimiter;
 use crate::webhooks::Webhooks;
@@ -61,6 +64,7 @@ pub struct AppState {
     pub(crate) auth: Auth,
     pub(crate) limits: Limits,
     pub(crate) streams: StreamSettings,
+    pub(crate) metrics: Arc<Metrics>,
     /// The open event streams, counted against the limits in `streams`.
     pub(crate) stream_limiter: Arc<StreamLimiter>,
     /// Becomes true when the server is shutting down, which ends every event
@@ -117,6 +121,7 @@ pub struct Server {
     credentials: CredentialSettings,
     streams: StreamSettings,
     webhooks: WebhookSettings,
+    metrics: bool,
     snapshot_dir: Option<std::path::PathBuf>,
 }
 
@@ -173,6 +178,7 @@ impl Server {
             credentials: CredentialSettings::default(),
             streams: StreamSettings::default(),
             webhooks: WebhookSettings::default(),
+            metrics: DEFAULT_METRICS,
             snapshot_dir: None,
         }
     }
@@ -246,6 +252,15 @@ impl Server {
         Ok(self)
     }
 
+    /// Serve `GET /metrics` and count what it reports, or not
+    /// (`MANSIO_METRICS`, on by default). With metrics off the route is a 404
+    /// and nothing is counted; the request log is written either way.
+    #[must_use]
+    pub fn with_metrics(mut self, on: bool) -> Self {
+        self.metrics = on;
+        self
+    }
+
     /// Read time from `clock` instead of the system clock.
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
@@ -260,13 +275,15 @@ impl Server {
     /// are called.
     pub fn build(self) -> Parts {
         let max_body = self.limits.max_body_bytes;
+        let metrics = Arc::new(Metrics::new(self.metrics));
         let mut engine = Engine::new(
             Arc::clone(&self.broker),
             self.sink,
             Arc::clone(&self.clock),
             self.work,
             self.limits.poll_max_count,
-        );
+        )
+        .with_metrics(Arc::clone(&metrics));
         if let Some(dir) = self.snapshot_dir {
             engine = engine.with_snapshot_dir(dir);
         }
@@ -302,13 +319,16 @@ impl Server {
             auth: self.auth,
             limits: self.limits,
             streams: self.streams,
+            metrics,
             stream_limiter: StreamLimiter::new(
                 self.streams.sse_max_per_credential,
                 self.streams.sse_max,
             ),
             ending,
         };
-        let router = Router::new()
+        let metrics_on = state.metrics.enabled();
+        let state = Arc::new(state);
+        let mut router = Router::new()
             .route("/healthz", get(healthz))
             .route("/v1/settings", get(settings))
             .route(
@@ -368,11 +388,19 @@ impl Server {
             .route(
                 "/v1/webhooks/{id}/rotate",
                 post(webhooks_api::webhooks_rotate),
-            )
+            );
+        if metrics_on {
+            router = router.route("/metrics", get(metrics_text));
+        }
+        let router = router
             .fallback(not_found)
             .method_not_allowed_fallback(method_not_allowed)
             .layer(DefaultBodyLimit::max(max_body))
-            .with_state(Arc::new(state));
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                request_log::observe,
+            ))
+            .with_state(state);
         Parts {
             router,
             engine,
@@ -493,6 +521,21 @@ async fn healthz(State(state): State<Arc<AppState>>) -> Response {
         json!(format!("{}; see the server log", messages.join("; "))),
     );
     (StatusCode::SERVICE_UNAVAILABLE, Json(Value::Object(body))).into_response()
+}
+
+/// The metrics in the Prometheus text format. Only the admin may read them:
+/// they name every tenant, topic and queue.
+async fn metrics_text(
+    State(state): State<Arc<AppState>>,
+    Authenticated(actor): Authenticated,
+) -> Result<Response, ApiError> {
+    actor.require_admin()?;
+    let gauges = state.engine.queue_gauges().await;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, metrics::CONTENT_TYPE)],
+        state.metrics.render(&gauges),
+    )
+        .into_response())
 }
 
 async fn settings(
@@ -1862,5 +1905,134 @@ mod tests {
             ["acme".parse::<TenantId>().unwrap()],
             "the refused requests made no state"
         );
+    }
+
+    async fn get_text(router: &Router, uri: &str, token: Option<&str>) -> (StatusCode, String) {
+        let mut request = Request::builder().method(Method::GET).uri(uri);
+        if let Some(token) = token {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let response = router
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_request_is_logged_with_its_route_tenant_status_and_principal_and_no_token() {
+        let (logs, _guard) = Logs::capture().await;
+        let router = router();
+        let (status, _) = send(&router, Method::POST, URI, Some(TOKEN), MINIMAL).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = send(&router, Method::GET, URI, None, "").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = send(&router, Method::GET, "/no/such/route/secret-id", None, "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let logged = logs.text();
+        let lines: Vec<&str> = logged.lines().filter(|l| l.contains("request")).collect();
+        assert_eq!(lines.len(), 3, "one line per request: {logged}");
+        for expected in [
+            "method=POST",
+            "route=/v1/tenants/{tenant}/topics/{topic}/messages",
+            "tenant=acme",
+            "status=201",
+            "duration_ms=",
+            "principal_kind=service",
+            "principal_name=mansio",
+        ] {
+            assert!(
+                lines[0].contains(expected),
+                "{expected} is not in {}",
+                lines[0]
+            );
+        }
+        for expected in ["status=401", "principal_kind=-", "principal_name=-"] {
+            assert!(
+                lines[1].contains(expected),
+                "{expected} is not in {}",
+                lines[1]
+            );
+        }
+        // The path of a request no route matched holds ids; only the label shows.
+        assert!(lines[2].contains("route=unmatched"), "{}", lines[2]);
+        assert!(!logged.contains("secret-id"), "{logged}");
+        assert!(!logged.contains(TOKEN), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn metrics_report_requests_publishes_and_the_queues_to_the_admin() {
+        let _serial = serial().await;
+        let router = router();
+        let (status, _) = send(&router, Method::POST, URI, Some(TOKEN), MINIMAL).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = send(&router, Method::GET, "/healthz", None, "").await;
+        assert_eq!(status, StatusCode::OK);
+        let item = r#"{"source":"s","type":"t"}"#;
+        let (status, _) = send(
+            &router,
+            Method::POST,
+            "/v1/tenants/acme/work/builds/items",
+            Some(TOKEN),
+            item,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, text) = get_text(&router, "/metrics", Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::OK);
+        for expected in [
+            "mansio_http_requests_total{method=\"POST\",route=\"/v1/tenants/{tenant}/topics/{topic}/messages\",status=\"201\"} 1",
+            "mansio_http_requests_total{method=\"GET\",route=\"/healthz\",status=\"200\"} 1",
+            "mansio_http_request_duration_seconds_count{method=\"GET\",route=\"/healthz\",status=\"200\"} 1",
+            "mansio_published_messages_total{tenant=\"acme\",topic=\"facts.build\"} 1",
+            "mansio_published_messages_total{tenant=\"acme\",topic=\"work.builds\"} 1",
+            "mansio_queue_open_items{tenant=\"acme\",queue=\"builds\"} 1",
+            "mansio_queue_active_leases{tenant=\"acme\",queue=\"builds\"} 0",
+            "# TYPE mansio_queue_dead_letters_total counter",
+        ] {
+            assert!(text.contains(expected), "{expected} is not in {text}");
+        }
+        let (status, _) = get_text(&router, "/metrics", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn only_the_admin_reads_the_metrics_and_they_can_be_turned_off() {
+        let _serial = serial().await;
+        let auth = || {
+            Auth::new(
+                SecretString::from(TOKEN.to_owned()),
+                "service:mansio".parse().unwrap(),
+            )
+        };
+        let parts = Server::new(Arc::new(MemoryBroker::new()), auth()).build();
+        let body = serde_json::from_value(json!({
+            "kind": "agent",
+            "name": "worker",
+            "tenant": "acme",
+            "scopes": [{"topic": "facts.*", "verbs": ["publish"]}],
+        }))
+        .unwrap();
+        let issued = parts
+            .credentials
+            .create(&"service:mansio".parse().unwrap(), body)
+            .await
+            .unwrap();
+        let (status, _) =
+            get_text(&parts.router, "/metrics", Some(issued.credential.expose())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let off = Server::new(Arc::new(MemoryBroker::new()), auth())
+            .with_metrics(false)
+            .router();
+        let (status, _) = get_text(&off, "/metrics", Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = send(&off, Method::POST, URI, Some(TOKEN), MINIMAL).await;
+        assert_eq!(status, StatusCode::CREATED);
     }
 }

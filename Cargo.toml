@@ -16,7 +16,7 @@ mansio-server = { path = "crates/mansio-server", version = "0.1.0" }
 
 anyhow = "1"
 async-trait = "0.1"
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "matched-path", "query", "tokio"] }
 blake3 = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive", "string"] }

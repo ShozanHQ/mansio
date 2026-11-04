@@ -882,6 +882,43 @@ expire; they stop working with the user. When the server starts, and has read th
 registry, it deletes the Iggy users it made for principals it holds no record
 of. While a record cannot be read it deletes none.
 
+### Request log and metrics
+
+The server writes one log line per request, at `info`, when the answer is
+ready: `method`, `route` (the route pattern, such as
+`/v1/tenants/{tenant}/topics/{topic}/messages`, or `unmatched`, never the
+path), `tenant` (from the path or the `tenant` query, `-` if there is none),
+`status`, `duration_ms`, and `principal_kind` and `principal_name` of the
+credential (`-` when the request had none that was accepted). A header is
+never logged, so a token never is. For an event stream the duration is the
+time to the start of the answer. The log is always on.
+
+`GET /metrics` serves Prometheus text, for the admin token only (it names
+every tenant, topic and queue). Point a scrape job at it with
+`authorization: {credentials: <MANSIO_TOKEN>}`.
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `mansio_http_requests_total` | counter | `method`, `route`, `status` |
+| `mansio_http_request_duration_seconds` | histogram | `method`, `route`, `status` |
+| `mansio_published_messages_total` | counter | `tenant`, `topic` |
+| `mansio_queue_open_items` | gauge | `tenant`, `queue` |
+| `mansio_queue_active_leases` | gauge | `tenant`, `queue` |
+| `mansio_queue_lease_expiries_total` | counter | `tenant`, `queue` |
+| `mansio_queue_retries_total` | counter | `tenant`, `queue` |
+| `mansio_queue_dead_letters_total` | counter | `tenant`, `queue` |
+
+Counters start at zero when the server starts. Open items are those not yet
+acknowledged or dead lettered, and a gauge is read when the endpoint is
+scraped, for tenants whose state is loaded. Published messages include the
+facts the server writes itself, on `facts.*` and `dead`. `MANSIO_METRICS=false`
+turns the endpoint off (it is then a 404) and stops the counting; the request
+log stays.
+
+With `MANSIO_OWNER_TTL_SECONDS` set, the queue gauges come only from the
+server that serves each tenant; a server that has lost a tenant reports none
+for it, so a sum across servers does not count a tenant twice.
+
 ### Order
 
 Every durable publish mansio makes (messages, work, transitions) is recorded
@@ -906,6 +943,7 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_CREDENTIAL_FOLLOW_MILLIS` | `1000` | The soonest the principals log is read again for a token the registry does not know, so that tokens never issued cannot make the server read it at every request. Also how long a broker user no record owns is left before it is deleted, when servers share a broker. |
 | `MANSIO_SINK_PATH` | `mansio-sink.jsonl` (`/data/sink.jsonl` in the image) | JSON Lines file that every durable publish is appended to before it is published. Empty turns the sink off. |
 | `MANSIO_SINK_SYNC` | `true` | `true` or `false`. Whether the sink syncs each record to disk before the publish goes on. `false` is for development: a crash can lose recent records. |
+| `MANSIO_METRICS` | `true` | `true` or `false`. Whether `GET /metrics` is served and the counters behind it are kept. `false` makes `/metrics` a 404. The request log is written either way; see [Request log and metrics](#request-log-and-metrics). |
 | `MANSIO_MAX_BODY_BYTES` | `1048576` | Largest request body; a larger one is a 413. Iggy has a cap of its own on a message payload, 64 000 000 bytes (the stored envelope, not the body's `data` alone), and a body over it is refused by Iggy as a 502, which a client does not retry. A value above about 64 000 000 lets a body reach that refusal; a value below it makes this setting the limit. Raise it only when messages are that large: Iggy holds a whole message in memory. |
 | `MANSIO_POLL_DEFAULT_COUNT` | `100` | Envelopes a poll returns when `count` is not given. |
 | `MANSIO_POLL_MAX_COUNT` | `1000` | The most a poll may ask for. Also how many messages the server reads at a time when it rebuilds its state on start. |
