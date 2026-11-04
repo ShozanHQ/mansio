@@ -5,18 +5,42 @@
 # mansio-server as a small non-root image.
 
 # Every image is pinned by digest, with its tag kept to read. Dependabot moves
-# both together. The Rust version is kept in step with rust-toolchain.toml by
-# hand: the toolchain file is not copied in, so the image's own compiler is the
-# one that builds.
-FROM rust:1.99.0-slim-trixie@sha256:2752b332db73fdbb7dc576f06c82ed1f312005784ef913d7e04a28f5f55dc581 AS build
+# both.
+#
+# The Rust version is written once, in rust-toolchain.toml. The rust image below
+# is only a host for rustup: its own compiler is never used. The toolchain file
+# is copied in and `rustup toolchain install` installs what it names, so changing
+# the pin there changes the image. The check after it fails the build if the
+# compiler that will build is not the one the file names. The tag below is not
+# the pin and need not move with it.
+FROM rust:1.99.0-slim-trixie@sha256:2752b332db73fdbb7dc576f06c82ed1f312005784ef913d7e04a28f5f55dc581 AS toolchain
 RUN apt-get update \
  && apt-get install -y --no-install-recommends build-essential cmake pkg-config \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
+COPY rust-toolchain.toml ./
+RUN rustup toolchain install \
+ && channel="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" \
+ && rustc --version | grep -F "rustc ${channel} " \
+ && cargo install cargo-chef --version 0.1.68 --locked
+
+# The recipe lists the dependencies and nothing else, so it changes only when
+# Cargo.toml or Cargo.lock does, and the layer that builds them is kept until then.
+FROM toolchain AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM toolchain AS build
+COPY --from=planner /src/recipe.json recipe.json
+# The dependencies: cached in this layer until the recipe changes. No cache
+# mount on target, so that the compiled dependencies stay in the layer, where a
+# registry cache can carry them to the next CI run.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo chef cook --locked --release --package mansio-server --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
     cargo build --locked --release --package mansio-server \
  && install -D target/release/mansio-server /out/mansio-server
 

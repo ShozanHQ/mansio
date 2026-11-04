@@ -41,8 +41,9 @@ updates:
         patterns: ["*"]
         update-types: [minor, patch]
     ignore:
-      # The compiler moves by hand, together with rust-toolchain.toml and
-      # rust-version. Patch releases and a new digest of the same tag still come.
+      # The compiler is whatever rust-toolchain.toml names; the rust image only
+      # hosts rustup. Its tag is held at the current minor so the base does not
+      # churn for nothing. Patch releases and a new digest of the same tag still come.
       - dependency-name: rust
         update-types:
           - version-update:semver-major

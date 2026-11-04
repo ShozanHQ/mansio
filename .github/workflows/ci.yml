@@ -96,6 +96,35 @@ jobs:
         if: always()
         run: docker compose down --volumes
 
+  # Writes the image's build cache to ghcr.io, from main only. It runs no code
+  # from a branch, and it is the only job with packages: write.
+  image-cache:
+    name: image-cache
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the dependency layer and push it as the cache
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ref="ghcr.io/${GITHUB_REPOSITORY,,}/build-cache"
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          start=$SECONDS
+          builder="$(docker buildx create --driver docker-container --bootstrap)"
+          docker buildx build --builder "$builder" \
+            --cache-from "type=registry,ref=$ref" \
+            --cache-to "type=registry,ref=$ref,mode=max" .
+          echo "Cold-or-warm cache build on main: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
+
   # The steps and the settings of the throwaway stack are in
   # .github/actions/e2e, which the weekly run against Iggy's edge build in
   # scheduled.yml uses too.
@@ -103,6 +132,11 @@ jobs:
     name: e2e
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    # Reads the image build cache and never writes it: the image-cache job
+    # below writes it, on a push to main only.
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -112,3 +146,6 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Start Iggy and mansio-server, run the end-to-end suite through compose, stop the stack
         uses: ./.github/actions/e2e
+        with:
+          cache-ref: ghcr.io/${{ github.repository }}/build-cache
+          registry-token: ${{ secrets.GITHUB_TOKEN }}

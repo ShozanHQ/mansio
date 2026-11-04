@@ -5,6 +5,21 @@ description: >-
   use it, so that they run the same thing. The caller checks out the repository,
   installs the toolchain and sets up the cache first.
 
+inputs:
+  cache-ref:
+    description: >-
+      A registry reference (for example ghcr.io/owner/repo/build-cache) that
+      holds the image's build cache, so the dependency layer is built once and
+      reused across runs. Empty builds without a shared cache.
+    default: ""
+  registry-token:
+    description: >-
+      A token that can read packages, to sign in to ghcr.io with for cache-ref.
+      Empty skips the sign-in. The action only reads the cache: a separate job
+      on a push to main writes it (image-cache in ci.yml), so no token that can
+      write is ever handed to code from a branch.
+    default: ""
+
 runs:
   using: composite
   steps:
@@ -67,9 +82,37 @@ runs:
       run: |
         mkdir -p "$RUNNER_TEMP/mansio-state"
         echo "MANSIO_E2E_STATE_DIR=$RUNNER_TEMP/mansio-state" >> "$GITHUB_ENV"
+    # The image is built here, before compose, so that the build can use a
+    # shared cache and be timed on its own. compose finds mansio-server:dev and
+    # does not build it again.
+    - name: Build the mansio-server image, reusing the cached dependency layer
+      shell: bash
+      env:
+        CACHE_REF: ${{ inputs.cache-ref }}
+        REGISTRY_TOKEN: ${{ inputs.registry-token }}
+      run: |
+        set -euo pipefail
+        start=$SECONDS
+        args=()
+        if [ -n "$CACHE_REF" ]; then
+          ref="${CACHE_REF,,}"
+          if [ -n "$REGISTRY_TOKEN" ]; then
+            printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin \
+              || echo "::warning::could not sign in to ghcr.io, so the build cache is read anonymously if at all"
+          fi
+          args+=(--cache-from "type=registry,ref=$ref")
+        fi
+        # A builder of its own name, so a second run in one job, or a reused
+        # runner, does not collide with an existing one.
+        builder="$(docker buildx create --driver docker-container --bootstrap)"
+        trap 'docker buildx rm "$builder" >/dev/null 2>&1 || true; docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+        docker buildx build --builder "$builder" --load --tag mansio-server:dev "${args[@]}" .
+        elapsed=$((SECONDS - start))
+        echo "Image build step: ${elapsed}s (cache: ${CACHE_REF:-none})"
+        echo "Image build step: ${elapsed}s (cache: ${CACHE_REF:-none})" >> "$GITHUB_STEP_SUMMARY"
     - name: Start Iggy, make mansio's Iggy user, and start mansio-server
       shell: bash
-      run: docker compose up --build --wait
+      run: docker compose up --wait
     - name: Publish, poll, claim, retry, acknowledge, stream, deliver webhooks and issue credentials through Iggy
       shell: bash
       run: cargo test -p mansio-e2e --locked
