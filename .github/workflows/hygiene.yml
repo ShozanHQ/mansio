@@ -39,7 +39,7 @@ jobs:
       # pieces, so it does not match itself.
       - name: Nothing in the tree carries an internal ticket id or a tracker link
         run: bash .github/scripts/names.sh tree
-      - name: Nor does a commit message, or the title or body of the pull request
+      - name: Nor does a commit message or tree, or the title or body of the pull request
         if: github.event_name == 'pull_request'
         # The title and the body are text of anyone who can open a pull request.
         # They reach the script through the environment and are never part of it.
@@ -55,6 +55,8 @@ jobs:
           commits=$(git rev-list "$BASE..$HEAD")
           for commit in $commits; do
             git log -1 --format=%B "$commit" | bash .github/scripts/names.sh text "commit $commit" || failed=1
+            # The tree of each commit, since merges keep every commit in main.
+            bash .github/scripts/names.sh tree "$commit" || failed=1
           done
           exit "$failed"
       - name: Every crate is Apache-2.0
