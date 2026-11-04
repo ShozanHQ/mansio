@@ -41,12 +41,23 @@ jobs:
   # reports and never blocks: continue-on-error keeps a failure here from
   # failing the workflow run. A failure that stays is a reason to look at what
   # Iggy changed before the next release of it.
+  #
+  # A green job notifies nobody, so a final step opens an issue labelled
+  # iggy-edge when anything in the job failed, or comments on the open one. The
+  # same run checks the hand-pinned frontend of the Dockerfile and reports a
+  # stale pin the same way. This is the only job with issues: write.
   e2e-edge:
     name: e2e against Iggy edge
     if: github.event_name != 'schedule' || github.event.schedule == '43 5 * * 1'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     continue-on-error: true
+    permissions:
+      contents: read
+      # To list the steps of this run and find the one that failed.
+      actions: read
+      # To open or comment on the iggy-edge issue.
+      issues: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -60,8 +71,78 @@ jobs:
           printf 'services:\n  iggy:\n    image: apache/iggy:edge\n' > "$override"
           echo "COMPOSE_FILE=$GITHUB_WORKSPACE/compose.yaml:$override" >> "$GITHUB_ENV"
       - name: Pull Iggy's edge build and say which one it is
+        id: edge
         run: |
           docker compose pull iggy
-          docker image inspect --format '{{index .RepoDigests 0}}' apache/iggy:edge
+          ref="$(docker image inspect --format '{{index .RepoDigests 0}}' apache/iggy:edge)"
+          echo "$ref"
+          echo "digest=${ref#*@}" >> "$GITHUB_OUTPUT"
+      # Does not fail here: the e2e suite below still runs, and a step after it
+      # fails the job when the pin is stale.
+      - name: Compare the pinned Dockerfile frontend with docker/dockerfile:1
+        id: pin
+        run: |
+          pinned="$(sed -n '1s|^# syntax=docker/dockerfile:1@||p' Dockerfile)"
+          current="$(docker buildx imagetools inspect docker/dockerfile:1 --format '{{.Manifest.Digest}}')"
+          echo "pinned:  $pinned"
+          echo "current: $current"
+          if [ -n "$pinned" ] && [ "$pinned" = "$current" ]; then
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+            echo "detail=Stale Dockerfile frontend pin: line 1 pins '${pinned:-nothing}', docker/dockerfile:1 is now $current." >> "$GITHUB_OUTPUT"
+          fi
       - name: Start Iggy and mansio-server, run the end-to-end suite through compose, stop the stack
         uses: ./.github/actions/e2e
+      - name: Dockerfile frontend pin is stale
+        if: always() && steps.pin.outputs.stale == 'true'
+        env:
+          DETAIL: ${{ steps.pin.outputs.detail }}
+        run: |
+          echo "::error::$DETAIL"
+          exit 1
+      - name: Summary
+        if: always()
+        env:
+          DIGEST: ${{ steps.edge.outputs.digest }}
+          RESULT: ${{ job.status }}
+          PIN_STALE: ${{ steps.pin.outputs.stale }}
+        run: |
+          pin=unchecked
+          [ "$PIN_STALE" = true ] && pin=stale
+          [ "$PIN_STALE" = false ] && pin=current
+          {
+            echo "### e2e against Iggy edge"
+            echo
+            echo "- Result: $RESULT"
+            echo "- Edge digest: \`${DIGEST:-not pulled}\`"
+            echo "- Dockerfile frontend pin: $pin"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Open or update the iggy-edge issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DIGEST: ${{ steps.edge.outputs.digest }}
+        run: |
+          failed="$(gh api "repos/$GH_REPO/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs" \
+            --jq '.jobs[] | select(.name == "e2e against Iggy edge") | .steps[] | select(.conclusion == "failure") | "- " + .name' || true)"
+          failed="${failed:-- (the failing step could not be read; see the run)}"
+          body="$(printf '%s\n' \
+            "Run: $RUN_URL" \
+            "Edge digest: \`${DIGEST:-not pulled}\`" \
+            "" \
+            "Failing step:" \
+            "$failed")"
+          gh label create iggy-edge --color B60205 \
+            --description "The weekly run against Iggy's edge build failed" 2>/dev/null || true
+          number="$(gh issue list --label iggy-edge --state open --limit 1 --json number --jq '.[0].number // empty')"
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body "$body"
+          else
+            gh issue create --label iggy-edge \
+              --title "Weekly run against Iggy edge failed" --body "$body"
+          fi
