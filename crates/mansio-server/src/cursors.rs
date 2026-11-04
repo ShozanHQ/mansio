@@ -189,6 +189,20 @@ impl Cursors {
         Ok(())
     }
 
+    /// How many named consumers have a position, once the log is read. `None`
+    /// if it cannot be.
+    pub(crate) async fn named(&self) -> Option<usize> {
+        self.load().await.ok()?;
+        let state = self.state();
+        Some(
+            state
+                .positions
+                .keys()
+                .filter(|cursor| matches!(cursor, Cursor::Named { .. }))
+                .count(),
+        )
+    }
+
     /// A commit failed in a way that does not say whether its record was
     /// stored: the positions may be one record behind the log.
     fn commit_was_unsure(&self) {

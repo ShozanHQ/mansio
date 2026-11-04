@@ -424,6 +424,7 @@ impl Server {
                 "the registry of webhooks could not be loaded; the next request will try again"
             );
         }
+        let stopped_engine = Arc::clone(&engine);
         let timer = Timer::start(engine, credentials, webhooks);
         // The signal ends the event streams, which would otherwise never let
         // the graceful shutdown finish, and starts the clock on what is left.
@@ -454,6 +455,8 @@ impl Server {
             }
         };
         timer.stop().await;
+        // Nothing is served now: another server may take the tenants at once.
+        stopped_engine.release_ownership().await;
         served
     }
 }
@@ -465,7 +468,7 @@ impl Server {
 /// the second no webhook is delivered. Asking for it tries each load again
 /// when its time is up, which is what a health check that keeps asking wants.
 async fn healthz(State(state): State<Arc<AppState>>) -> Response {
-    let credentials = state.credentials.load().await.is_err();
+    let credentials = state.credentials.load().await.is_err() || !state.credentials.whole().await;
     let webhooks = state.webhooks.load().await.is_err();
     if !credentials && !webhooks {
         return Json(json!({ "status": "ok" })).into_response();
@@ -509,12 +512,14 @@ async fn settings(
         idempotency_max_keys: u64::try_from(work.idempotency_max_keys).unwrap_or(u64::MAX),
         recovery_log_seconds: seconds(work.recovery_log),
         snapshot_interval_seconds: seconds(work.snapshot_interval),
+        owner_ttl_seconds: seconds(work.owner_ttl),
         max_body_bytes: u64::try_from(limits.max_body_bytes).unwrap_or(u64::MAX),
         poll_default_count: limits.poll_default_count,
         poll_max_count: limits.poll_max_count,
         agent_credential_ttl_seconds: seconds(credentials.agent_ttl),
         credential_recheck_seconds: seconds(credentials.recheck),
         credential_sweep_seconds: seconds(credentials.sweep),
+        credential_follow_millis: u64::try_from(credentials.follow.as_millis()).unwrap_or(u64::MAX),
         stream_poll_millis: u64::try_from(state.streams.poll.as_millis()).unwrap_or(u64::MAX),
         sse_keepalive_seconds: seconds(state.streams.sse_keepalive),
         shutdown_grace_seconds: seconds(state.streams.shutdown_grace),
@@ -1606,6 +1611,7 @@ mod tests {
             agent_ttl: std::time::Duration::from_secs(60),
             recheck: std::time::Duration::from_secs(30),
             sweep: std::time::Duration::from_secs(10),
+            follow: std::time::Duration::from_millis(1000),
         })
         .router();
 

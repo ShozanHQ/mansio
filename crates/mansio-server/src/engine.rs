@@ -45,6 +45,7 @@ use crate::clock::Clock;
 use crate::error::ApiError;
 use crate::facts::Facts;
 use crate::idempotency::{self, Keys};
+use crate::ownership::Ownership;
 use crate::records;
 use crate::recover;
 use crate::settings::WorkSettings;
@@ -113,8 +114,16 @@ pub struct Engine {
     /// The idempotency keys the log holds, read once, until each tenant takes
     /// its own.
     seeded_keys: Mutex<Option<HashMap<TenantId, Keys>>>,
+    /// With servers sharing a broker: the idempotency log as far as this
+    /// server has read it, and the keys it holds, so that a tenant taken up
+    /// reads only what was added since, not the whole log.
+    shared_keys: Mutex<(u64, HashMap<TenantId, Keys>)>,
     /// Where snapshots of each tenant's state are kept, if they are.
     snapshots: Option<Arc<dyn Snapshots>>,
+    /// Which server owns which tenant, if servers share a broker
+    /// (`MANSIO_OWNER_TTL_SECONDS`). Without it this server serves every
+    /// tenant.
+    ownership: Option<Arc<Ownership>>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -136,16 +145,26 @@ impl Engine {
         settings: WorkSettings,
         page: u32,
     ) -> Self {
+        let ownership = (!settings.owner_ttl.is_zero()).then(|| {
+            Arc::new(Ownership::new(
+                Arc::clone(&broker),
+                Arc::clone(&clock),
+                settings.owner_ttl,
+                page.max(1),
+            ))
+        });
         Self {
             broker,
             sink,
             clock,
             settings,
+            ownership,
             page: page.max(1),
             facts: Facts::new(),
             tenants: StdMutex::default(),
             discovered: AtomicBool::new(false),
             seeded_keys: Mutex::new(None),
+            shared_keys: Mutex::new((0, HashMap::new())),
             snapshots: None,
         }
     }
@@ -194,14 +213,39 @@ impl Engine {
 
     // ---- state ------------------------------------------------------------
 
+    /// Whether other servers may share the broker (ownership is on).
+    pub(crate) fn shared(&self) -> bool {
+        self.ownership.is_some()
+    }
+
+    /// Whether this server may act for `tenant`: always without ownership,
+    /// and otherwise only while it owns the tenant (taking it if nobody does).
+    ///
+    /// # Errors
+    ///
+    /// Returns 503 if another server owns the tenant, or if the owners log
+    /// cannot be read or written.
+    pub(crate) async fn serves(&self, tenant: &TenantId) -> Result<(), ApiError> {
+        match &self.ownership {
+            Some(ownership) => ownership.acquire(tenant).await.map(|_| ()),
+            None => Ok(()),
+        }
+    }
+
     /// The tenant's state, locked and up to date. The first call for a tenant
     /// rebuilds it from the broker.
     async fn lock(&self, tenant: &TenantId) -> Result<Held, ApiError> {
+        // With servers sharing a broker, only the tenant's owner serves it.
+        let epoch = match &self.ownership {
+            Some(ownership) => ownership.acquire(tenant).await?,
+            None => 0,
+        };
         let cell = {
             let mut tenants = self.tenants.lock().unwrap_or_else(PoisonError::into_inner);
             Arc::clone(tenants.entry(tenant.clone()).or_default())
         };
         let mut held = cell.lock_owned().await;
+        see_owner(&mut held, epoch);
         if !held.loaded {
             self.load(tenant, &mut held).await?;
         }
@@ -222,14 +266,25 @@ impl Engine {
         if seeded.is_some() {
             return Ok(());
         }
+        let mut tenants = HashMap::new();
+        self.read_keys(&mut tenants, &mut 0).await?;
+        *seeded = Some(tenants);
+        Ok(())
+    }
+
+    /// Read the idempotency log from `offset` to its end into `tenants`, and
+    /// move `offset` past what was read.
+    async fn read_keys(
+        &self,
+        tenants: &mut HashMap<TenantId, Keys>,
+        offset: &mut u64,
+    ) -> Result<(), ApiError> {
         let now = self.clock.now_millis();
         let window = millis(self.settings.idempotency_window);
-        let mut tenants = HashMap::new();
-        let mut offset = 0;
         loop {
             let batch = match self
                 .broker
-                .system_read(SystemLog::Idempotency, offset, self.page)
+                .system_read(SystemLog::Idempotency, *offset, self.page)
                 .await
             {
                 Ok(batch) => batch,
@@ -240,16 +295,15 @@ impl Engine {
                 Err(error) => return Err(error.into()),
             };
             let Some(last) = batch.last() else { break };
-            offset = last.offset.saturating_add(1);
+            *offset = last.offset.saturating_add(1);
             idempotency::replay_into(
-                &mut tenants,
+                tenants,
                 &batch,
                 now,
                 window,
                 self.settings.idempotency_max_keys,
             );
         }
-        *seeded = Some(tenants);
         Ok(())
     }
 
@@ -259,6 +313,16 @@ impl Engine {
     /// cannot be read fails keyed publishes and nothing else.
     async fn ensure_keys(&self, tenant: &TenantId, held: &mut TenantState) -> Result<(), ApiError> {
         if held.keys_loaded {
+            return Ok(());
+        }
+        if self.ownership.is_some() {
+            // Another server may have published with keys since this one
+            // last held the tenant, so they are read again from the log.
+            let mut shared = self.shared_keys.lock().await;
+            let (next, tenants) = &mut *shared;
+            self.read_keys(tenants, next).await?;
+            held.keys = tenants.get(tenant).cloned().unwrap_or_default();
+            held.keys_loaded = true;
             return Ok(());
         }
         let mut seeded = self.seeded_keys.lock().await;
@@ -392,7 +456,15 @@ impl Engine {
     pub async fn recover(&self) -> Result<(), ApiError> {
         // The idempotency log is read first, before any tenant is locked, so
         // that no request waits on it.
-        let mut keys_ready = {
+        let tenants = self.broker.tenants().await?;
+        // With servers sharing a broker, this one takes the tenants nobody
+        // owns, and leaves the rest to their owners. A tenant's keys are read
+        // when it first publishes with one, because they may have changed
+        // since.
+        if let Some(ownership) = &self.ownership {
+            ownership.maintain(&tenants, true).await;
+        }
+        let mut keys_ready = self.ownership.is_none() && {
             let mut seeded = self.seeded_keys.lock().await;
             match self.seed_keys(&mut seeded).await {
                 Ok(()) => true,
@@ -402,7 +474,14 @@ impl Engine {
                 }
             }
         };
-        for tenant in self.broker.tenants().await? {
+        for tenant in tenants {
+            if self
+                .ownership
+                .as_ref()
+                .is_some_and(|ownership| ownership.epoch_of(&tenant).is_none())
+            {
+                continue;
+            }
             match self.lock(&tenant).await {
                 Ok(mut held) => {
                     if keys_ready && self.ensure_keys(&tenant, &mut held).await.is_err() {
@@ -441,6 +520,17 @@ impl Engine {
         held: &mut TenantState,
         mut envelope: Envelope,
     ) -> Result<Published, ApiError> {
+        // The last check before a write: a server whose time to serve the
+        // tenant has run out, or that has it again at another epoch than the
+        // state was built at, writes nothing, however it got here.
+        if let Some(ownership) = &self.ownership
+            && ownership.epoch_of(&envelope.tenant) != Some(held.owner_epoch)
+        {
+            return Err(ApiError::Unavailable(format!(
+                "tenant {} is served by another mansio-server; try again",
+                envelope.tenant
+            )));
+        }
         self.broker.ensure_tenant(&envelope.tenant).await?;
         self.broker
             .ensure_topic(&envelope.tenant, &envelope.topic)
@@ -1009,6 +1099,14 @@ impl Engine {
         };
         for (tenant, cell) in cells {
             let mut held = Arc::clone(&cell).lock_owned().await;
+            // A tenant another server owns is not this one's to expire, to
+            // retry or to snapshot.
+            if let Some(ownership) = &self.ownership {
+                match ownership.epoch_of(&tenant) {
+                    Some(epoch) => see_owner(&mut held, epoch),
+                    None => continue,
+                }
+            }
             if !held.loaded
                 && let Err(error) = self.load(&tenant, &mut held).await
             {
@@ -1049,8 +1147,52 @@ impl Engine {
             interval.tick().await;
             if !self.discovered.load(Ordering::Acquire) {
                 self.try_recover(&mut retry).await;
+            } else {
+                self.keep_ownership().await;
             }
             self.tick().await;
+        }
+    }
+
+    /// With servers sharing a broker: renew the tenants this server owns, take
+    /// the ones nobody does, and take up the state of any it has just got.
+    /// Done every quarter of `MANSIO_OWNER_TTL_SECONDS`.
+    async fn keep_ownership(&self) {
+        let Some(ownership) = &self.ownership else {
+            return;
+        };
+        if !ownership.due() {
+            return;
+        }
+        let tenants = match self.broker.tenants().await {
+            Ok(tenants) => tenants,
+            Err(error) => {
+                debug!(?error, "the tenants could not be listed to renew them");
+                self.tracked_tenant_ids()
+            }
+        };
+        ownership.maintain(&tenants, false).await;
+        for tenant in tenants {
+            if ownership.epoch_of(&tenant).is_some()
+                && let Err(error) = self.lock(&tenant).await
+            {
+                warn!(%tenant, ?error, "the state could not be rebuilt");
+            }
+        }
+    }
+
+    /// The tenants the engine holds state for.
+    fn tracked_tenant_ids(&self) -> Vec<TenantId> {
+        let tenants = self.tenants.lock().unwrap_or_else(PoisonError::into_inner);
+        tenants.keys().cloned().collect()
+    }
+
+    /// Give up every tenant this server owns, so that another server takes
+    /// them at once and not when the time runs out. Called when the server
+    /// stops, after it has stopped serving.
+    pub async fn release_ownership(&self) {
+        if let Some(ownership) = &self.ownership {
+            ownership.release_all().await;
         }
     }
 
@@ -1366,6 +1508,17 @@ fn note_published(held: &mut TenantState, topic: &Topic, offset: Option<u64>) {
             covered.insert(topic.clone(), offset.saturating_add(1));
         }
         _ => held.covered = None,
+    }
+}
+
+/// Note the epoch at which this server owns the tenant. A state built at
+/// another epoch may be missing what the other server did, so it is built
+/// again, and so are the idempotency keys.
+fn see_owner(held: &mut TenantState, epoch: u64) {
+    if held.owner_epoch != epoch {
+        held.owner_epoch = epoch;
+        held.loaded = false;
+        held.keys_loaded = false;
     }
 }
 

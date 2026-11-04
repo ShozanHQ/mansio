@@ -34,12 +34,14 @@
 #   MANSIO_IGGY_SEGMENT_SIZE_BYTES, MANSIO_RETENTION_ALERTS_SECONDS,
 #   MANSIO_IGGY_PRESENCE_SEGMENT_SIZE_BYTES, MANSIO_RETENTION_PRESENCE_SECONDS,
 #   MANSIO_AGENT_CREDENTIAL_TTL_SECONDS, MANSIO_CREDENTIAL_RECHECK_SECONDS,
-#   MANSIO_CREDENTIAL_SWEEP_SECONDS, MANSIO_STREAM_POLL_MILLIS,
+#   MANSIO_CREDENTIAL_SWEEP_SECONDS, MANSIO_CREDENTIAL_FOLLOW_MILLIS,
+#   MANSIO_STREAM_POLL_MILLIS,
 #   MANSIO_SSE_KEEPALIVE_SECONDS, MANSIO_SSE_MAX_PER_CREDENTIAL,
 #   MANSIO_SSE_MAX, MANSIO_SHUTDOWN_GRACE_SECONDS,
 #   MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS,
 #   MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS, MANSIO_WEBHOOK_MAX_ATTEMPTS,
-#   MANSIO_WEBHOOK_TIMEOUT_SECONDS, MANSIO_WEBHOOK_URL_MAX_BYTES
+#   MANSIO_WEBHOOK_TIMEOUT_SECONDS, MANSIO_WEBHOOK_URL_MAX_BYTES,
+#   MANSIO_OWNER_TTL_SECONDS
 #
 # A webhook to a program on the host is reached from the container as
 # host.docker.internal, which the mansio-server service maps to the host.
@@ -121,7 +123,7 @@ services:
       MANSIO_IGGY_USERNAME: ${MANSIO_IGGY_USERNAME:-mansio}
       MANSIO_IGGY_PASSWORD: ${MANSIO_IGGY_PASSWORD:-mansio-dev-admin}
 
-  mansio-server:
+  mansio-server: &mansio-server
     build: *mansio-build
     image: mansio-server:dev
     restart: unless-stopped
@@ -157,6 +159,7 @@ services:
       MANSIO_AGENT_CREDENTIAL_TTL_SECONDS: ${MANSIO_AGENT_CREDENTIAL_TTL_SECONDS:-}
       MANSIO_CREDENTIAL_RECHECK_SECONDS: ${MANSIO_CREDENTIAL_RECHECK_SECONDS:-}
       MANSIO_CREDENTIAL_SWEEP_SECONDS: ${MANSIO_CREDENTIAL_SWEEP_SECONDS:-}
+      MANSIO_CREDENTIAL_FOLLOW_MILLIS: ${MANSIO_CREDENTIAL_FOLLOW_MILLIS:-}
       MANSIO_STREAM_POLL_MILLIS: ${MANSIO_STREAM_POLL_MILLIS:-}
       MANSIO_SSE_KEEPALIVE_SECONDS: ${MANSIO_SSE_KEEPALIVE_SECONDS:-}
       MANSIO_SSE_MAX_PER_CREDENTIAL: ${MANSIO_SSE_MAX_PER_CREDENTIAL:-}
@@ -167,6 +170,7 @@ services:
       MANSIO_WEBHOOK_MAX_ATTEMPTS: ${MANSIO_WEBHOOK_MAX_ATTEMPTS:-}
       MANSIO_WEBHOOK_TIMEOUT_SECONDS: ${MANSIO_WEBHOOK_TIMEOUT_SECONDS:-}
       MANSIO_WEBHOOK_URL_MAX_BYTES: ${MANSIO_WEBHOOK_URL_MAX_BYTES:-}
+      MANSIO_OWNER_TTL_SECONDS: ${MANSIO_OWNER_TTL_SECONDS:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -182,6 +186,25 @@ services:
       # /healthz is dark until it has. Failures in this period do not count.
       start_period: ${MANSIO_HEALTH_START_PERIOD:-60s}
 
+  # A second server on the same Iggy, to share tenants with the first: run
+  # both with MANSIO_OWNER_TTL_SECONDS set, and start this one with
+  #
+  #   docker compose --profile ha up --build --wait
+  #
+  # It has a sink and snapshots of its own, and listens on host port 7071.
+  mansio-server-b:
+    <<: *mansio-server
+    profiles: ["ha"]
+    # A server that is killed stays down, so that the run shows the other
+    # taking its tenants. One that came back would be a new identity that waits
+    # out the ttl all the same.
+    restart: "no"
+    ports:
+      - "127.0.0.1:7071:7070"
+    volumes:
+      - sink-b:/data
+
 volumes:
   iggy-data:
   sink:
+  sink-b:

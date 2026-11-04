@@ -451,6 +451,7 @@ async fn the_settings_are_served_and_need_the_token() -> anyhow::Result<()> {
     assert!(settings.agent_credential_ttl_seconds >= 1);
     assert!(settings.credential_recheck_seconds >= 1);
     assert!(settings.credential_sweep_seconds >= 1);
+    assert!(settings.credential_follow_millis >= 1);
 
     let uri = format!("{}/v1/settings", target.base);
     let (status, body) = target.call(Method::GET, &uri, None, None).await?;
@@ -475,9 +476,11 @@ async fn the_settings_are_served_and_need_the_token() -> anyhow::Result<()> {
         "idempotency_max_keys",
         "recovery_log_seconds",
         "snapshot_interval_seconds",
+        "owner_ttl_seconds",
         "agent_credential_ttl_seconds",
         "credential_recheck_seconds",
         "credential_sweep_seconds",
+        "credential_follow_millis",
     ] {
         assert!(keys.contains(key), "{key} in {body}");
     }
