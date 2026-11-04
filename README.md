@@ -162,13 +162,15 @@ and you can check that before you run it. You need the
 An archive (the attestation covers the archive, which holds the binary) has a build provenance attestation:
 
 ```sh
-gh attestation verify mansio-aarch64-apple-darwin.tar.xz --repo ShozanHQ/mansio
+gh attestation verify mansio-aarch64-apple-darwin.tar.xz --repo ShozanHQ/mansio \
+  --signer-workflow ShozanHQ/mansio/.github/workflows/release.yml
 ```
 
 So does the image, by tag or by digest:
 
 ```sh
-gh attestation verify oci://ghcr.io/shozanhq/mansio-server:0.1.0 --repo ShozanHQ/mansio
+gh attestation verify oci://ghcr.io/shozanhq/mansio-server:0.1.0 --repo ShozanHQ/mansio \
+  --signer-workflow ShozanHQ/mansio/.github/workflows/release.yml
 ```
 
 The image is also signed with cosign, keyless, and carries its CycloneDX SBOM as
@@ -1236,8 +1238,9 @@ pinned release. It reports and never blocks.
 `.github/workflows/release.yml` runs on every push to `main`.
 [release-plz](https://release-plz.dev) keeps a release pull request open with the
 version bumps and the `CHANGELOG.md` (configured in `release-plz.toml`). Merging
-it starts the jobs in the `release` environment, which the owner approves twice:
-once for `publish`, then once for `binaries` and `image`, which start after it.
+it starts the jobs in the `release` environment, which the owner approves three
+times: for `publish`, for `tag`, then for `binaries` and `image`, which start
+after them. Only `tag` holds the tag signing key, and it compiles nothing.
 Only the merge of release-plz's own pull request (head branch `release-plz-*`,
 opened by `github-actions[bot]`) starts them; a pull request titled
 "chore: release" by anyone else does not. The jobs
@@ -1252,7 +1255,9 @@ The first release needs a one-time setup by the owner, which is still pending:
 1. Make an SSH signing key. Put the private key in the `release` environment as
    the secret `TAG_SIGNING_KEY`, and commit the public half as
    `.github/release-signers` (`release@users.noreply.github.com ssh-ed25519 ...`).
-   `publish` fails until both exist.
+   Without the file the `version` job fails before anything is published;
+   without the secret `tag` fails after the crates are published, and the
+   release has no tag, archives, image or GitHub release.
 2. Give the `release` environment required reviewers.
 3. While the first release pull request (which carries 0.1.0) is open, publish
    0.1.0 of each crate by hand from its branch, since a crate that does not
@@ -1262,6 +1267,10 @@ The first release needs a one-time setup by the owner, which is still pending:
 4. Merge the release pull request. `release-plz release` finds 0.1.0 already
    published and skips it, and the workflow tags `v0.1.0`, builds the archives
    and the image, and creates the release. The examples above use that version.
+5. After the first image push, make the `mansio-server` package public (GitHub,
+   the organisation's packages, package settings). A new ghcr.io package is
+   private by default, and until it is public `docker pull` and every image
+   check in "Verify a release" fail for anyone but the owner.
 
 Until 0.1.0 is on crates.io the `semver`
 check of `ci.yml` is skipped; after it, it compares the library crates with the

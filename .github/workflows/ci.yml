@@ -15,6 +15,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  SEMVER_CHECKS_VERSION: "0.44.0"
 
 jobs:
   check:
@@ -92,7 +93,7 @@ jobs:
       - name: cargo-semver-checks
         if: steps.published.outputs.published == 'true'
         run: |
-          cargo install cargo-semver-checks --locked --version 0.44.0
+          cargo install cargo-semver-checks --locked --version "$SEMVER_CHECKS_VERSION"
           cargo semver-checks -p mansio-core -p mansio-iggy -p mansio-server
 
   # The guarantee (README, "The guarantee"): a consumer killed while idle, and

@@ -7,9 +7,9 @@ name: release
 #   the rest     when the pushed commit is the merge of that pull request, the
 #                jobs in the `release` environment publish the crates, tag the
 #                commit, build the archives and the image, and attest them. The
-#                environment waits for the owner's approval twice: for
-#                `publish`, then for `binaries` and `image`, which start after
-#                it.
+#                environment waits for the owner's approval three times: for
+#                `publish`, for `tag`, then for `binaries` and `image`, which
+#                start after them.
 #
 # One-time setup, outside the repository, pending until the first release (the
 # README, "Releases", gives the order):
@@ -21,8 +21,11 @@ name: release
 #     `TAG_SIGNING_KEY`: an SSH private key that signs the release tag. Its
 #     public half is committed as `.github/release-signers`, in the
 #     allowed-signers format (`release@users.noreply.github.com ssh-ed25519 ...`).
-#     The owner makes the key and commits the file; `publish` fails until both
-#     exist.
+#     The owner makes the key and commits the file; `version` fails before
+#     anything is published while the file is missing, and `tag` fails without
+#     the secret, after the crates are published.
+#   - the `mansio-server` package on ghcr.io is made public after the first
+#     image push, or nobody else can pull or verify the image.
 #
 # The release pull request is opened with the workflow's token, so GitHub does
 # not start the checks on it: close and reopen it to run them.
@@ -32,10 +35,6 @@ on:
     branches: [main]
 
 permissions: {}
-
-concurrency:
-  group: release
-  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -47,12 +46,21 @@ env:
   # the repository's Actions policy does not allow.
   RELEASE_PLZ_VERSION: "0.4.3"
   RELEASE_PLZ_SHA256: 4a4cfa92ea2abaee02b40daa596a95ca2725816a6a32cb03a8f48ddead287681
+  # Built from crates.io with --locked. DIST_VERSION must equal
+  # cargo-dist-version in dist-workspace.toml; the step that installs it checks.
+  DIST_VERSION: "0.30.0"
+  CYCLONEDX_VERSION: "0.5.7"
 
 jobs:
   release-pr:
     name: release pull request
     if: "!startsWith(github.event.head_commit.message, 'chore: release')"
     runs-on: ubuntu-24.04
+    # A newer push replaces a pending run: the release pull request is rebuilt
+    # from the newest main anyway. The release jobs have groups of their own.
+    concurrency:
+      group: release-pr
+      cancel-in-progress: true
     permissions:
       contents: write
       pull-requests: write
@@ -96,6 +104,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Nothing is published while the tag's trust anchor is missing: `tag`
+      # would fail after the crates were on crates.io.
+      - name: The tag's trust anchor is committed
+        run: '[ -s .github/release-signers ] || { echo "::error::.github/release-signers is missing or empty; the one-time setup is not done"; exit 1; }'
       - name: Install the toolchain pinned in rust-toolchain.toml
         run: rustup toolchain install
       - name: Read the version of the mansio package
@@ -107,19 +119,21 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
   # Publishes the crates with a token that crates.io exchanges for this run's
-  # OIDC identity (trusted publishing): no token is stored. Then tags the
-  # commit with an annotated tag signed with the environment's SSH key, and
-  # checks the signature with git against `.github/release-signers`.
+  # OIDC identity (trusted publishing): no token is stored. It compiles the
+  # crates and their dependencies, so it holds no repository write access and
+  # no signing key; the `tag` job holds the key and compiles nothing.
   publish:
-    name: publish crates and tag
+    name: publish crates
     needs: prepare
     runs-on: ubuntu-24.04
     environment: release
+    # Keyed by the commit, so a later push cannot replace a pending release.
+    concurrency:
+      group: release-publish-${{ github.sha }}
+      cancel-in-progress: false
     permissions:
-      contents: write
+      contents: read
       id-token: write
-    env:
-      VERSION: ${{ needs.prepare.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -127,13 +141,6 @@ jobs:
           persist-credentials: false
       - name: Install the toolchain pinned in rust-toolchain.toml
         run: rustup toolchain install
-      # Fail before anything is published when the tag cannot be signed.
-      - name: Check the tag signing setup
-        env:
-          TAG_SIGNING_KEY: ${{ secrets.TAG_SIGNING_KEY }}
-        run: |
-          [ -s .github/release-signers ] || { echo "::error::.github/release-signers is missing"; exit 1; }
-          [ -n "$TAG_SIGNING_KEY" ] || { echo "::error::the release environment has no TAG_SIGNING_KEY secret"; exit 1; }
       - name: Exchange the OIDC identity of this run for a crates.io token
         id: crates
         run: |
@@ -149,10 +156,11 @@ jobs:
           echo "token=$token" >> "$GITHUB_OUTPUT"
       - name: Install release-plz, checked against its pinned checksum
         uses: ./.github/actions/release-plz
+      # release-plz neither tags nor makes a release (release-plz.toml), so it
+      # needs no GitHub token.
       - name: Publish the crates
         run: release-plz release
         env:
-          GITHUB_TOKEN: ${{ github.token }}
           CARGO_REGISTRY_TOKEN: ${{ steps.crates.outputs.token }}
       - name: The token has done its work
         if: always() && steps.crates.outputs.token != ''
@@ -162,6 +170,27 @@ jobs:
           curl -sS -X DELETE -H "Authorization: Bearer $CRATES_TOKEN" \
             -H 'User-Agent: mansio-release (https://github.com/ShozanHQ/mansio)' \
             https://crates.io/api/v1/trusted_publishing/tokens || true
+
+  # Tags the commit with an annotated tag signed with the environment's SSH
+  # key, and checks the signature with git against `.github/release-signers`.
+  # A fresh checkout, nothing compiled and no third-party code run, so the key
+  # is never in the same job as a build script.
+  tag:
+    name: signed tag
+    needs: [prepare, publish]
+    runs-on: ubuntu-24.04
+    environment: release
+    concurrency:
+      group: release-tag-${{ github.sha }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Tag the commit with a signed annotated tag
         env:
           GH_TOKEN: ${{ github.token }}
@@ -200,9 +229,12 @@ jobs:
 
   binaries:
     name: mansio ${{ matrix.target }}
-    needs: [prepare, publish]
+    needs: [prepare, publish, tag]
     runs-on: ${{ matrix.os }}
     environment: release
+    concurrency:
+      group: release-binaries-${{ matrix.target }}-${{ github.sha }}
+      cancel-in-progress: false
     timeout-minutes: 60
     permissions:
       contents: read
@@ -229,11 +261,13 @@ jobs:
           persist-credentials: false
       - name: Install the toolchain pinned in rust-toolchain.toml
         run: rustup toolchain install
-      # The version is written once, in dist-workspace.toml.
+      # dist reads its own version from dist-workspace.toml; this step checks
+      # that it is DIST_VERSION.
       - name: Install cargo-dist
         run: |
-          dist_version="$(sed -n 's/^cargo-dist-version *= *"\(.*\)"/\1/p' dist-workspace.toml)"
-          cargo install cargo-dist --locked --version "$dist_version"
+          in_toml="$(sed -n 's/^cargo-dist-version *= *"\(.*\)"/\1/p' dist-workspace.toml)"
+          [ "$in_toml" = "$DIST_VERSION" ] || { echo "::error::dist-workspace.toml has cargo-dist $in_toml, the workflow $DIST_VERSION"; exit 1; }
+          cargo install cargo-dist --locked --version "$DIST_VERSION"
       - name: Build the archive
         run: dist build --tag "v$VERSION" --artifacts=local --target "$TARGET"
       - name: Attest the build provenance of the archive
@@ -258,9 +292,12 @@ jobs:
 
   image:
     name: mansio-server image
-    needs: [prepare, publish]
+    needs: [prepare, publish, tag]
     runs-on: ubuntu-24.04
     environment: release
+    concurrency:
+      group: release-image-${{ github.sha }}
+      cancel-in-progress: false
     timeout-minutes: 120
     permissions:
       contents: read
@@ -281,7 +318,7 @@ jobs:
       # not list the packages of the base image.
       - name: Make the CycloneDX SBOM
         run: |
-          cargo install cargo-cyclonedx --locked --version 0.5.7
+          cargo install cargo-cyclonedx --locked --version "$CYCLONEDX_VERSION"
           cargo cyclonedx --manifest-path crates/mansio-server/Cargo.toml \
             --format json --spec-version 1.5 --override-filename sbom
           mv crates/mansio-server/sbom.json "mansio-server-$VERSION.cdx.json"
@@ -348,7 +385,7 @@ jobs:
   # leaves a tag and published crates but no release to install from.
   github-release:
     name: GitHub release
-    needs: [prepare, publish, binaries, image]
+    needs: [prepare, publish, tag, binaries, image]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
