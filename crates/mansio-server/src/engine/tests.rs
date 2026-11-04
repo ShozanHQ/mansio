@@ -2787,3 +2787,112 @@ async fn a_recovery_that_keeps_failing_is_logged_once_per_interval_and_backs_off
         RecoveryAttempt::Recovered
     );
 }
+
+/// Seed a tenant with `n` open items (a third claimable, a third leased and a
+/// third in backoff, all with nothing due) and `n / 10` alerts, directly in
+/// the engine's state.
+fn seed_idle_tenant(engine: &Engine, n: usize) {
+    let mut state = TenantState {
+        loaded: true,
+        keys_loaded: true,
+        ..TenantState::default()
+    };
+    let far = START + 3_600_000;
+    for i in 0..n {
+        let id = EventId::generate();
+        let item: ItemId = id.to_string().parse().unwrap();
+        let phase = match i % 3 {
+            0 => Phase::Ready,
+            1 => Phase::Leased(Lease {
+                fingerprint: LeaseId::generate().fingerprint(),
+                id: None,
+                holder: agent("worker"),
+                consumer: consumer("w1"),
+                expires_at: far + i64::try_from(i).unwrap(),
+                claimed_at: START,
+            }),
+            _ => Phase::Backoff {
+                due: far + i64::try_from(i).unwrap(),
+                next: Next::Retry,
+            },
+        };
+        state
+            .queue_mut(&queue())
+            .insert(item, item_envelope(id, "bench"), phase);
+    }
+    for _ in 0..n / 10 {
+        state.alerts.insert(EventId::generate(), START);
+    }
+    engine
+        .tenants
+        .lock()
+        .unwrap()
+        .insert(tenant(), Arc::new(Mutex::new(state)));
+}
+
+/// A tick with nothing due finds nothing through the due-time indexes and
+/// looks at one entry per index, with 100k open items: a return to scanning
+/// the items would raise the count.
+#[tokio::test]
+async fn a_tick_with_nothing_due_does_constant_work_at_100k_open_items() {
+    let rig = Rig::new();
+    seed_idle_tenant(&rig.engine, 100_000);
+    let cell = rig
+        .engine
+        .tenants
+        .lock()
+        .unwrap()
+        .get(&tenant())
+        .cloned()
+        .unwrap();
+    let mut held = cell.lock_owned().await;
+    let now = rig.clock.now_millis();
+    let (tasks, looked) = rig.engine.due_counted(&held, now);
+    assert!(tasks.is_empty());
+    // Leases and backoffs of the one queue, and the alerts.
+    assert_eq!(looked, 3);
+    rig.engine.tick_tenant(&mut held, &tenant()).await;
+}
+
+/// Tick time and lock hold time of a tick with nothing due, at three queue
+/// depths. Run with
+/// `cargo test -p mansio-server --release -- --ignored --nocapture tick_benchmark`.
+#[tokio::test]
+#[ignore = "a benchmark: run it by name"]
+async fn tick_benchmark() {
+    use std::time::Instant;
+    const TICKS: u32 = 50;
+    for n in [1_000, 10_000, 100_000] {
+        let rig = Rig::new();
+        seed_idle_tenant(&rig.engine, n);
+        rig.engine.tick().await;
+        let started = Instant::now();
+        for _ in 0..TICKS {
+            rig.engine.tick().await;
+        }
+        let tick = started.elapsed() / TICKS;
+
+        // The tick's critical section: the tenant lock, held from taking it
+        // to the end of the pass.
+        let cell = rig
+            .engine
+            .tenants
+            .lock()
+            .unwrap()
+            .get(&tenant())
+            .cloned()
+            .unwrap();
+        let mut hold = Duration::ZERO;
+        for _ in 0..TICKS {
+            let mut held = cell.clone().lock_owned().await;
+            let taken = Instant::now();
+            rig.engine.tick_tenant(&mut held, &tenant()).await;
+            hold += taken.elapsed();
+        }
+        println!(
+            "open_items={n} tick_nanos={} lock_hold_nanos={}",
+            tick.as_nanos(),
+            (hold / TICKS).as_nanos()
+        );
+    }
+}

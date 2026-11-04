@@ -5,6 +5,24 @@ All notable changes to mansio are listed here. The format follows
 
 ## Unreleased
 
+### Changed
+
+- The timer finds due leases, retries, owed facts and resurfacing alerts
+  through a due-time index instead of scanning every open item and alert, so
+  a tick with nothing due does constant work and holds the tenant lock for
+  the same short time at any queue depth Mean time per tick with nothing
+  due, one tenant, release build, from `tick_benchmark`
+  (`cargo test -p mansio-server --release -- --ignored --nocapture tick_benchmark`);
+  the lock hold is the tenant lock held across the tick's pass:
+
+  | Open items | Tick before | Tick after | Lock hold before | Lock hold after |
+  | ---------- | ----------- | ---------- | ---------------- | --------------- |
+  | 1k         | 1.4 µs      | 0.13 µs    | 1.3 µs           | 0.05 µs         |
+  | 10k        | 26 µs       | 0.8 µs     | 13 µs            | 0.06 µs         |
+  | 100k       | 1120 µs     | 0.08 µs    | 1025 µs          | 0.07 µs         |
+
+  "Before" is origin/main with the same benchmark; "after" is this change.
+
 ### Added
 
 - `MANSIO_SSE_MAX_PER_CREDENTIAL` (default 10) and `MANSIO_SSE_MAX` (default

@@ -46,7 +46,7 @@ use crate::records;
 use crate::recover;
 use crate::settings::WorkSettings;
 pub use crate::state::Holder;
-use crate::state::{Item, Lease, Phase, Remembered, TenantState, Then, backoff, held_lease};
+use crate::state::{Due, Item, Lease, Phase, Remembered, TenantState, Then, backoff, held_lease};
 
 type Held = OwnedMutexGuard<TenantState>;
 
@@ -269,7 +269,7 @@ impl Engine {
             }
         }
         state.queues = rebuilt.queues;
-        state.alerts = alerts;
+        state.alerts = alerts.into();
         state.acknowledged_alerts = rebuilt.acknowledged_alerts;
         state.loaded = true;
         Ok(())
@@ -907,11 +907,16 @@ impl Engine {
                 warn!(%tenant, ?error, "the state could not be rebuilt");
                 continue;
             }
-            let now = self.clock.now_millis();
-            held.keys
-                .prune(now, millis(self.settings.idempotency_window));
-            self.process_due(&mut held, &tenant, now).await;
+            self.tick_tenant(&mut held, &tenant).await;
         }
+    }
+
+    /// One tenant's share of a tick, run under its lock.
+    async fn tick_tenant(&self, held: &mut TenantState, tenant: &TenantId) {
+        let now = self.clock.now_millis();
+        held.keys
+            .prune(now, millis(self.settings.idempotency_window));
+        self.process_due(held, tenant, now).await;
     }
 
     /// Run the timer until the task is dropped or aborted: take up the
@@ -970,31 +975,36 @@ impl Engine {
     /// leases that ran out, oldest first, then items whose backoff is over or
     /// that owe a fact, then alerts to surface again.
     fn due(&self, held: &TenantState, now: i64) -> Vec<Task> {
+        self.due_counted(held, now).0
+    }
+
+    /// [`Engine::due`] and how many index entries it looked at: the due ones
+    /// and at most one more per index, so a tick with nothing due does the
+    /// same work at any queue depth.
+    fn due_counted(&self, held: &TenantState, now: i64) -> (Vec<Task>, usize) {
         let mut due: Vec<(u8, i64, Task)> = Vec::new();
-        for (queue, items) in &held.queues {
-            for (id, item) in items.iter() {
-                match &item.phase {
-                    Phase::Leased(lease) if lease.expires_at <= now => {
-                        due.push((0, lease.expires_at, Task::Expire(queue.clone(), id.clone())))
-                    }
-                    Phase::Backoff { due: at, .. } if *at <= now => {
-                        due.push((1, *at, Task::Advance(queue.clone(), id.clone())));
-                    }
-                    Phase::Owed { .. } => {
-                        due.push((1, now, Task::Advance(queue.clone(), id.clone())));
-                    }
-                    _ => {}
-                }
-            }
+        let mut looked = 0;
+        let mut items = Vec::new();
+        for (queue, items_of) in &held.queues {
+            items.clear();
+            looked += items_of.due(now, &mut items);
+            due.extend(items.drain(..).map(|(kind, at, id)| match kind {
+                Due::Lease => (0, at, Task::Expire(queue.clone(), id)),
+                Due::Advance => (1, at, Task::Advance(queue.clone(), id)),
+            }));
         }
         let interval = millis(self.settings.alert_resurface);
-        for (alert, surfaced_at) in &held.alerts {
-            if surfaced_at.saturating_add(interval) <= now {
-                due.push((2, *surfaced_at, Task::Resurface(*alert)));
-            }
-        }
+        let mut alerts = Vec::new();
+        looked += held
+            .alerts
+            .surfaced_by(now.saturating_sub(interval), &mut alerts);
+        due.extend(
+            alerts
+                .into_iter()
+                .map(|(at, alert)| (2, at, Task::Resurface(alert))),
+        );
         due.sort();
-        due.into_iter().map(|(_, _, task)| task).collect()
+        (due.into_iter().map(|(_, _, task)| task).collect(), looked)
     }
 
     /// Do what is due in a tenant.
@@ -1052,8 +1062,8 @@ impl Engine {
             &data,
         )?;
         self.append(held, fact).await?;
-        if let Some(surfaced_at) = held.alerts.get_mut(&alert) {
-            *surfaced_at = now;
+        if held.alerts.contains_key(&alert) {
+            held.alerts.insert(alert, now);
         }
         debug!(%tenant, %alert, "alert surfaced again");
         Ok(())
