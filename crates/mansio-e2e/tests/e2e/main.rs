@@ -99,6 +99,56 @@ async fn a_published_envelope_is_polled_back_with_every_field_intact() -> anyhow
     Ok(())
 }
 
+/// The raw text of the first `data` member in a JSON document, up to the
+/// closing brace of its object.
+fn raw_data(text: &str) -> anyhow::Result<&str> {
+    let start = text.find("\"data\":").context("the document has no data")? + "\"data\":".len();
+    let rest = &text[start..];
+    let end = rest.find('}').context("data is not closed")? + 1;
+    Ok(&rest[..end])
+}
+
+#[tokio::test]
+async fn numbers_in_data_come_back_exactly_as_published() -> anyhow::Result<()> {
+    const DATA: &str = r#"{"big":123456789012345678901234567890,"exp":1e2,"long":0.1234567890123456789012345678901234567890}"#;
+    let target = Target::start().await?;
+    let id = EventId::generate().to_string();
+    let body = format!(
+        r#"{{"id":"{id}","source":"e2e","type":"e2e.numbers","datacontenttype":"application/json","data":{DATA}}}"#
+    );
+
+    let response = target
+        .http
+        .post(target.messages_uri("facts.numbers"))
+        .bearer_auth(&target.token)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await?;
+    ensure!(
+        response.status() == StatusCode::CREATED,
+        "publish answered {}",
+        response.status()
+    );
+    let published = response.text().await?;
+    assert_eq!(raw_data(&published)?, DATA);
+
+    let response = target
+        .http
+        .get(format!("{}?offset=0", target.messages_uri("facts.numbers")))
+        .bearer_auth(&target.token)
+        .send()
+        .await?;
+    ensure!(
+        response.status() == StatusCode::OK,
+        "poll answered {}",
+        response.status()
+    );
+    let polled = response.text().await?;
+    assert_eq!(raw_data(&polled)?, DATA);
+    Ok(())
+}
+
 #[tokio::test]
 async fn omitted_id_and_time_are_filled_in_and_kept() -> anyhow::Result<()> {
     let target = Target::start().await?;

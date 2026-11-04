@@ -15,8 +15,8 @@ use axum::{Json, Router};
 use bytes::Bytes;
 use mansio_core::api::{EffectiveSettings, Polled, Published};
 use mansio_core::{
-    Action, Broker, Envelope, EventId, NoSink, ParseError, Principal, Sink, TenantId, Timestamp,
-    Topic,
+    Action, Broker, Data, Envelope, EventId, NoSink, ParseError, Principal, Sink, TenantId,
+    Timestamp, Topic,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -610,7 +610,20 @@ pub(crate) fn build_envelope(
         principal.name.to_string().into(),
     );
 
-    Envelope::from_json_value(Value::Object(attributes)).map_err(|e| bad(e.to_string()))
+    // `data` is read again from the body as text, so its numbers are kept
+    // exactly as sent; the attributes above have already turned them into
+    // numbers.
+    #[derive(Deserialize)]
+    struct DataOnly {
+        data: Option<Data>,
+    }
+    let DataOnly { data } = serde_json::from_slice(body).map_err(|e| bad(e.to_string()))?;
+    attributes.remove("data");
+
+    let mut envelope =
+        Envelope::from_json_value(Value::Object(attributes)).map_err(|e| bad(e.to_string()))?;
+    envelope.data = data;
+    Ok(envelope)
 }
 
 async fn publish(
@@ -702,6 +715,24 @@ mod tests {
     use crate::testing::{Logs, serial};
 
     const TOKEN: &str = "test-token";
+
+    #[test]
+    fn a_built_envelope_keeps_the_numbers_in_data_as_sent() {
+        let data = r#"{"big":123456789012345678901234567890,"exp":1e2,"long":0.1234567890123456789012345678901234567890}"#;
+        let body = format!(r#"{{"source":"s","type":"t","data":{data}}}"#);
+        let envelope = build_envelope(
+            body.as_bytes(),
+            &"acme".parse().unwrap(),
+            &"facts.build".parse().unwrap(),
+            &"service:mansio".parse().unwrap(),
+            &Timestamp::from_unix_millis(1_792_000_000_000).unwrap(),
+            Origin::Message,
+        )
+        .unwrap();
+        assert_eq!(envelope.data.as_ref().unwrap().as_str(), data);
+        let stored = String::from_utf8(envelope.to_json_vec().unwrap()).unwrap();
+        assert!(stored.contains(&format!(r#""data":{data}"#)), "{stored}");
+    }
 
     fn router() -> Router {
         let auth = Auth::new(

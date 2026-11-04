@@ -26,7 +26,7 @@ iggy = "=0.11.0"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.11"
 subtle = "2"
 thiserror = "2"

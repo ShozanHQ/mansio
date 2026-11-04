@@ -82,7 +82,12 @@ async fn an_alert_is_acknowledged_once_and_the_ack_names_the_principal() -> anyh
 
     let facts = target.read("facts.alert").await?;
     assert_eq!(facts.len(), 1, "one acknowledgement, not three");
-    assert_eq!(facts[0], acked.envelope);
+    // The response went through a `Value` in the test client, which orders
+    // the keys of `data`; the same JSON, not the same text.
+    assert_eq!(
+        serde_json::to_value(&facts[0])?,
+        serde_json::to_value(&acked.envelope)?
+    );
     Ok(())
 }
 

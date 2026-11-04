@@ -467,12 +467,21 @@ impl Target {
 
     pub async fn poll(&self, topic: &str, query: &str) -> anyhow::Result<Polled> {
         let uri = format!("{}?{query}", self.messages_uri(topic));
-        let (status, response) = self.authed(Method::GET, &uri, None).await?;
+        let (status, bytes) = self.get_bytes(&uri).await?;
         ensure!(
             status == StatusCode::OK,
-            "poll answered {status}: {response}"
+            "poll answered {status}: {}",
+            String::from_utf8_lossy(&bytes)
         );
-        Ok(serde_json::from_value(response)?)
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    /// A GET with the right token, answering the body as it came, so `data`
+    /// is not rewritten by a trip through a `Value`.
+    async fn get_bytes(&self, uri: &str) -> anyhow::Result<(StatusCode, Vec<u8>)> {
+        let response = self.http.get(uri).bearer_auth(&self.token).send().await?;
+        let status = response.status();
+        Ok((status, response.bytes().await?.to_vec()))
     }
 
     /// Everything in a topic, in order. A topic nobody has published to is
@@ -483,15 +492,16 @@ impl Target {
         loop {
             let query = format!("offset={offset}&count={}", self.settings.poll_max_count);
             let uri = format!("{}?{query}", self.messages_uri(topic));
-            let (status, response) = self.authed(Method::GET, &uri, None).await?;
+            let (status, bytes) = self.get_bytes(&uri).await?;
             if status == StatusCode::NOT_FOUND {
                 return Ok(all);
             }
             ensure!(
                 status == StatusCode::OK,
-                "poll answered {status}: {response}"
+                "poll answered {status}: {}",
+                String::from_utf8_lossy(&bytes)
             );
-            let page: Polled = serde_json::from_value(response)?;
+            let page: Polled = serde_json::from_slice(&bytes)?;
             let Some(last) = page.messages.last() else {
                 return Ok(all);
             };
