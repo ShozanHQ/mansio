@@ -12,6 +12,7 @@ cargo-fuzz = true
 
 # Not a member of the root workspace: libFuzzer needs a nightly compiler, and
 # the workspace builds on the pinned stable one. Its lockfile, fuzz/Cargo.lock, is committed and CI passes --locked.
+# (Generate it with `cargo generate-lockfile` in fuzz/ whenever a dependency changes.)
 [workspace]
 
 [dependencies]
