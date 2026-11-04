@@ -1,0 +1,21 @@
+name: release-plz
+description: >-
+  Download release-plz at the version pinned in the workflow's
+  RELEASE_PLZ_VERSION and RELEASE_PLZ_SHA256, check it, and put it on PATH.
+  The repository's Actions policy does not allow the release-plz action.
+runs:
+  using: composite
+  steps:
+    - name: Download and check release-plz
+      shell: bash
+      run: |
+        : "${RELEASE_PLZ_VERSION:?set RELEASE_PLZ_VERSION in the workflow env}"
+        : "${RELEASE_PLZ_SHA256:?set RELEASE_PLZ_SHA256 in the workflow env}"
+        url="https://github.com/release-plz/release-plz/releases/download/release-plz-v${RELEASE_PLZ_VERSION}/release-plz-x86_64-unknown-linux-musl.tar.gz"
+        curl -sSfL -o release-plz.tar.gz "$url"
+        echo "$RELEASE_PLZ_SHA256  release-plz.tar.gz" | sha256sum -c - \
+          || { echo "::error::release-plz checksum mismatch"; exit 1; }
+        mkdir -p "$RUNNER_TEMP/bin"
+        tar -xzf release-plz.tar.gz -C "$RUNNER_TEMP/bin" release-plz
+        rm release-plz.tar.gz
+        echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"

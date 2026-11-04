@@ -24,6 +24,8 @@
 /rust-toolchain.toml   @snowloops
 /clippy.toml           @snowloops
 /Cargo.toml            @snowloops
+/release-plz.toml      @snowloops
+/dist-workspace.toml   @snowloops
 /Dockerfile            @snowloops
 /compose.yaml          @snowloops
 

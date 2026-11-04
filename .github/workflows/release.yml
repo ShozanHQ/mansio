@@ -1,0 +1,349 @@
+name: release
+
+# Two paths on every push to main.
+#
+#   release-pr   release-plz opens or updates the release pull request: the
+#                version bumps and the CHANGELOG.
+#   the rest     when the pushed commit is the merge of that pull request, the
+#                jobs in the `release` environment publish the crates, tag the
+#                commit, build the archives and the image, and attest them. The
+#                environment waits for the owner's approval, once, for all of
+#                them together.
+#
+# One-time setup, outside the repository:
+#   - crates.io: each published crate has this repository, workflow
+#     `release.yml` and environment `release` as a trusted publisher. The first
+#     publish of a new crate cannot use one, so 0.1.0 of each crate is
+#     published by hand once, and the trusted publisher added after.
+#   - the `release` environment has required reviewers, and a secret
+#     `TAG_SIGNING_KEY`: an SSH private key that signs the release tag. Its
+#     public half is committed as `.github/release-signers`, in the
+#     allowed-signers format (`release@users.noreply.github.com ssh-ed25519 ...`).
+#
+# The release pull request is opened with the workflow's token, so GitHub does
+# not start the checks on it: close and reopen it to run them.
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  IMAGE: ghcr.io/shozanhq/mansio-server
+  # Who may have signed and attested: this workflow, on main.
+  SIGNER: https://github.com/ShozanHQ/mansio/.github/workflows/release.yml@refs/heads/main
+  # release-plz is downloaded and checked, not run through its action, which
+  # the repository's Actions policy does not allow.
+  RELEASE_PLZ_VERSION: "0.4.3"
+  RELEASE_PLZ_SHA256: 4a4cfa92ea2abaee02b40daa596a95ca2725816a6a32cb03a8f48ddead287681
+
+jobs:
+  release-pr:
+    name: release pull request
+    if: "!startsWith(github.event.head_commit.message, 'chore: release')"
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: rustup toolchain install
+      - name: Install release-plz, checked against its pinned checksum
+        uses: ./.github/actions/release-plz
+      - name: Open or update the release pull request
+        run: release-plz release-pr
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  # The commit is the merge of the release pull request, whose title starts
+  # with "chore: release" (pr_name in release-plz.toml).
+  prepare:
+    name: version
+    if: "startsWith(github.event.head_commit.message, 'chore: release')"
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: rustup toolchain install
+      - name: Read the version of the mansio package
+        id: version
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "mansio") | .version')"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::unexpected version '$version'"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  # Publishes the crates with a token that crates.io exchanges for this run's
+  # OIDC identity (trusted publishing): no token is stored. Then tags the
+  # commit with an annotated tag signed with the environment's SSH key, and
+  # checks the signature with git against `.github/release-signers`.
+  publish:
+    name: publish crates and tag
+    needs: prepare
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: rustup toolchain install
+      # Fail before anything is published when the tag cannot be signed.
+      - name: Check the tag signing setup
+        env:
+          TAG_SIGNING_KEY: ${{ secrets.TAG_SIGNING_KEY }}
+        run: |
+          [ -s .github/release-signers ] || { echo "::error::.github/release-signers is missing"; exit 1; }
+          [ -n "$TAG_SIGNING_KEY" ] || { echo "::error::the release environment has no TAG_SIGNING_KEY secret"; exit 1; }
+      - name: Exchange the OIDC identity of this run for a crates.io token
+        id: crates
+        run: |
+          jwt="$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=crates.io" | jq -r .value)"
+          echo "::add-mask::$jwt"
+          token="$(curl -sSf -X POST -H 'Content-Type: application/json' \
+            -H 'User-Agent: mansio-release (https://github.com/ShozanHQ/mansio)' \
+            -d "$(jq -cn --arg jwt "$jwt" '{jwt: $jwt}')" \
+            https://crates.io/api/v1/trusted_publishing/tokens | jq -r .token)"
+          [ -n "$token" ] && [ "$token" != null ] || { echo "::error::crates.io gave no token"; exit 1; }
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+      - name: Install release-plz, checked against its pinned checksum
+        uses: ./.github/actions/release-plz
+      - name: Publish the crates
+        run: release-plz release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates.outputs.token }}
+      - name: The token has done its work
+        if: always() && steps.crates.outputs.token != ''
+        env:
+          CRATES_TOKEN: ${{ steps.crates.outputs.token }}
+        run: |
+          curl -sS -X DELETE -H "Authorization: Bearer $CRATES_TOKEN" \
+            -H 'User-Agent: mansio-release (https://github.com/ShozanHQ/mansio)' \
+            https://crates.io/api/v1/trusted_publishing/tokens || true
+      - name: Tag the commit with a signed annotated tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          # An SSH key held in the `release` environment, used for nothing
+          # else. Its public half is `.github/release-signers`, in the
+          # allowed-signers format, so anyone can check a tag with git.
+          TAG_SIGNING_KEY: ${{ secrets.TAG_SIGNING_KEY }}
+        run: |
+          tag="v$VERSION"
+          signers="$GITHUB_WORKSPACE/.github/release-signers"
+          [ -s "$signers" ] || { echo "::error::.github/release-signers is missing"; exit 1; }
+          [ -n "$TAG_SIGNING_KEY" ] || { echo "::error::the release environment has no TAG_SIGNING_KEY secret"; exit 1; }
+          key="$RUNNER_TEMP/tag-signing-key"
+          (umask 077; printf '%s\n' "$TAG_SIGNING_KEY" > "$key")
+          trap 'rm -f "$key"' EXIT
+          git config user.name "mansio release"
+          git config user.email "release@users.noreply.github.com"
+          git config gpg.format ssh
+          git config user.signingkey "$key"
+          git config gpg.ssh.allowedSignersFile "$signers"
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git"
+          if git ls-remote --exit-code --tags "$remote" "refs/tags/$tag" >/dev/null 2>&1; then
+            git fetch --no-tags "$remote" "refs/tags/$tag:refs/tags/$tag"
+          else
+            git tag -s "$tag" "$SHA" -m "mansio $VERSION"
+            git push "$remote" "refs/tags/$tag"
+          fi
+          # Whether it was made now or by an earlier run, it must be an
+          # annotated tag with a good signature, on this commit.
+          [ "$(git cat-file -t "refs/tags/$tag")" = tag ] || { echo "::error::$tag is not an annotated tag"; exit 1; }
+          git verify-tag "$tag"
+          [ "$(git rev-parse "$tag^{commit}")" = "$SHA" ] || { echo "::error::$tag does not point at $SHA"; exit 1; }
+          echo "tag $tag is signed and points at $SHA"
+
+  binaries:
+    name: mansio ${{ matrix.target }}
+    needs: [prepare, publish]
+    runs-on: ${{ matrix.os }}
+    environment: release
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-15, archive: tar.xz }
+          - { target: x86_64-apple-darwin, os: macos-15-intel, archive: tar.xz }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04, archive: tar.xz }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, archive: tar.xz }
+          - { target: x86_64-pc-windows-msvc, os: windows-2025, archive: zip }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # The version is written once, in dist-workspace.toml.
+      - name: Install cargo-dist
+        run: |
+          dist_version="$(sed -n 's/^cargo-dist-version *= *"\(.*\)"/\1/p' dist-workspace.toml)"
+          cargo install cargo-dist --locked --version "$dist_version"
+      - name: Build the archive
+        run: dist build --tag "v$VERSION" --artifacts=local --target "$TARGET"
+      - name: Attest the build provenance of the archive
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: target/distrib/mansio-${{ matrix.target }}.${{ matrix.archive }}
+      - name: The attestation verifies against this repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE: target/distrib/mansio-${{ matrix.target }}.${{ matrix.archive }}
+        run: |
+          gh attestation verify "$ARCHIVE" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            target/distrib/mansio-${{ matrix.target }}.${{ matrix.archive }}
+            target/distrib/mansio-${{ matrix.target }}.${{ matrix.archive }}.sha256
+          if-no-files-found: error
+
+  image:
+    name: mansio-server image
+    needs: [prepare, publish]
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      - name: Log in to ghcr.io
+        env:
+          ACTOR: ${{ github.actor }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+      - name: Build and push linux/amd64 and linux/arm64
+        id: build
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          # The attestations below are made by this workflow, not by BuildKit.
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ env.IMAGE }}:${{ env.VERSION }}
+            ${{ env.IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=Apache-2.0
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Attest the build provenance of the image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: rustup toolchain install
+      # The SBOM lists the Rust dependencies that went into the binary. It does
+      # not list the packages of the base image.
+      - name: Make the CycloneDX SBOM
+        run: |
+          cargo install cargo-cyclonedx --locked --version 0.5.7
+          cargo cyclonedx --manifest-path crates/mansio-server/Cargo.toml \
+            --format json --spec-version 1.5 --override-filename sbom
+          mv crates/mansio-server/sbom.json "mansio-server-$VERSION.cdx.json"
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+      # Keyless: the signature and the attestation are made with this run's
+      # OIDC identity and recorded in the Rekor transparency log.
+      - name: Sign the image and attest the SBOM
+        env:
+          REF: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+        run: |
+          cosign sign --yes "$REF"
+          cosign attest --yes --type cyclonedx --predicate "mansio-server-$VERSION.cdx.json" "$REF"
+      - name: The signature, the SBOM attestation and the provenance verify
+        env:
+          REF: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+        run: |
+          cosign verify "$REF" \
+            --certificate-identity "$SIGNER" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+          cosign verify-attestation "$REF" --type cyclonedx \
+            --certificate-identity "$SIGNER" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+          gh attestation verify "oci://$REF" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-sbom
+          path: mansio-server-${{ env.VERSION }}.cdx.json
+          if-no-files-found: error
+
+  # The release is made when everything before it passed, so a failed build
+  # leaves a tag and published crates but no release to install from.
+  github-release:
+    name: GitHub release
+    needs: [prepare, publish, binaries, image]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Download the archives and the SBOM
+        run: gh run download "$GITHUB_RUN_ID" --pattern 'dist-*' --dir dist
+      - name: Create the release on the signed tag
+        run: |
+          gh release create "v$VERSION" dist/*/* --verify-tag --title "v$VERSION" --generate-notes

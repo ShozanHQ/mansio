@@ -126,6 +126,72 @@ publish is also appended to `mansio-sink.jsonl`.
   written whole, but a crash or power loss can lose the most recent records.
   Leave it on in production.
 
+## Install
+
+Each release, `vX.Y.Z`, is on the
+[releases page](https://github.com/ShozanHQ/mansio/releases).
+
+The `mansio` command line, as an archive for macOS (Apple silicon and Intel),
+Linux (x86-64 and arm64) and Windows (x86-64), each with its `.sha256`:
+
+```sh
+gh release download v0.1.0 --repo ShozanHQ/mansio --pattern 'mansio-aarch64-apple-darwin.tar.xz*'
+```
+
+Or from source: `cargo install mansio --locked`.
+
+The server, as a multi-arch (linux/amd64 and linux/arm64) image:
+
+```sh
+docker pull ghcr.io/shozanhq/mansio-server:0.1.0
+```
+
+The libraries, `mansio-core`, `mansio-iggy` and `mansio-server`, are on
+[crates.io](https://crates.io/crates/mansio-core).
+
+## Verify a release
+
+Everything a release publishes was built by this repository's release workflow,
+and you can check that before you run it. You need the
+[GitHub CLI](https://cli.github.com) for the first two checks and
+[cosign](https://docs.sigstore.dev/cosign/installation/) for the others.
+
+An archive (the attestation covers the archive, which holds the binary) has a build provenance attestation:
+
+```sh
+gh attestation verify mansio-aarch64-apple-darwin.tar.xz --repo ShozanHQ/mansio
+```
+
+So does the image, by tag or by digest:
+
+```sh
+gh attestation verify oci://ghcr.io/shozanhq/mansio-server:0.1.0 --repo ShozanHQ/mansio
+```
+
+The image is also signed with cosign, keyless, and carries its CycloneDX SBOM as
+an attestation. Both name the release workflow on `main` as their signer:
+
+```sh
+signer=https://github.com/ShozanHQ/mansio/.github/workflows/release.yml@refs/heads/main
+issuer=https://token.actions.githubusercontent.com
+cosign verify ghcr.io/shozanhq/mansio-server:0.1.0 \
+  --certificate-identity "$signer" --certificate-oidc-issuer "$issuer"
+cosign verify-attestation ghcr.io/shozanhq/mansio-server:0.1.0 --type cyclonedx \
+  --certificate-identity "$signer" --certificate-oidc-issuer "$issuer"
+```
+
+The SBOM lists the Rust dependencies built into the server. It is also on the
+release as `mansio-server-X.Y.Z.cdx.json`.
+
+The tag is an annotated tag signed with an SSH key that only the `release`
+environment holds. Its public half is `.github/release-signers`, committed with the release setup.
+In a clone, this prints `Good "git" signature`:
+
+```sh
+git fetch --tags
+git -c gpg.ssh.allowedSignersFile=.github/release-signers verify-tag v0.1.0
+```
+
 ## The guarantee
 
 Work is never dropped and never done twice, for consumers that are not always
@@ -1160,6 +1226,25 @@ Dependabot moves each pin and its comment or tag together. A scheduled workflow
 (`.github/workflows/scheduled.yml`) runs `cargo deny check` daily, and every
 Monday the same end-to-end suite against `apache/iggy:edge` in place of the
 pinned release. It reports and never blocks.
+
+### Releases
+
+`.github/workflows/release.yml` runs on every push to `main`.
+[release-plz](https://release-plz.dev) keeps a release pull request open with the
+version bumps and the `CHANGELOG.md` (configured in `release-plz.toml`). Merging
+it starts the jobs in the `release` environment, which the owner approves once:
+they publish the crates to crates.io by trusted publishing (the run's OIDC
+identity, no stored token), create the signed `vX.Y.Z` tag, build the `mansio`
+archives with [cargo-dist](https://github.com/axodotdev/cargo-dist)
+(`dist-workspace.toml`), push the image, attest, sign and verify each of them,
+and create the GitHub release. crates.io needs each crate's trusted publisher
+set to this repository, the workflow `release.yml` and the environment
+`release`, and 0.1.0 of each crate published by hand once, since a crate that
+does not exist yet cannot have one. The tag needs a `TAG_SIGNING_KEY` secret
+(an SSH private key) in the `release` environment and its public half committed
+as `.github/release-signers`. Until 0.1.0 is on crates.io the `semver`
+check of `ci.yml` is skipped; after it, it compares the library crates with the
+last release on every pull request.
 
 ## Contributing and security
 

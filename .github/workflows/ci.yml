@@ -48,6 +48,43 @@ jobs:
           command: check
           arguments: --all-features --locked
 
+  # A change to the public API of a library crate that the version does not
+  # allow, against the last release on crates.io. There is nothing to compare
+  # with until 0.1.0 is published, so until then the job passes without running
+  # the check; the step that looks says which it did.
+  semver:
+    name: semver
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Is 0.1.0 published?
+        id: published
+        run: |
+          status="$(curl -s -o /dev/null -w '%{http_code}' \
+            -H 'User-Agent: mansio-ci (https://github.com/ShozanHQ/mansio)' \
+            https://crates.io/api/v1/crates/mansio-core/0.1.0)"
+          case "$status" in
+            200) echo "published=true" >> "$GITHUB_OUTPUT" ;;
+            404)
+              echo "published=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::mansio-core 0.1.0 is not on crates.io: cargo-semver-checks is skipped" ;;
+            *) echo "::error::crates.io answered HTTP $status; cannot tell whether 0.1.0 is published"; exit 1 ;;
+          esac
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        if: steps.published.outputs.published == 'true'
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: steps.published.outputs.published == 'true'
+      # The libraries only: mansio is a binary, and the other crates are not published.
+      - name: cargo-semver-checks
+        if: steps.published.outputs.published == 'true'
+        run: |
+          cargo install cargo-semver-checks --locked --version 0.44.0
+          cargo semver-checks -p mansio-core -p mansio-iggy -p mansio-server
+
   # The guarantee (README, "The guarantee"): a consumer killed while idle, and
   # one killed holding a lease, and every item done exactly once. It has a
   # compose stack of its own, so it does not wait for the e2e job.
