@@ -29,6 +29,8 @@ mod engine;
 mod error;
 mod events_api;
 mod facts;
+#[cfg(feature = "fuzzing")]
+pub mod fuzz;
 mod idempotency;
 mod ownership;
 mod principals_api;

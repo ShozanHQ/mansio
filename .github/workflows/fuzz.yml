@@ -1,0 +1,189 @@
+name: fuzz
+
+# Fuzzing of every decoder of untrusted input (fuzz/, CONTRIBUTING.md, "Fuzzing"):
+# the envelope, each request body of the HTTP API, and each record replayed
+# from the broker on start. One libFuzzer run per target, a few minutes each,
+# seeded from fuzz/corpus.
+#
+# It reports and never blocks. continue-on-error keeps a crash from failing the
+# run, and so from failing a pull request. A crash is uploaded as an artifact
+# named fuzz-crash-<target>, written to the run's summary and, outside a pull
+# request, opened as an issue labelled fuzz. The fix is a change that adds the
+# input to fuzz/regressions/<target>/, where `cargo test` replays it.
+#
+# Pull requests that touch the decoders run it, and scheduled.yml calls it
+# weekly with a longer run.
+
+on:
+  pull_request:
+    paths:
+      - "fuzz/**"
+      - "crates/mansio-core/src/**"
+      - "crates/mansio-server/src/**"
+      - "crates/mansio-iggy/src/**"
+      - "Cargo.lock"
+      - "fuzz/Cargo.lock"
+      - ".github/workflows/fuzz.yml"
+  workflow_call:
+    inputs:
+      seconds:
+        description: Seconds of fuzzing per target.
+        type: number
+        default: 300
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds of fuzzing per target.
+        type: number
+        default: 180
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # A nightly is needed for libFuzzer's sanitizer. Pinned to a date, so that a
+  # new nightly does not change what a run finds.
+  FUZZ_TOOLCHAIN: nightly-2026-10-15
+  CARGO_FUZZ_VERSION: 0.13.1
+  # Seconds of fuzzing per target: the input, or three minutes on a pull request.
+  SECONDS_PER_TARGET: ${{ inputs.seconds || 180 }}
+
+jobs:
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - envelope
+          - body_publish
+          - body_work_item
+          - body_principal
+          - body_webhook
+          - body_commit
+          - body_pull
+          - body_extend
+          - body_ack
+          - body_fail
+          - record_principal
+          - record_cursor
+          - record_webhook
+          - record_idempotency
+          - record_ownership
+          - record_snapshot
+          - record_work_fact
+          - record_alert_fact
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain pinned in rust-toolchain.toml, and the nightly for libFuzzer
+        run: |
+          rustup toolchain install
+          rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            . -> target
+            fuzz -> target
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+      - name: Fuzz ${{ matrix.target }}
+        id: fuzz
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          # An input is at most 1 MiB, the default of the server's
+          # MANSIO_MAX_BODY_BYTES setting (settings.rs, max_body_bytes), and
+          # a run that holds more than 2 GiB has an unbounded allocation.
+          status=0
+          cargo "+$FUZZ_TOOLCHAIN" fuzz run --locked "$TARGET" -- \
+            "-max_total_time=$SECONDS_PER_TARGET" -max_len=1048576 -rss_limit_mb=2048 || status=$?
+          # A crash leaves its input in fuzz/artifacts/<target>/. A non-zero
+          # status without one is a build or setup failure, not a crash.
+          crashed=false
+          state=clean
+          if compgen -G "fuzz/artifacts/$TARGET/*" >/dev/null; then
+            crashed=true
+            state=crashed
+            echo "::warning title=fuzz $TARGET::the target crashed; the input is in the fuzz-crash-$TARGET artifact"
+          elif [ "$status" -ne 0 ]; then
+            state=failed
+            echo "::warning title=fuzz $TARGET::the run failed without a crashing input (status $status); see the log"
+          fi
+          echo "crashed=$crashed" >> "$GITHUB_OUTPUT"
+          {
+            echo "### fuzz $TARGET"
+            echo
+            echo "- Seconds: $SECONDS_PER_TARGET"
+            echo "- Result: $state"
+            [ "$state" != failed ] || echo "- The run did not fuzz (build or setup failure, status $status); see the log."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          # A run that never fuzzed leaves a marker artifact for the report job.
+          if [ "$state" = failed ]; then mkdir -p fuzz/failed && echo "$status" > "fuzz/failed/$TARGET"; fi
+      - name: Keep the crashing input
+        if: steps.fuzz.outputs.crashed == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: warn
+      - name: Keep the failure marker
+        if: steps.fuzz.outputs.state == 'failed'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-failed-${{ matrix.target }}
+          path: fuzz/failed/${{ matrix.target }}
+
+  # A green job notifies nobody, so outside a pull request a crash opens an
+  # issue labelled fuzz, or comments on the open one.
+  report:
+    name: report
+    needs: fuzz
+    if: always() && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # To list the artifacts of this run.
+      actions: read
+      # To open or comment on the fuzz issue.
+      issues: write
+    steps:
+      - name: Open or update the fuzz issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          crashed="$(gh api "repos/$GH_REPO/actions/runs/$RUN_ID/artifacts" \
+            --jq '.artifacts[] | select(.name | startswith("fuzz-crash-")) | "- " + .name' || true)"
+          failed="$(gh api "repos/$GH_REPO/actions/runs/$RUN_ID/artifacts" \
+            --jq '.artifacts[] | select(.name | startswith("fuzz-failed-")) | "- " + .name' || true)"
+          [ -n "$crashed$failed" ] || exit 0
+          body="$(printf '%s\n' "Run: $RUN_URL" "")"
+          if [ -n "$crashed" ]; then
+            body="$(printf '%s\n' "$body" "Targets that crashed:" "$crashed" "" \
+              "Download the input from the run, fix the decoder, and add the input to fuzz/regressions/<target>/.")"
+          fi
+          if [ -n "$failed" ]; then
+            body="$(printf '%s\n' "$body" "Targets that never fuzzed (build or setup failure, see the log):" "$failed")"
+          fi
+          gh label create fuzz --color B60205 \
+            --description "A fuzz target crashed or did not run" 2>/dev/null || true
+          number="$(gh issue list --label fuzz --state open --limit 1 --json number --jq '.[0].number // empty')"
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body "$body"
+          else
+            gh issue create --label fuzz --title "A fuzz target crashed or did not run" --body "$body"
+          fi

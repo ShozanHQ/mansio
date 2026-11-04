@@ -1,0 +1,1 @@
+{"queue":"builds","message_id":"0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b1","attempt":2,"lease":"0123456789abcdef0123456789abcdef","holder":"agent:builder-1","consumer":"worker-1","reason":"out of disk","next":"retry","retry_at":"2026-10-26T12:02:00Z"}
