@@ -1,5 +1,6 @@
-//! The admin API for webhooks: `webhooks_create`, `webhooks_list` and
-//! `webhooks_delete`. Only the admin credential may call them.
+//! The admin API for webhooks: `webhooks_create`, `webhooks_list`,
+//! `webhooks_delete` and `webhooks_rotate`. Only the admin credential may call
+//! them.
 
 use std::sync::Arc;
 
@@ -8,7 +9,7 @@ use axum::extract::rejection::{BytesRejection, PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use bytes::Bytes;
-use mansio_core::api::{CreateWebhook, WebhookCreated, Webhooks};
+use mansio_core::api::{CreateWebhook, WebhookCreated, WebhookRotated, Webhooks};
 use mansio_core::{TenantId, Webhook};
 use serde::Deserialize;
 
@@ -27,7 +28,7 @@ pub(crate) async fn webhooks_create(
     let request: CreateWebhook = parse_body(&read_body(&state, body)?)?;
     let created = state
         .webhooks
-        .create(request)
+        .create(actor.principal(), request)
         .await
         .map_err(|error| error.logged_in("webhooks_create"))?;
     Ok((StatusCode::CREATED, Json(created)))
@@ -66,8 +67,26 @@ pub(crate) async fn webhooks_delete(
     let Path(id) = path.map_err(|e| ApiError::BadRequest(e.body_text()))?;
     let deleted = state
         .webhooks
-        .delete(parse_part(&id)?)
+        .delete(actor.principal(), parse_part(&id)?)
         .await
         .map_err(|error| error.logged_in("webhooks_delete"))?;
     Ok(Json(deleted))
+}
+
+/// `POST /v1/webhooks/{id}/rotate`: replace a webhook's signing secret. 200
+/// with the webhook, the new secret, which is shown this once, and until when
+/// the old one signs deliveries too.
+pub(crate) async fn webhooks_rotate(
+    State(state): State<Arc<AppState>>,
+    Authenticated(actor): Authenticated,
+    path: Result<Path<String>, PathRejection>,
+) -> Result<Json<WebhookRotated>, ApiError> {
+    actor.require_admin()?;
+    let Path(id) = path.map_err(|e| ApiError::BadRequest(e.body_text()))?;
+    let rotated = state
+        .webhooks
+        .rotate(actor.principal(), parse_part(&id)?)
+        .await
+        .map_err(|error| error.logged_in("webhooks_rotate"))?;
+    Ok(Json(rotated))
 }

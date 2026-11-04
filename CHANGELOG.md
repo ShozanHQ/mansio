@@ -26,6 +26,31 @@ All notable changes to mansio are listed here. The format follows
 
 ### Added
 
+- Webhooks have a start position, a destination policy, secret rotation and
+  lifecycle facts.
+  - `webhooks_create` takes an optional `start`, `first` (the default, as
+    before) or `next`, which delivers only what is published after the webhook
+    is made. The CLI flag is `--start`.
+  - `webhooks_rotate` (`POST /v1/webhooks/{id}/rotate`, `mansio webhooks
+    rotate`, the MCP tool of that name) returns a new signing secret once.
+    For `MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS` (default a day) deliveries are
+    signed with the new secret and the old, two `v1` values in
+    `mansio-signature`, then with the new one only. `mansio_core::webhook::sign_many`
+    makes such a header, and `verify` already accepted one.
+  - `mansio.webhook.created`, `.rotated` and `.deleted` are recorded in the
+    sink and on `facts.webhook`. They carry the webhook, the topic and the
+    origin of the address, and never a secret or the user name, path or query
+    of the address.
+  - A delivery to a loopback, link-local or private address is refused, judged
+    on the address the host name resolves to when the delivery is made.
+    `MANSIO_WEBHOOK_ALLOW_PRIVATE_DESTINATIONS=true` allows them.
+
+  Upgrading: a receiver on a private address stops receiving until
+  `MANSIO_WEBHOOK_ALLOW_PRIVATE_DESTINATIONS=true` is set. `/v1/settings` gains
+  `webhook_allow_private_destinations` and `webhook_rotation_grace_seconds`. A
+  server older than this change cannot read a `rotated` record of the webhooks'
+  log and keeps the registry unloaded, so do not roll back after a rotation.
+
 - More than one mansio-server can share a broker without leasing an item twice.
   With `MANSIO_OWNER_TTL_SECONDS` (default 0, which keeps one server per
   broker; `owner_ttl_seconds` in `GET /v1/settings`) set to the same value on

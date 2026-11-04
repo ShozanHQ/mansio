@@ -17,6 +17,19 @@ secret as text (`whsec_...`, shown once by `mansio webhooks create`). Check it
 before you trust the body, and check that `t` is recent, so that a captured
 request cannot be sent again later.
 
+After `mansio webhooks rotate` the header carries two `v1` values, one for the
+new secret and one for the old, until the grace period
+(`MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS`) is over:
+
+```
+mansio-signature: t=1792000000,v1=<new secret's HMAC>,v1=<old secret's HMAC>
+```
+
+A receiver that holds either secret verifies it if **any** `v1` matches, so
+change the secret it holds at any time in the grace without missing a
+delivery. The samples below do that: do not read the header into a map keyed
+by name, which keeps only the last `v1`.
+
 Answer with any 2xx once you have the envelope. Anything else, or no answer
 within `MANSIO_WEBHOOK_TIMEOUT_SECONDS`, is tried again with a backoff. A
 delivery is at least once: deduplicate on the envelope's `id`.
@@ -27,10 +40,11 @@ delivery is at least once: deduplicate on the envelope's `id`.
 import hashlib, hmac, time
 
 def verify(secret: str, header: str, body: bytes, tolerance: int = 300) -> bool:
-    parts = dict(p.split("=", 1) for p in header.split(","))
-    t = parts["t"]
+    parts = [p.split("=", 1) for p in header.split(",")]
+    t = next(v for k, v in parts if k == "t")
     expected = hmac.new(secret.encode(), t.encode() + b"." + body, hashlib.sha256).hexdigest()
-    return abs(time.time() - int(t)) <= tolerance and hmac.compare_digest(expected, parts["v1"])
+    same = any(hmac.compare_digest(expected, v) for k, v in parts if k == "v1")
+    return same and abs(time.time() - int(t)) <= tolerance
 ```
 
 ## Node
@@ -39,10 +53,11 @@ def verify(secret: str, header: str, body: bytes, tolerance: int = 300) -> bool:
 const crypto = require("node:crypto");
 
 function verify(secret, header, body, tolerance = 300) {
-  const { t, v1 } = Object.fromEntries(header.split(",").map((p) => p.split("=")));
+  const parts = header.split(",").map((p) => p.split("="));
+  const t = (parts.find(([k]) => k === "t") ?? [])[1];
   const expected = crypto.createHmac("sha256", secret).update(`${t}.`).update(body).digest("hex");
-  const same = expected.length === v1.length &&
-    crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(v1));
+  const same = parts.some(([k, v]) => k === "v1" && v.length === expected.length &&
+    crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(v)));
   return same && Math.abs(Date.now() / 1000 - Number(t)) <= tolerance;
 }
 ```
@@ -61,6 +76,9 @@ use mansio_core::webhook::verify;
 let secret = WebhookSecret::new("whsec_...");
 let ok = verify(&secret, header, body, now_unix_seconds, 300);
 ```
+
+`verify` accepts a header with several `v1` values, as one is in the grace
+period after a rotation.
 
 ## Shell, to try it
 
