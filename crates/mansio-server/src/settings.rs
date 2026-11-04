@@ -255,6 +255,12 @@ pub struct StreamSettings {
     /// the requests still being served to finish before the server stops
     /// anyway (`MANSIO_SHUTDOWN_GRACE_SECONDS`).
     pub shutdown_grace: Duration,
+    /// The most event streams one credential may hold open; the next gets
+    /// 429 (`MANSIO_SSE_MAX_PER_CREDENTIAL`).
+    pub sse_max_per_credential: usize,
+    /// The most event streams open on the server in all; the next gets 503
+    /// (`MANSIO_SSE_MAX`).
+    pub sse_max: usize,
 }
 
 impl Default for StreamSettings {
@@ -263,6 +269,8 @@ impl Default for StreamSettings {
             poll: Duration::from_millis(500),
             sse_keepalive: Duration::from_secs(15),
             shutdown_grace: Duration::from_secs(10),
+            sse_max_per_credential: 10,
+            sse_max: 1000,
         }
     }
 }
@@ -286,6 +294,12 @@ impl StreamSettings {
         }
         if self.shutdown_grace < Duration::from_secs(1) {
             return Err(invalid("MANSIO_SHUTDOWN_GRACE_SECONDS"));
+        }
+        if self.sse_max_per_credential == 0 {
+            return Err(invalid("MANSIO_SSE_MAX_PER_CREDENTIAL"));
+        }
+        if self.sse_max == 0 {
+            return Err(invalid("MANSIO_SSE_MAX"));
         }
         Ok(())
     }
@@ -520,6 +534,11 @@ impl Settings {
                 "MANSIO_SHUTDOWN_GRACE_SECONDS",
                 stream_defaults.shutdown_grace,
             )?,
+            sse_max_per_credential: env.parse(
+                "MANSIO_SSE_MAX_PER_CREDENTIAL",
+                stream_defaults.sse_max_per_credential,
+            )?,
+            sse_max: env.parse("MANSIO_SSE_MAX", stream_defaults.sse_max)?,
         };
         stream.validate()?;
 
@@ -993,6 +1012,8 @@ mod tests {
         assert_eq!(stream.poll, Duration::from_millis(500));
         assert_eq!(stream.sse_keepalive, Duration::from_secs(15));
         assert_eq!(stream.shutdown_grace, Duration::from_secs(10));
+        assert_eq!(stream.sse_max_per_credential, 10);
+        assert_eq!(stream.sse_max, 1000);
         assert_eq!(stream.validate(), Ok(()));
         let webhooks = WebhookSettings::default();
         assert_eq!(webhooks.backoff_base, Duration::from_secs(5));
@@ -1011,6 +1032,8 @@ mod tests {
             ("MANSIO_STREAM_POLL_MILLIS", "50"),
             ("MANSIO_SSE_KEEPALIVE_SECONDS", "3"),
             ("MANSIO_SHUTDOWN_GRACE_SECONDS", "4"),
+            ("MANSIO_SSE_MAX_PER_CREDENTIAL", "2"),
+            ("MANSIO_SSE_MAX", "7"),
             ("MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS", "1"),
             ("MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS", "4"),
             ("MANSIO_WEBHOOK_MAX_ATTEMPTS", "5"),
@@ -1024,6 +1047,8 @@ mod tests {
                 poll: Duration::from_millis(50),
                 sse_keepalive: Duration::from_secs(3),
                 shutdown_grace: Duration::from_secs(4),
+                sse_max_per_credential: 2,
+                sse_max: 7,
             }
         );
         assert_eq!(
@@ -1045,6 +1070,9 @@ mod tests {
             ("MANSIO_STREAM_POLL_MILLIS", "often"),
             ("MANSIO_SSE_KEEPALIVE_SECONDS", "0"),
             ("MANSIO_SHUTDOWN_GRACE_SECONDS", "0"),
+            ("MANSIO_SSE_MAX_PER_CREDENTIAL", "0"),
+            ("MANSIO_SSE_MAX", "0"),
+            ("MANSIO_SSE_MAX", "many"),
             ("MANSIO_WEBHOOK_BACKOFF_BASE_SECONDS", "0"),
             ("MANSIO_WEBHOOK_MAX_ATTEMPTS", "0"),
             ("MANSIO_WEBHOOK_TIMEOUT_SECONDS", "0"),

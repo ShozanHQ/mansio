@@ -26,6 +26,9 @@ pub enum ApiError {
     /// 409: the request is well formed but the state it acts on does not
     /// allow it, for example an alert already acknowledged.
     Conflict(String),
+    /// 429: the caller holds as many of something as it may, for example
+    /// open event streams (`MANSIO_SSE_MAX_PER_CREDENTIAL`).
+    TooManyRequests(String),
     /// 502: the broker named a refusal that it makes before it stores
     /// anything. Nothing was stored.
     BadGateway(String),
@@ -48,6 +51,7 @@ impl ApiError {
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
+            ApiError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             ApiError::BadGateway(_) => StatusCode::BAD_GATEWAY,
             ApiError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Internal => StatusCode::INTERNAL_SERVER_ERROR,
@@ -63,6 +67,7 @@ impl ApiError {
             ApiError::NotFound(_) => "not_found",
             ApiError::MethodNotAllowed => "method_not_allowed",
             ApiError::Conflict(_) => "conflict",
+            ApiError::TooManyRequests(_) => "too_many_requests",
             ApiError::BadGateway(_) => "broker_refused",
             ApiError::Unavailable(_) => "unavailable",
             ApiError::Internal => "internal",
@@ -105,6 +110,7 @@ impl ApiError {
             | ApiError::Forbidden(m)
             | ApiError::NotFound(m)
             | ApiError::Conflict(m)
+            | ApiError::TooManyRequests(m)
             | ApiError::BadGateway(m)
             | ApiError::Unavailable(m) => m.clone(),
             ApiError::Unauthorized => "missing or invalid bearer token".to_owned(),

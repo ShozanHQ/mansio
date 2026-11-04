@@ -37,6 +37,7 @@ mod registry;
 mod settings;
 mod sink;
 mod state;
+mod stream_limits;
 mod tail;
 #[cfg(test)]
 mod testing;

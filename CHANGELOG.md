@@ -7,6 +7,10 @@ All notable changes to mansio are listed here. The format follows
 
 ### Added
 
+- `MANSIO_SSE_MAX_PER_CREDENTIAL` (default 10) and `MANSIO_SSE_MAX` (default
+  1000) limit open event streams: the next `GET /v1/events` gets 429 for a
+  credential at its limit and 503 when the server is at its own. Both are in
+  `GET /v1/settings` as `sse_max_per_credential` and `sse_max`.
 - `MANSIO_IGGY_PRESENCE_SEGMENT_SIZE_BYTES` (default 1 MiB): `presence` topics
   get a small segment, so their retention holds on a quiet server. The README
   says retention is a minimum, bounded by segment size, for every kind of
