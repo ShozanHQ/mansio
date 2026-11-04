@@ -121,13 +121,13 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Run the newest demo
         run: |
-          newest=$(ls docs/demos/*.md 2>/dev/null | sort | tail -n 1)
+          newest=$(ls docs/demos/[0-9]*.md 2>/dev/null | sort | tail -n 1)
           if [ -z "$newest" ]; then
             echo "no demo found in docs/demos/" >&2
             exit 1
           fi
           .github/scripts/demo-check.sh "$newest"
-      - name: The checker fails on a failing block and names it
+      - name: The checker fails on a failing block and on an untracked reference, and names them
         run: .github/scripts/demo-check-test.sh
 
   # The steps and the settings of the throwaway stack are in

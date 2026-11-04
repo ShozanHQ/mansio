@@ -5,6 +5,13 @@
 #
 #   demo-check.sh docs/demos/2026-11-06.md
 #
+# Before it builds or starts anything it checks every `[[...]]` reference in
+# the file outside its `bash`, `sh` and `text` fences (so a `[[ ]]` test in a
+# step is not read as one): the part before the first `#` (and without a
+# leading `<sha>:` or `<sha>..<sha>:`) must be a tracked file, by
+# `git ls-files --error-unmatch` from the repository root. A failure prints the
+# path and exits 1. Commits are not checked: CI's checkout is shallow.
+#
 # Blocks fenced as anything but `bash` (the step that starts the server is
 # `sh`, what a command prints is `text`) are not run. The shell the blocks run
 # in has what a reader has after the start step:
@@ -26,6 +33,28 @@ fi
 demo=$1
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
+
+# Every reference names a tracked file. The `|| true` keeps a demo without
+# references passing under pipefail.
+missing=0
+refs=$( { awk '
+    /^[[:space:]]*```(bash|sh|text)[[:space:]]*$/ && !skip { skip = 1; next }
+    /^[[:space:]]*```/ && skip { skip = 0; next }
+    !skip' "$demo" | grep -o '\[\[[^]]*\]\]' || true; } \
+  | sed -e 's/^\[\[//' -e 's/\]\]$//' -e 's/#.*$//' \
+        -e 's/^[0-9a-fA-F]*\.\.[0-9a-fA-F]*://' -e 's/^[0-9a-fA-F]*://' \
+  | sort -u)
+while IFS= read -r ref; do
+  [ -n "$ref" ] || continue
+  if ! (cd "$root" && git ls-files --error-unmatch -- "$ref") >/dev/null 2>&1; then
+    echo "demo-check: reference [[$ref]] in $demo is not a tracked file" >&2
+    missing=1
+  fi
+done <<EOF_REFS
+$refs
+EOF_REFS
+[ "$missing" -eq 0 ] || exit 1
+
 server_bin=${MANSIO_SERVER_BIN:-$root/target/debug/mansio-server}
 cli_bin=${MANSIO_BIN:-$root/target/debug/mansio}
 if [ ! -x "$server_bin" ] || [ ! -x "$cli_bin" ]; then
