@@ -8,8 +8,8 @@ use mansio_core::Envelope;
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
-use crate::harness::{DataValue, Outcome, SLACK, Target};
-use crate::receiver::{Receiver, Reply, check_signed};
+use crate::harness::{DataValue, LocalSettings, Outcome, SLACK, Target, type_names};
+use crate::receiver::{Receiver, Reply, check_signed, check_signed_under};
 
 fn event(n: u32) -> Value {
     json!({"source": "e2e", "type": format!("e2e.n{n}"), "data": {"n": n}})
@@ -34,7 +34,10 @@ async fn a_delivery_that_fails_twice_arrives_on_the_third_attempt_with_a_valid_s
     let receiver = Receiver::start(&target, [Reply::Status(500), Reply::Hang]).await?;
     let created = target.webhook("facts.build", &receiver.url).await?;
     let secret = created["secret"].as_str().context("the secret")?.to_owned();
-    assert!(secret.starts_with("whsec_"), "{secret}");
+    assert!(
+        secret.starts_with("whsec_"),
+        "the created secret has no whsec_ prefix"
+    );
     let id = created["webhook"]["id"]
         .as_str()
         .context("the id")?
@@ -167,7 +170,12 @@ async fn a_delivery_that_fails_every_attempt_is_recorded_and_the_webhook_moves_o
     // The give-up is a fact, made by the engine, naming what and why.
     let facts = target
         .until("the failure to be recorded", SLACK, || async {
-            let facts = target.read("facts.webhook").await?;
+            let facts: Vec<_> = target
+                .read("facts.webhook")
+                .await?
+                .into_iter()
+                .filter(|fact| fact.event_type.as_str() == "mansio.webhook.failed")
+                .collect();
             Ok((!facts.is_empty()).then_some(facts))
         })
         .await?;
@@ -488,6 +496,264 @@ async fn the_longest_address_is_the_setting() -> anyhow::Result<()> {
             .is_some_and(|message| message.contains(&format!("longer than {max} bytes"))),
         "{response}"
     );
+    target.delete_webhooks().await?;
+    Ok(())
+}
+
+/// A new webhook starts at the topic's first message unless it asks for the
+/// next: with no start, or `first`, it is sent the whole history; with `next`,
+/// only what is published after it is made. Anything else is refused.
+#[tokio::test]
+async fn a_webhook_starts_at_the_first_message_by_default_or_at_the_next_when_asked()
+-> anyhow::Result<()> {
+    let target = Target::start().await?;
+    let by_default = Receiver::start(&target, []).await?;
+    let first = Receiver::start(&target, []).await?;
+    let next = Receiver::start(&target, []).await?;
+    let mut sent = Vec::new();
+    for n in 0..2 {
+        sent.push(target.publish("facts.build", &event(n)).await?.envelope.id);
+    }
+    for (receiver, start) in [
+        (&by_default, None),
+        (&first, Some("first")),
+        (&next, Some("next")),
+    ] {
+        let (status, _) = target
+            .create_webhook_at("facts.build", &receiver.url, start)
+            .await?;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "create with start {start:?} failed"
+        );
+    }
+    for n in 2..4 {
+        sent.push(target.publish("facts.build", &event(n)).await?.envelope.id);
+    }
+
+    let ids = |receiver: &Receiver| -> anyhow::Result<Vec<String>> {
+        receiver
+            .requests()
+            .iter()
+            .map(|request| delivered_id(&request.body))
+            .collect()
+    };
+    let all: Vec<String> = sent.iter().map(ToString::to_string).collect();
+    by_default.wait_for(&target, 4, SLACK).await?;
+    first.wait_for(&target, 4, SLACK).await?;
+    next.wait_for(&target, 2, SLACK).await?;
+    tokio::time::sleep(target.settle()).await;
+    assert_eq!(ids(&by_default)?, all, "no start is first");
+    assert_eq!(ids(&first)?, all);
+    assert_eq!(ids(&next)?, all[2..], "next skips what the topic held");
+
+    for bad in ["last", "", "NEXT", "0"] {
+        let (status, _) = target
+            .create_webhook_at("facts.build", &next.url, Some(bad))
+            .await?;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "create with start {bad:?} was not refused"
+        );
+    }
+    assert_eq!(target.webhooks().await?.len(), 3, "the refused made none");
+    target.delete_webhooks().await?;
+    Ok(())
+}
+
+/// Rotating returns a new secret once. Deliveries are signed with the old
+/// secret and the new for the grace period, so a receiver that holds either
+/// verifies them, and with the new one only after it. The creation, the
+/// rotation and the deletion are facts that name no secret.
+#[tokio::test]
+async fn a_rotated_secret_signs_beside_the_old_for_the_grace_and_alone_after() -> anyhow::Result<()>
+{
+    let target = Target::start().await?;
+    let grace = Duration::from_secs(target.settings.webhook_rotation_grace_seconds);
+    ensure!(
+        grace <= Duration::from_secs(60),
+        "the test needs MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS of a minute or less"
+    );
+    let receiver = Receiver::start(&target, []).await?;
+    let created = target.webhook("facts.build", &receiver.url).await?;
+    let id = created["webhook"]["id"]
+        .as_str()
+        .context("the id")?
+        .to_owned();
+    let old = created["secret"].as_str().context("the secret")?.to_owned();
+
+    // Before the rotation: the old secret alone.
+    target.publish("facts.build", &event(0)).await?;
+    let requests = receiver.wait_for(&target, 1, SLACK).await?;
+    check_signed(&requests[0], &old)?;
+
+    // The rotation: a new secret, shown in this answer only.
+    let rotated = target.rotate_webhook(&id).await?;
+    let rotated_at = std::time::Instant::now();
+    let new = rotated["secret"].as_str().context("the secret")?.to_owned();
+    assert!(
+        new.starts_with("whsec_"),
+        "the rotated secret has no whsec_ prefix"
+    );
+    assert!(new != old, "the rotated secret is the same as the old one");
+    assert_eq!(rotated["webhook"]["id"], json!(id));
+    assert!(rotated["webhook"].get("secret").is_none());
+    let valid_until = serde_json::from_value(rotated["previous_secret_valid_until"].clone())?;
+    let valid_until = crate::harness::millis(&valid_until)?;
+    let listed = serde_json::to_string(&target.webhooks().await?)?;
+    assert!(
+        !listed.contains(&new) && !listed.contains(&old),
+        "a secret is in the webhooks list"
+    );
+
+    // Inside the grace: both signatures, the new one first, and each is the
+    // HMAC of the body under its own secret.
+    target.publish("facts.build", &event(1)).await?;
+    let requests = receiver.wait_for(&target, 2, SLACK).await?;
+    let stamp = check_signed_under(&requests[1], &[&new, &old])?;
+    assert!(stamp * 1000 < valid_until, "sent inside the grace");
+
+    // After it: the new secret alone, and the old one no longer signs.
+    tokio::time::sleep((grace + target.settle()).saturating_sub(rotated_at.elapsed())).await;
+    target.publish("facts.build", &event(2)).await?;
+    let requests = receiver.wait_for(&target, 3, SLACK).await?;
+    check_signed(&requests[2], &new)?;
+    assert!(check_signed_under(&requests[2], &[&old]).is_err());
+    assert!(check_signed_under(&requests[2], &[&new, &old]).is_err());
+
+    // The facts, on the topic and in the sink, name no secret.
+    target.delete_webhooks().await?;
+    let facts = target.read("facts.webhook").await?;
+    assert_eq!(
+        type_names(&facts, "mansio.webhook."),
+        ["created", "rotated", "deleted"]
+    );
+    for fact in &facts {
+        assert_eq!(
+            fact.subject.as_ref().map(ToString::to_string),
+            Some(id.clone())
+        );
+        let data = fact.data.as_ref().context("data")?.value();
+        assert_eq!(data["webhook_id"], json!(id));
+        assert_eq!(data["topic"], "facts.build");
+        let text = serde_json::to_string(fact)?;
+        let searched = [old.as_str(), new.as_str(), "whsec_", receiver.url.as_str()];
+        for (n, secret) in searched.into_iter().enumerate() {
+            assert!(
+                !text.contains(secret),
+                "searched item {n} is in a webhook fact"
+            );
+        }
+    }
+    let data = |n: usize| -> anyhow::Result<Value> {
+        Ok(facts[n].data.as_ref().context("data")?.value().clone())
+    };
+    assert_eq!(data(0)?["start"], "first");
+    assert_eq!(
+        data(1)?["previous_secret_valid_until"],
+        rotated["previous_secret_valid_until"]
+    );
+    if let Some(records) = target.sink_records()? {
+        let recorded = type_names(&records, "mansio.webhook.");
+        for kind in ["created", "rotated", "deleted"] {
+            assert!(
+                recorded.iter().any(|recorded| recorded == kind),
+                "{kind} is not in the sink: {recorded:?}"
+            );
+        }
+        let sunk = records
+            .iter()
+            .filter(|record| record.event_type.as_str().starts_with("mansio.webhook."))
+            .map(serde_json::to_string)
+            .collect::<Result<String, _>>()?;
+        assert!(
+            !sunk.contains(&old) && !sunk.contains(&new),
+            "a secret is in the sink"
+        );
+    }
+    Ok(())
+}
+
+/// Only the admin rotates, and only a webhook that exists.
+#[tokio::test]
+async fn only_the_admin_rotates_and_only_a_webhook_that_exists() -> anyhow::Result<()> {
+    let target = Target::start().await?;
+    let receiver = Receiver::start(&target, []).await?;
+    let agent = target
+        .issue(
+            "agent",
+            "rotator",
+            &json!([{"topic": "facts.*", "verbs": ["publish", "subscribe"]}]),
+            None,
+        )
+        .await?;
+    let created = target.webhook("facts.build", &receiver.url).await?;
+    let id = created["webhook"]["id"]
+        .as_str()
+        .context("the id")?
+        .to_owned();
+    let uri = format!("{}/v1/webhooks/{id}/rotate", target.base);
+    let (status, _) = target
+        .call(Method::POST, &uri, Some(&agent.token), None)
+        .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = target.call(Method::POST, &uri, None, None).await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let missing = format!(
+        "{}/v1/webhooks/0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b3/rotate",
+        target.base
+    );
+    let (status, _) = target.authed(Method::POST, &missing, None).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let bad = format!("{}/v1/webhooks/not-an-id/rotate", target.base);
+    let (status, _) = target.authed(Method::POST, &bad, None).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = target.authed(Method::GET, &uri, None).await?;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    // None of that changed the secret.
+    let old = created["secret"].as_str().context("the secret")?.to_owned();
+    target.publish("facts.build", &event(0)).await?;
+    let requests = receiver.wait_for(&target, 1, SLACK).await?;
+    check_signed(&requests[0], &old)?;
+    target.delete_webhooks().await?;
+    Ok(())
+}
+
+/// With the setting off a delivery to the loopback is refused, and the
+/// listing says so without naming the address; the receiver is never sent
+/// anything.
+#[tokio::test]
+async fn a_delivery_to_a_private_address_is_refused_unless_the_setting_allows_it()
+-> anyhow::Result<()> {
+    let mut settings = LocalSettings::default();
+    settings.webhooks.allow_private_destinations = false;
+    let target = Target::start_with(settings).await?;
+    if !target.is_local() {
+        // A live server runs with what it was started with, and the tests'
+        // receivers are on a private address.
+        return Ok(());
+    }
+    let receiver = Receiver::start(&target, []).await?;
+    target.webhook("facts.build", &receiver.url).await?;
+    target.publish("facts.build", &event(0)).await?;
+    let wait = target.webhook_give_up() + SLACK;
+    let listed = target
+        .until("the refusal to be listed", wait, || async {
+            let all = target.webhooks().await?;
+            Ok(all
+                .iter()
+                .any(|webhook| webhook["last_error"]["offset"] == 0)
+                .then_some(all))
+        })
+        .await?;
+    let message = listed[0]["last_error"]["message"]
+        .as_str()
+        .context("an error message")?;
+    assert!(message.contains("loopback"), "{message}");
+    assert!(!message.contains(&receiver.url), "{message}");
+    assert!(receiver.requests().is_empty(), "nothing was sent");
     target.delete_webhooks().await?;
     Ok(())
 }

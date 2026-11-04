@@ -51,6 +51,10 @@ runs:
           echo MANSIO_WEBHOOK_BACKOFF_CAP_SECONDS=4
           echo MANSIO_WEBHOOK_MAX_ATTEMPTS=3
           echo MANSIO_WEBHOOK_TIMEOUT_SECONDS=2
+          # The receiver is on the runner, which the container reaches at a
+          # private address, and a rotated secret is honoured for 4 s.
+          echo MANSIO_WEBHOOK_ALLOW_PRIVATE_DESTINATIONS=true
+          echo MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS=4
           # The name mansio-server, in its container, reaches the webhook
           # receiver of the tests by. The receiver listens on the runner.
           echo MANSIO_E2E_WEBHOOK_HOST=host.docker.internal

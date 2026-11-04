@@ -9,7 +9,7 @@ use crate::envelope::{Envelope, Timestamp};
 use crate::id::{ConsumerName, LeaseId, PrincipalKind, PrincipalName, TenantId};
 use crate::principal::PrincipalInfo;
 use crate::topic::Topic;
-use crate::webhook::{WebhookInfo, WebhookSecret};
+use crate::webhook::{StartPosition, WebhookInfo, WebhookSecret};
 
 /// The answer to a publish: the envelope as stored, and where it landed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -191,6 +191,10 @@ pub struct CreateWebhook {
     pub topic: Topic,
     /// The `http` or `https` address each envelope is POSTed to.
     pub url: String,
+    /// Where in the topic the webhook starts: `first` (the default) delivers
+    /// the whole history, `next` only what is published after it is made.
+    #[serde(default)]
+    pub start: StartPosition,
 }
 
 /// The answer to `webhooks_create`: the webhook, and the secret its
@@ -201,6 +205,19 @@ pub struct WebhookCreated {
     pub webhook: WebhookInfo,
     /// The signing secret.
     pub secret: WebhookSecret,
+}
+
+/// The answer to `webhooks_rotate`: the new signing secret, which is shown this
+/// once, and until when deliveries are also signed with the old one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookRotated {
+    /// The webhook.
+    pub webhook: WebhookInfo,
+    /// The new signing secret.
+    pub secret: WebhookSecret,
+    /// Deliveries are signed with the old secret as well as the new until
+    /// this time, and with the new one only after it.
+    pub previous_secret_valid_until: Timestamp,
 }
 
 /// The answer to `webhooks_list`.
@@ -290,6 +307,12 @@ pub struct EffectiveSettings {
     pub webhook_timeout_seconds: u64,
     /// `MANSIO_WEBHOOK_URL_MAX_BYTES`: the longest address a webhook may have.
     pub webhook_url_max_bytes: u64,
+    /// `MANSIO_WEBHOOK_ALLOW_PRIVATE_DESTINATIONS`: whether a webhook may be
+    /// delivered to a loopback, link-local or private address.
+    pub webhook_allow_private_destinations: bool,
+    /// `MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS`: how long deliveries are
+    /// signed with the old secret too after a rotation.
+    pub webhook_rotation_grace_seconds: u64,
 }
 
 #[cfg(test)]

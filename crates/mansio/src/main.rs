@@ -203,6 +203,7 @@ mod parity {
             "webhooks_create",
             "webhooks_list",
             "webhooks_delete",
+            "webhooks_rotate",
             "consumers_get",
             "consumers_commit",
         ] {

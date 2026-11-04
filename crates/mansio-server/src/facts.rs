@@ -6,7 +6,7 @@ use std::str::FromStr;
 use mansio_core::{
     AlertEvent, AlertFact, CausationId, Data, DataContentType, Envelope, EventId, EventType,
     ItemId, Principal, PrincipalEvent, PrincipalFact, Segment, Source, Subject, TenantId,
-    Timestamp, Topic, WebhookEvent, WebhookFact, WorkEvent, WorkFact,
+    Timestamp, Topic, WebhookChange, WebhookEvent, WebhookFact, WorkEvent, WorkFact,
 };
 use tracing::error;
 
@@ -237,6 +237,34 @@ impl Facts {
             data.webhook_id.as_u128() ^ data.message_id.as_u128() ^ WEBHOOK_FAILED_SALT,
         )
         .unwrap_or_else(|_| EventId::generate());
+        Ok(envelope)
+    }
+
+    /// The creation, deletion or rotation of a webhook, on `facts.webhook`,
+    /// with the webhook id as its subject and the admin who did it as its
+    /// principal. The data names no signing secret and of the address only its
+    /// origin.
+    pub(crate) fn webhook_change(
+        &self,
+        tenant: &TenantId,
+        event: WebhookEvent,
+        by: &Principal,
+        at: i64,
+        data: &WebhookChange,
+    ) -> Result<Envelope, ApiError> {
+        let value = Data::new(data).map_err(|reason| {
+            error!(%reason, "a webhook fact did not serialize");
+            ApiError::Internal
+        })?;
+        let mut envelope = self.envelope(
+            tenant,
+            Topic::facts_webhook(),
+            event.event_type(),
+            by,
+            at,
+            &data.webhook_id.to_string(),
+        )?;
+        envelope.data = Some(value);
         Ok(envelope)
     }
 
