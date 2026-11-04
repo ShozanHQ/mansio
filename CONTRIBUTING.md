@@ -46,12 +46,12 @@ A pull request merges when all of these pass:
 | offline | consumers killed while idle and while holding a lease, every item done once |
 
 Run the first four before you push. The hygiene check runs locally as
-`bash .github/scripts/names.sh tree`.
-
-The first time you contribute, the workflow runs on your pull request wait for a
-maintainer's approval before they start; that is GitHub's rule for first-time
-contributors, not a sign that something is wrong. A weakened or deleted test is a failed
+`bash .github/scripts/names.sh tree`. A weakened or deleted test is a failed
 review; add tests, do not trade them.
+
+The first time you contribute, the workflow runs on your pull request wait for
+a maintainer's approval before they start; that is GitHub's rule for
+first-time contributors, not a sign that something is wrong.
 
 ## The code
 
@@ -78,8 +78,7 @@ comma, a colon or a new sentence. Cut rather than elaborate.
 
 ## Commits and pull requests
 
-- Signed commits (`git commit -S`) are welcome, so that GitHub shows them as
-  verified, and not required.
+- Sign your commits (`git commit -S`), so that GitHub shows them as verified.
 - One change per pull request, kept to what the issue asks. Something else you
   find along the way becomes its own issue.
 - Fill in the pull request template: what, why, the done criteria, the settings
