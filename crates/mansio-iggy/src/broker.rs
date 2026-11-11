@@ -13,8 +13,9 @@ use bytes::Bytes;
 use iggy::prelude::{
     AutoLogin, Client, Consumer, Credentials, Durability as IggyDurability, Identifier,
     IggyByteSize, IggyClient, IggyClientBuilder, IggyDuration, IggyError, IggyExpiry, IggyMessage,
-    MaxTopicSize, MessageClient, Partitioning, PersonalAccessTokenClient, PollingStrategy,
-    StreamClient, TopicClient, TopicCreateOptions, TopicUpdateOptions, UserClient, UserStatus,
+    MaxTopicSize, MessageClient, Partitioning, PersonalAccessTokenClient, PollOptions,
+    PollingStrategy, StreamClient, StreamCreateOptions, TopicClient, TopicCreateOptions,
+    TopicUpdateOptions, UserClient, UserCreateOptions, UserStatus,
 };
 use mansio_core::{
     Broker, BrokerError, BrokerUser, BrokerUserInfo, Caller, Credential, Envelope, EventId, Grant,
@@ -44,6 +45,14 @@ const TOKEN_NAME: &str = "mansio";
 
 /// The one partition of every topic.
 const PARTITION: u32 = 0;
+
+/// A read of `count` messages that answers at once and commits nothing.
+fn poll_options(count: u32) -> PollOptions {
+    PollOptions {
+        count,
+        ..PollOptions::default()
+    }
+}
 
 /// The streams and topics this process has found or created, so that a
 /// request after the first skips the round trips that check for them.
@@ -385,11 +394,10 @@ impl IggyBroker {
             .poll_messages(
                 stream,
                 topic,
-                Some(PARTITION),
+                PARTITION,
                 &Consumer::default(),
                 &PollingStrategy::last(),
-                self.locate_window,
-                false,
+                poll_options(self.locate_window),
             )
             .await?;
         Ok(find_offset(&polled.messages, id))
@@ -467,11 +475,10 @@ impl IggyBroker {
             .poll_messages(
                 &stream_id(tenant)?,
                 &topic_id(topic)?,
-                Some(PARTITION),
+                PARTITION,
                 &Consumer::default(),
                 &strategy,
-                count,
-                false,
+                poll_options(count),
             )
             .await;
         let polled = self.settle(caller, polled).await?;
@@ -548,7 +555,11 @@ impl IggyBroker {
             Ok(None) | Err(IggyError::StreamIdNotFound(_) | IggyError::StreamNameNotFound(_)) => {}
             Err(error) => return Err(map_iggy(error)),
         }
-        match self.client.create_stream(name).await {
+        match self
+            .client
+            .create_stream(name, &StreamCreateOptions::default())
+            .await
+        {
             Ok(_) => {
                 info!(stream = name, "created stream");
                 Ok(true)
@@ -603,7 +614,7 @@ impl IggyBroker {
         else {
             return Ok(());
         };
-        if topic.message_expiry == want {
+        if topic.resolved_options().message_expiry == want {
             return Ok(());
         }
         let options = TopicUpdateOptions {
@@ -611,7 +622,7 @@ impl IggyBroker {
             ..TopicUpdateOptions::default()
         };
         self.client
-            .update_topic(&stream_id, &id, name, &options)
+            .update_topic(&stream_id, &id, &options)
             .await
             .map_err(map_iggy)?;
         info!(
@@ -1043,11 +1054,10 @@ impl Broker for IggyBroker {
             .poll_messages(
                 &Identifier::named(SYSTEM_STREAM).map_err(map_iggy)?,
                 &Identifier::named(log.as_str()).map_err(map_iggy)?,
-                Some(PARTITION),
+                PARTITION,
                 &Consumer::default(),
                 &PollingStrategy::offset(offset),
-                max,
-                false,
+                poll_options(max),
             )
             .await
             .map_err(map_iggy)?;
@@ -1086,6 +1096,7 @@ impl Broker for IggyBroker {
                     password.expose(),
                     UserStatus::Active,
                     Some(permissions(stream, &topics, grants)),
+                    &UserCreateOptions::default(),
                 )
                 .await
                 .map_err(map_iggy)?;

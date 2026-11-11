@@ -1298,11 +1298,13 @@ impl Direct {
                     .poll_messages(
                         &iggy::prelude::Identifier::named(tenant)?,
                         &iggy::prelude::Identifier::named(topic)?,
-                        Some(0),
+                        0,
                         &iggy::prelude::Consumer::default(),
                         &iggy::prelude::PollingStrategy::offset(0),
-                        1,
-                        false,
+                        iggy::prelude::PollOptions {
+                            count: 1,
+                            ..iggy::prelude::PollOptions::default()
+                        },
                     )
                     .await
                 {
