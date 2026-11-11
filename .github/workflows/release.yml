@@ -9,7 +9,9 @@ name: release
 #                commit, build the archives and the image, and attest them. The
 #                environment waits for the owner's approval three times: for
 #                `publish`, for `tag`, then for `binaries` and `image`, which
-#                start after them.
+#                start after them. Before the first approval, `before` runs
+#                the state models on the release commit and names, in the run
+#                summary, the demos that show the release.
 #
 # One-time setup, outside the repository, pending until the first release (the
 # README, "Releases", gives the order):
@@ -124,13 +126,40 @@ jobs:
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::unexpected version '$version'"; exit 1; }
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+  # The release does not wait for CI's run on this commit, so the state models
+  # are checked here: they hold and their charts are current. The summary then
+  # names the demos in docs/demos/ that show the release, as diffmap links, and
+  # the pull requests in none, for the owner to read before approving `publish`.
+  before:
+    name: before the release
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The history and the tags: the list starts at the last release.
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: rustup toolchain install
+      - name: The state models hold and their charts are current
+        run: |
+          cargo test -p mansio-models --locked
+          echo "State models: every rule holds and every chart is current." >> "$GITHUB_STEP_SUMMARY"
+      - name: Name the walkthroughs that cover the release
+        run: bash .github/scripts/release-walkthroughs.sh >> "$GITHUB_STEP_SUMMARY"
+
   # Publishes the crates with a token that crates.io exchanges for this run's
   # OIDC identity (trusted publishing): no token is stored. It compiles the
   # crates and their dependencies, so it holds no repository write access and
   # no signing key; the `tag` job holds the key and compiles nothing.
   publish:
     name: publish crates
-    needs: prepare
+    needs: [prepare, before]
     runs-on: ubuntu-24.04
     environment: release
     # Keyed by the commit, so a later push cannot replace a pending release.
