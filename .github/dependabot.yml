@@ -65,3 +65,11 @@ updates:
       compose-minor-patch:
         patterns: ["*"]
         update-types: [minor, patch]
+    ignore:
+      # Iggy 0.10 accepts only binary protocol 0.12, and the iggy SDK in
+      # Cargo.lock speaks 0.11, so a minor bump of the image alone breaks every
+      # e2e and offline run. The SDK change (#39) moves the image with it and
+      # lifts this ignore. Patch releases and a new digest of 0.9 still come.
+      - dependency-name: apache/iggy
+        update-types:
+          - version-update:semver-minor
