@@ -6,9 +6,9 @@
 # Only two kinds of path are listed, on purpose:
 #
 #   the rules the project runs under: the workflows and the repository's own
-#   configuration, the dependency policy, the toolchain and lint profile, the
-#   workspace manifest (it holds the workspace lints and the release profile),
-#   and the image and compose definitions;
+#   configuration, the reviewer's configuration, the dependency policy, the
+#   toolchain and lint profile, the workspace manifest (it holds the workspace
+#   lints and the release profile), and the image and compose definitions;
 #
 #   the security boundary: the code that issues, checks and revokes credentials,
 #   decides what a credential may do, keeps sessions with the broker, makes the
@@ -20,6 +20,7 @@
 
 # The rules
 /.github/              @snowloops
+/.greptile/            @snowloops
 /deny.toml             @snowloops
 /rust-toolchain.toml   @snowloops
 /clippy.toml           @snowloops
