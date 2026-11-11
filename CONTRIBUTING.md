@@ -103,10 +103,11 @@ cargo +nightly fuzz run body_publish -- -max_total_time=180 -max_len=1048576
 - Change [ARCHITECTURE.md](ARCHITECTURE.md) in the same pull request when the
   code departs from it.
 
-## Writing
+## Writing Summaries and Comments
 
-No em-dashes, in prose, code comments, commit messages or pull requests. Use a
-comma, a colon or a new sentence. Cut rather than elaborate.
+Cut rather than elaborate. The simplest possible answer in the fewest possible words.
+Code can be self explanatory, especially if it is simple.
+AI is welcome here, but you should evaluate skills which help reduce noise. 
 
 ## Commits and pull requests
 
