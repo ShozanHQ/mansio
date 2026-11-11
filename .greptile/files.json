@@ -1,0 +1,6 @@
+{
+  "files": [
+    { "path": "CONTRIBUTING.md", "description": "The rules a change follows" },
+    { "path": "ARCHITECTURE.md", "description": "The design the code follows" }
+  ]
+}
