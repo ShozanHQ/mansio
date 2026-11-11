@@ -73,8 +73,19 @@ jobs:
         run: rustup toolchain install
       - name: Install release-plz, checked against its pinned checksum
         uses: ./.github/actions/release-plz
+      # release-plz commits the bumps with git and pushes its branch to
+      # origin; the checkout keeps no credentials, so git gets an identity and
+      # the token here, as the `tag` job does. The pull request's author is
+      # the token's, github-actions[bot], which `prepare` checks.
+      # The CLI does not read GITHUB_TOKEN from the environment; it takes the
+      # token as --git-token for the API calls, as release-plz's own action
+      # passes it.
       - name: Open or update the release pull request
-        run: release-plz release-pr
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          release-plz release-pr --git-token "$GITHUB_TOKEN"
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
@@ -162,12 +173,14 @@ jobs:
           echo "token=$token" >> "$GITHUB_OUTPUT"
       - name: Install release-plz, checked against its pinned checksum
         uses: ./.github/actions/release-plz
-      # release-plz neither tags nor makes a release (release-plz.toml), so it
-      # needs no GitHub token.
+      # release-plz neither tags nor makes a release (release-plz.toml). It
+      # gets the read-only token anyway, as its own action passes it, in case
+      # it asks GitHub about the merged release pull request.
       - name: Publish the crates
-        run: release-plz release
+        run: release-plz release --git-token "$GITHUB_TOKEN"
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
       - name: The token has done its work
         if: always() && steps.crates.outputs.token != ''
         env:
