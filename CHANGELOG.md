@@ -17,6 +17,11 @@ All notable changes to mansio are listed here. The format follows
 
 ### Changed
 
+- mansio moves to the `iggy` SDK 0.12.0 and Iggy server 0.10.0 (`compose.yaml`
+  pins `apache/iggy:0.10.0` by digest), the released pair for binary protocol
+  0.12. mansio no longer works with Iggy server 0.9: an SDK only talks to
+  servers of its own protocol version, so upgrade the Iggy server with it.
+
 - The timer finds due leases, retries, owed facts and resurfacing alerts
   through a due-time index instead of scanning every open item and alert, so
   a tick with nothing due does constant work and holds the tenant lock for
