@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use iggy::prelude::{
     AutoLogin, Client, Credentials, Identifier, IggyClientBuilder, IggyError, UserClient,
-    UserStatus,
+    UserCreateOptions, UserStatus,
 };
 use mansio_core::BrokerError;
 use secrecy::{ExposeSecret, SecretString};
@@ -77,6 +77,7 @@ pub async fn provision_admin(config: ProvisionConfig) -> Result<Provisioned, Bro
             config.admin_password.expose_secret(),
             UserStatus::Active,
             Some(admin_permissions()),
+            &UserCreateOptions::default(),
         )
         .await;
     let done = match made {
