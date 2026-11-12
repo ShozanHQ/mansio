@@ -81,7 +81,13 @@ published to answers 404.
 docker compose up --build --wait
 ```
 
-This starts Iggy 0.9.0, makes the Iggy user mansio-server acts as (the
+This starts Iggy server 0.10.0, the pair of the `iggy` SDK 0.12.0 that mansio
+is built on: both speak Iggy's binary protocol 0.12, and an SDK only talks to
+servers of its own protocol version (SDK 0.11 and server 0.9 speak protocol
+0.11, and neither talks to the other pair). The compose file pins the image by
+digest, and the SDK is pinned in `Cargo.lock`; a new minor of either moves with
+the other, so an automated update of the image or the crate alone is expected to
+fail until its pair lands. It makes the Iggy user mansio-server acts as (the
 `iggy-admin` service runs once and stops), and starts mansio-server, and waits
 until it is healthy. mansio-server listens on `127.0.0.1:7070` and Iggy's TCP
 port is published on `127.0.0.1:8090`. The token and the passwords in
@@ -580,7 +586,7 @@ curl ... -d '{"lease_id":"<uuid>","consumer":"worker-1","reason":"out of memory"
   every `MANSIO_SNAPSHOT_INTERVAL_SECONDS` and a start replays only what came
   after it. Iggy deletes expired messages a whole segment at a time, and only
   after the segment has filled and rolled (see `MANSIO_IGGY_SEGMENT_SIZE_BYTES`);
-  Iggy 0.9 answers a read from offset 0 of a topic whose head it has deleted
+  Iggy answers a read from offset 0 of a topic whose head it has deleted
   with the first message left, so the rebuild sees everything that remains.
 
 The transitions are `mansio.work.claimed`, `.extended`, `.acked`, `.failed`,
@@ -1090,7 +1096,7 @@ storage, so a 201 survives a crash of the host. With `replicated`, Iggy
 answers after its quorum commit without that barrier; on one node that is a
 write to the operating system, and a crash of the host can lose the messages
 acknowledged since the last flush, after the sink has already recorded them.
-`persisted` costs write latency. Under `persisted` Iggy 0.9's partition setting
+`persisted` costs write latency. Under `persisted` Iggy's partition setting
 `wal_group_commit_delay_micros` (environment `IGGY_PARTITION_WAL_GROUP_COMMIT_DELAY_MICROS`,
 0 in the configuration Iggy prints on start) is the knob that trades latency
 for group commits. See [Iggy's durability documentation](https://iggy.apache.org/docs).

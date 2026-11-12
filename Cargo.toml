@@ -22,7 +22,7 @@ bytes = "1"
 clap = { version = "4", features = ["derive", "string"] }
 futures-util = { version = "0.3", default-features = false }
 hmac = "0.13"
-iggy = "=0.11.0"
+iggy = "=0.12.0"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
