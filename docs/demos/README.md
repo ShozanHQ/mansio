@@ -40,3 +40,10 @@ npx @tanishqkancharla/diffmap@0.10.0 serve docs/demos/<date>.md
 
 The syntax is in the same command with `guide` in place of `serve` and the
 path.
+
+## At a release
+
+Before anything is published, the release run's summary links the demos that
+cover the release and names the pull requests in none
+(`.github/scripts/release-walkthroughs.sh`). It reads the rows under
+`## What shipped`: one pull request a row, starting `| #N |`.

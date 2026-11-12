@@ -1246,7 +1246,11 @@ pinned release. It reports and never blocks.
 version bumps and the `CHANGELOG.md` (configured in `release-plz.toml`). Merging
 it starts the jobs in the `release` environment, which the owner approves three
 times: for `publish`, for `tag`, then for `binaries` and `image`, which start
-after them. Only `tag` holds the tag signing key, and it compiles nothing.
+after them. Before the first approval, `before` runs the state models on the
+release commit, and a failure there stops the release. Its summary links the
+demos that cover the release and names the pull requests in none: read it
+before approving `publish`. Only `tag` holds the tag signing key, and it
+compiles nothing.
 Only the merge of release-plz's own pull request (head branch `release-plz-*`,
 opened by `github-actions[bot]`) starts them; a pull request titled
 "chore: release" by anyone else does not. The jobs
