@@ -1,0 +1,12 @@
+{
+  "strictness": 3,
+  "commentTypes": ["logic", "syntax"],
+  "excludeAuthors": ["dependabot[bot]", "github-actions[bot]"],
+  "ignorePatterns": "Cargo.lock\nCHANGELOG.md\ncrates/mansio-models/charts/**\nfuzz/corpus/**\nfuzz/regressions/**",
+  "shouldUpdateDescription": false,
+  "summarySection": { "included": false },
+  "issuesTableSection": { "included": false },
+  "confidenceScoreSection": { "included": false },
+  "sequenceDiagramSection": { "included": false },
+  "instructions": "Comment only on a defect: wrong behaviour, a security hole, lost or corrupt data. One short comment for each, and no praise."
+}

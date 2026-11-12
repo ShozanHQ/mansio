@@ -123,3 +123,5 @@ comma, a colon or a new sentence. Cut rather than elaborate.
 - A pull request merges when the checks are green and every review thread is
   resolved; it does not wait for an approval. A person reviews a versioned
   release: the `release` environment waits for the owner's approval.
+- `.greptile/` configures the Greptile reviewer: critical findings only. Each
+  inline comment is a review thread: fix or answer it, then resolve it.
