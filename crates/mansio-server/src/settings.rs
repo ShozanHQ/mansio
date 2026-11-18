@@ -31,6 +31,10 @@ pub const DEFAULT_SINK_PATH: &str = "mansio-sink.jsonl";
 pub const DEFAULT_SINK_SYNC: bool = true;
 /// Whether `GET /metrics` is served and counted by default (`MANSIO_METRICS`).
 pub const DEFAULT_METRICS: bool = true;
+
+/// Whether the server is told another server shares its broker, so it refuses
+/// to start with ownership off (`MANSIO_EXPECT_PEERS`).
+pub const DEFAULT_EXPECT_PEERS: bool = false;
 /// Default directory of the snapshots (`MANSIO_SNAPSHOT_DIR`).
 pub const DEFAULT_SNAPSHOT_DIR: &str = "mansio-snapshots";
 /// Default interval between snapshots, in seconds
@@ -517,6 +521,10 @@ pub struct Settings {
     /// Whether `GET /metrics` is served and what it reports is counted
     /// (`MANSIO_METRICS`, default `true`).
     pub metrics: bool,
+    /// Whether another server shares this broker (`MANSIO_EXPECT_PEERS`,
+    /// default `false`). With it `true` and `MANSIO_OWNER_TTL_SECONDS` zero,
+    /// the server refuses to start. Read at start only.
+    pub expect_peers: bool,
     /// The directory of the snapshots of each tenant's state
     /// (`MANSIO_SNAPSHOT_DIR`); `None` keeps none, and every start replays
     /// every topic from offset 0.
@@ -597,6 +605,15 @@ impl Settings {
             owner_ttl: env.seconds("MANSIO_OWNER_TTL_SECONDS", work_defaults.owner_ttl)?,
         };
         work.validate()?;
+        let expect_peers = env.parse("MANSIO_EXPECT_PEERS", DEFAULT_EXPECT_PEERS)?;
+        if expect_peers && work.owner_ttl.is_zero() {
+            return Err(SettingsError::Invalid {
+                name: "MANSIO_EXPECT_PEERS",
+                reason: "true needs MANSIO_OWNER_TTL_SECONDS set, to the same value (3 or \
+                         more) on every server, or two servers could lease the same item"
+                    .to_owned(),
+            });
+        }
 
         let credential_defaults = CredentialSettings::default();
         let credentials = CredentialSettings {
@@ -689,6 +706,7 @@ impl Settings {
             },
             sink_sync: env.parse("MANSIO_SINK_SYNC", DEFAULT_SINK_SYNC)?,
             metrics: env.parse("MANSIO_METRICS", DEFAULT_METRICS)?,
+            expect_peers,
             snapshot_dir: match env.raw("MANSIO_SNAPSHOT_DIR") {
                 None => Some(PathBuf::from(DEFAULT_SNAPSHOT_DIR)),
                 Some(dir) if dir.is_empty() => None,
@@ -1057,6 +1075,49 @@ mod tests {
         assert_eq!(with("0").unwrap().work.owner_ttl, Duration::ZERO);
         // Too short to renew inside: renewals are a quarter of it apart.
         assert!(with("2").is_err());
+    }
+
+    #[test]
+    fn a_server_that_expects_peers_needs_an_owner_ttl() {
+        let base = [("MANSIO_TOKEN", "t"), ("MANSIO_BROKER", "memory")];
+        let with = |peers: &'static str, ttl: Option<&'static str>| {
+            let mut pairs = base.to_vec();
+            pairs.push(("MANSIO_EXPECT_PEERS", peers));
+            if let Some(ttl) = ttl {
+                pairs.push(("MANSIO_OWNER_TTL_SECONDS", ttl));
+            }
+            settings(&pairs)
+        };
+
+        for ttl in [None, Some("0"), Some("")] {
+            let err = with("true", ttl).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    SettingsError::Invalid {
+                        name: "MANSIO_EXPECT_PEERS",
+                        ..
+                    }
+                ),
+                "{err:?}"
+            );
+            assert!(err.to_string().contains("MANSIO_OWNER_TTL_SECONDS"));
+        }
+        assert!(with("true", Some("30")).unwrap().expect_peers);
+
+        assert!(!settings(&base).unwrap().expect_peers);
+        assert!(!with("false", None).unwrap().expect_peers);
+        assert!(!with("false", Some("0")).unwrap().expect_peers);
+        assert!(!with("", None).unwrap().expect_peers);
+
+        let err = with("1", Some("30")).unwrap_err();
+        assert!(matches!(
+            err,
+            SettingsError::Invalid {
+                name: "MANSIO_EXPECT_PEERS",
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -824,8 +824,17 @@ When the owner stops, another server takes its tenants within
 (a stop in order, `SIGTERM`). Nothing is lost: the new owner rebuilds the
 tenant from the broker as a restart does, so a lease the old owner gave is held
 until it ends and the item is then retried, and every item that was waiting is
-claimable. Try it with `docker compose --profile ha up --build --wait`, which
-adds a second server on port 7071 (set the variable for both).
+claimable. Try it with a second server on port 7071:
+
+    MANSIO_OWNER_TTL_SECONDS=30 docker compose --profile ha up --build --wait
+
+Two limits stay with two servers. Each server delivers every webhook it holds,
+so a receiver sees a delivery once per server and deduplicates on the envelope
+id. A named consumer's position committed on one server is not seen by the
+other until it restarts.
+
+The profile's second server runs with `MANSIO_EXPECT_PEERS=true`, so it refuses
+to start without `MANSIO_OWNER_TTL_SECONDS`.
 
 Credentials follow the broker: a server reads new records of the principals log
 at every sweep (`MANSIO_CREDENTIAL_SWEEP_SECONDS`) and, at most once per
@@ -834,11 +843,9 @@ server works on the other, including after the first dies.
 
 Still per server: webhooks and consumer positions are read when a server
 starts, so a webhook or a named consumer made through one server is known to
-another only after that restarts, a position committed on one is not seen by
-the other, and each server delivers the webhooks it holds (a server that holds
-webhooks logs a warning at start when this setting is on). The bootstrap
-`MANSIO_TOKEN` works on all of them. Iggy's own clustering is separate: mansio
-uses one Iggy.
+another only after that restarts, and a server that holds webhooks logs a
+warning at start when this setting is on. The bootstrap `MANSIO_TOKEN` works on
+all of them. Iggy's own clustering is separate: mansio uses one Iggy.
 
 ### Credentials
 
@@ -1034,6 +1041,7 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_SNAPSHOT_INTERVAL_SECONDS` | `300` | How often the state of a tenant that has changed is written to a snapshot, which the next start reads instead of replaying every topic from offset 0 (see "Snapshots" in ARCHITECTURE.md). 0 writes none. |
 | `MANSIO_SNAPSHOT_DIR` | `mansio-snapshots` | The directory of the snapshots, one file per tenant; `/data/snapshots` in the container image. Empty keeps none. A snapshot that cannot be read is ignored with a warning and the start replays from offset 0. |
 | `MANSIO_OWNER_TTL_SECONDS` | `0` | Set on every mansio-server that shares a broker, to the same value (3 or more; 30 or more for a cluster that stays up for months, because every owner appends a record each quarter of it, about 11,500 a day per tenant at 30, and a starting server reads them all), to run more than one: a tenant is served by one of them, and another takes it over this long (and a quarter more) after its server stops renewing it. `0` serves every tenant and must be the only server on its broker (see [More than one server per broker](#more-than-one-server-per-broker)). |
+| `MANSIO_EXPECT_PEERS` | `false` | `true` or `false`. Set `true` on a server that shares its broker with another: with `MANSIO_OWNER_TTL_SECONDS` at `0` it refuses to start and names both settings. The `ha` profile of `compose.yaml` sets it on its second server. Read at start only. |
 | `MANSIO_ALERT_RESURFACE_SECONDS` | `3600` | How long an alert may go unacknowledged before it is surfaced again, and again after each further interval. |
 | `MANSIO_TICK_MILLIS` | `500` | How often the timer looks for leases to expire, items to republish and alerts to surface again. |
 | `MANSIO_IDEMPOTENCY_WINDOW_SECONDS` | `86400` | How long a publish's `idempotencykey` is remembered. A second publish to the same tenant and topic with the same key inside the window is answered 200 with the first envelope and offset and publishes nothing. At least `1`, at most `315360000` (ten years). |
