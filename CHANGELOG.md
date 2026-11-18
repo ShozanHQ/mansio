@@ -11,6 +11,10 @@ All notable changes to mansio are listed here. The format follows
   `MANSIO_OWNER_TTL_SECONDS` refuses to start. The `ha` profile's second server
   sets it, so the two-server command is now
   `MANSIO_OWNER_TTL_SECONDS=30 docker compose --profile ha up --build --wait`.
+- A startup warning for each development default from `compose.yaml` in use:
+  mansio-server names `MANSIO_TOKEN` and `MANSIO_IGGY_PASSWORD`, and
+  `provision-admin` names `IGGY_ROOT_PASSWORD`. The warning never shows the
+  value.
 - A release pipeline: release-plz opens the release pull request, merging it
   publishes the crates through crates.io trusted publishing and creates a
   signed `vX.Y.Z` tag, and the release carries `mansio` archives for macOS,

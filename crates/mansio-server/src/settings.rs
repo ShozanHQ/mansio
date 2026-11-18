@@ -17,7 +17,7 @@ use mansio_iggy::{
     DEFAULT_SIGNIN_TIMEOUT, DEFAULT_USERNAME, DurabilityPolicy, IggyConfig, ProvisionConfig,
     Retention, check_segment_size,
 };
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 
 /// Default listen address: loopback only. The container image listens on all
@@ -502,6 +502,48 @@ pub fn retention_warning(retention: &Retention) -> Option<String> {
     }
 }
 
+/// The token `compose.yaml` ships for `MANSIO_TOKEN`.
+const DEVELOPMENT_TOKEN: &str = "mansio-dev-token";
+/// The password `compose.yaml` ships for `MANSIO_IGGY_PASSWORD`.
+const DEVELOPMENT_IGGY_PASSWORD: &str = "mansio-dev-admin";
+/// The password `compose.yaml` ships for `IGGY_ROOT_PASSWORD`.
+const DEVELOPMENT_ROOT_PASSWORD: &str = "iggy";
+
+fn development_default_warning(name: &str) -> String {
+    format!(
+        "{name} is the development default from compose.yaml, which is public; \
+         set it before the server is reachable from another machine"
+    )
+}
+
+/// One warning for each of `MANSIO_TOKEN` and `MANSIO_IGGY_PASSWORD` that is
+/// the development default from `compose.yaml`. The text names the setting,
+/// never the value.
+#[must_use]
+pub fn development_defaults(settings: &Settings) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if settings.token.expose_secret() == DEVELOPMENT_TOKEN {
+        warnings.push(development_default_warning("MANSIO_TOKEN"));
+    }
+    if let Backend::Iggy(iggy) = &settings.broker
+        && iggy.password.expose_secret() == DEVELOPMENT_IGGY_PASSWORD
+    {
+        warnings.push(development_default_warning("MANSIO_IGGY_PASSWORD"));
+    }
+    warnings
+}
+
+/// One warning if `IGGY_ROOT_PASSWORD` is the development default from
+/// `compose.yaml`. The text names the setting, never the value.
+#[must_use]
+pub fn provision_development_defaults(config: &ProvisionConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if config.root_password.expose_secret() == DEVELOPMENT_ROOT_PASSWORD {
+        warnings.push(development_default_warning("IGGY_ROOT_PASSWORD"));
+    }
+    warnings
+}
+
 /// Everything the binary is configured with.
 #[derive(Debug)]
 pub struct Settings {
@@ -886,7 +928,6 @@ mod tests {
     use std::collections::HashMap;
 
     use mansio_iggy::Durability;
-    use secrecy::ExposeSecret;
 
     use super::*;
 
@@ -1393,6 +1434,65 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn development_defaults_are_named_and_never_shown() {
+        let both = settings(&[
+            ("MANSIO_TOKEN", "mansio-dev-token"),
+            ("MANSIO_IGGY_PASSWORD", "mansio-dev-admin"),
+        ])
+        .unwrap();
+        let warnings = development_defaults(&both);
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("MANSIO_TOKEN"));
+        assert!(warnings[1].contains("MANSIO_IGGY_PASSWORD"));
+
+        let other = settings(&[("MANSIO_TOKEN", "t"), ("MANSIO_IGGY_PASSWORD", "p")]).unwrap();
+        assert!(development_defaults(&other).is_empty());
+
+        let token_only = settings(&[
+            ("MANSIO_TOKEN", "mansio-dev-token"),
+            ("MANSIO_IGGY_PASSWORD", "p"),
+        ])
+        .unwrap();
+        let only = development_defaults(&token_only);
+        assert_eq!(only.len(), 1);
+        assert!(only[0].contains("MANSIO_TOKEN"));
+
+        let memory = settings(&[
+            ("MANSIO_BROKER", "memory"),
+            ("MANSIO_TOKEN", "mansio-dev-token"),
+            ("MANSIO_IGGY_PASSWORD", "mansio-dev-admin"),
+        ])
+        .unwrap();
+        let only = development_defaults(&memory);
+        assert_eq!(only.len(), 1);
+        assert!(only[0].contains("MANSIO_TOKEN"));
+
+        for warning in warnings.iter().chain(&only) {
+            assert!(!warning.contains("mansio-dev-token"));
+            assert!(!warning.contains("mansio-dev-admin"));
+        }
+    }
+
+    #[test]
+    fn the_root_password_default_is_named_and_never_shown() {
+        let config = |root: &str| {
+            let map: HashMap<String, String> = [
+                ("IGGY_ROOT_PASSWORD", root),
+                ("MANSIO_IGGY_PASSWORD", "admin-secret"),
+            ]
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+            Settings::provision_from_lookup(|name| map.get(name).cloned()).unwrap()
+        };
+        let warnings = provision_development_defaults(&config("iggy"));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("IGGY_ROOT_PASSWORD"));
+        assert!(!warnings[0].contains("iggy"));
+        assert!(provision_development_defaults(&config("root-secret")).is_empty());
     }
 
     #[test]
