@@ -225,6 +225,10 @@ async fn every_command_refuses_without_a_token_and_calls_nothing() -> anyhow::Re
             "--offset",
             "1",
         ],
+        vec!["work", "list", "--tenant", &t, "--queue", "builds"],
+        vec![
+            "work", "show", "--tenant", &t, "--queue", "builds", "--item", "i",
+        ],
         vec!["mcp"],
     ];
     for args in &commands {
@@ -1296,8 +1300,10 @@ async fn the_mcp_server_lists_the_tools_and_pulls_and_acks_work_over_stdio() -> 
         "work_ack",
         "work_extend",
         "work_fail",
+        "work_list",
         "work_publish",
         "work_pull",
+        "work_show",
     ];
     expected.sort_unstable();
     assert_eq!(
@@ -1333,6 +1339,109 @@ async fn the_mcp_server_lists_the_tools_and_pulls_and_acks_work_over_stdio() -> 
         target.work_transitions().await?,
         ["claimed", "extended", "acked"]
     );
+    Ok(())
+}
+
+/// `mansio work list`, `mansio work show` and the MCP tools print what the
+/// routes return.
+#[tokio::test]
+async fn work_list_and_work_show_print_what_the_routes_return() -> anyhow::Result<()> {
+    let target = Target::start().await?;
+    let (t, queue) = (target.tenant.clone(), "listing");
+    let first = target.work_publish(queue, &job(1)).await?.envelope;
+    let second = target.work_publish(queue, &job(2)).await?.envelope;
+    let claim = target.claim(queue, "w1", SLACK).await?;
+    target.extend_claim(queue, &claim, Some(30)).await?;
+    let acked = target.claim(queue, "w2", SLACK).await?;
+    target.ack_claim(queue, &acked).await?;
+    let third = target.work_publish(queue, &job(3)).await?.envelope;
+    let (live, done) = (first.id.to_string(), second.id.to_string());
+    assert_eq!(claim.item.id, first.id);
+    assert_eq!(acked.item.id, second.id);
+
+    let route = |rest: String| {
+        let target = &target;
+        async move {
+            let (status, body) = target
+                .authed(
+                    reqwest::Method::GET,
+                    &target.tenant_uri(&format!("work/{queue}/items{rest}")),
+                    None,
+                )
+                .await?;
+            ensure!(status == reqwest::StatusCode::OK, "{status}: {body}");
+            anyhow::Ok(body)
+        }
+    };
+    let listed = route(String::new()).await?;
+    assert_eq!(listed["items"].as_array().map(Vec::len), Some(2));
+    let filtered = route("?state=claimable&count=1".to_owned()).await?;
+    let shown_live = route(format!("/{live}")).await?;
+    let shown_done = route(format!("/{done}")).await?;
+    assert_eq!(shown_done["state"], "finished");
+    assert_eq!(shown_live["envelope"]["id"], json!(live));
+    assert_eq!(listed["items"][1]["item_id"], json!(third.id.to_string()));
+
+    let token = &target.token;
+    let base = ["work", "list", "--tenant", &t, "--queue", queue];
+    assert_eq!(one(&target, token, &base).await?, listed);
+    let mut with_filter = base.to_vec();
+    with_filter.extend(["--state", "claimable", "--count", "1"]);
+    assert_eq!(one(&target, token, &with_filter).await?, filtered);
+    for (item, expected) in [(&live, &shown_live), (&done, &shown_done)] {
+        let args = [
+            "work", "show", "--tenant", &t, "--queue", queue, "--item", item,
+        ];
+        assert_eq!(&one(&target, token, &args).await?, expected);
+    }
+
+    let (base_url, token_owned) = (target.base.clone(), token.clone());
+    let binary = crate::cli_binary()?;
+    let (list_args, live_id, done_id) = (json!({"tenant": t, "queue": queue}), live, done);
+    let (tools, via_list, via_filter, via_live, via_done) =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let mut mcp = Mcp::start(&binary, &base_url, &token_owned)?;
+            mcp.request(
+                1,
+                "initialize",
+                json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "e2e", "version": "1"}
+                }),
+            )?;
+            mcp.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))?;
+            let tools = mcp.request(2, "tools/list", json!({}))?;
+            let via_list = mcp.call(3, "work_list", list_args.clone())?;
+            let mut filter = list_args.clone();
+            filter["state"] = json!("claimable");
+            filter["count"] = json!(1);
+            let via_filter = mcp.call(4, "work_list", filter)?;
+            let mut show = list_args.clone();
+            show["item"] = json!(live_id);
+            let via_live = mcp.call(5, "work_show", show.clone())?;
+            show["item"] = json!(done_id);
+            let via_done = mcp.call(6, "work_show", show)?;
+            mcp.finish()?;
+            Ok((tools, via_list, via_filter, via_live, via_done))
+        })
+        .await??;
+    let names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .context("tools")?
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert!(names.contains(&"work_list") && names.contains(&"work_show"));
+    for (called, expected) in [
+        (via_list, &listed),
+        (via_filter, &filtered),
+        (via_live, &shown_live),
+        (via_done, &shown_done),
+    ] {
+        assert!(!called.0, "{}", called.1);
+        assert_eq!(&serde_json::from_str::<Value>(&called.1)?, expected);
+    }
     Ok(())
 }
 

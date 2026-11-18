@@ -7,6 +7,14 @@ All notable changes to mansio are listed here. The format follows
 
 ### Added
 
+- `work_list` and `work_show`: a queue's live work items can be listed, one
+  page at a time in publish order with each item's state, attempt, holder and
+  lease expiry or retry time, and one item shown with its envelope, on
+  `GET /v1/tenants/{tenant}/work/{queue}/items` and `.../items/{item}`, as
+  `mansio work list` and `mansio work show`, and as the MCP tools `work_list`
+  and `work_show`. A finished item shows only that it is finished. The page
+  size is set by `MANSIO_WORK_LIST_DEFAULT_COUNT` and
+  `MANSIO_WORK_LIST_MAX_COUNT`, which `GET /v1/settings` shows.
 - A release pipeline: release-plz opens the release pull request, merging it
   publishes the crates through crates.io trusted publishing and creates a
   signed `vX.Y.Z` tag, and the release carries `mansio` archives for macOS,

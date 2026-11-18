@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use mansio_core::api::{CreatePrincipal, CreateWebhook};
 use mansio_core::{
-    CausationId, ConsumerName, CorrelationId, EventId, EventType, Grant, IdempotencyKey,
+    CausationId, ConsumerName, CorrelationId, EventId, EventType, Grant, IdempotencyKey, ItemId,
     PrincipalId, PrincipalKind, PrincipalName, Segment, Source, StartPosition, Subject, TenantId,
     Topic, WebhookId,
 };
@@ -43,6 +43,10 @@ pub enum Op {
     WorkAck,
     /// Give a claimed item back as failed.
     WorkFail,
+    /// List the live items of a queue.
+    WorkList,
+    /// Show one item of a queue.
+    WorkShow,
     /// Publish an alert.
     AlertsPublish,
     /// Acknowledge an alert.
@@ -181,7 +185,7 @@ const ENVELOPE: [Param; 8] = [
 
 impl Op {
     /// Every operation, in the order they are listed.
-    pub const ALL: [Op; 19] = [
+    pub const ALL: [Op; 21] = [
         Op::Publish,
         Op::Poll,
         Op::Watch,
@@ -190,6 +194,8 @@ impl Op {
         Op::WorkExtend,
         Op::WorkAck,
         Op::WorkFail,
+        Op::WorkList,
+        Op::WorkShow,
         Op::AlertsPublish,
         Op::AlertsAck,
         Op::PrincipalsCreate,
@@ -214,6 +220,8 @@ impl Op {
             Op::WorkExtend => &["work", "extend"],
             Op::WorkAck => &["work", "ack"],
             Op::WorkFail => &["work", "fail"],
+            Op::WorkList => &["work", "list"],
+            Op::WorkShow => &["work", "show"],
             Op::AlertsPublish => &["alerts", "publish"],
             Op::AlertsAck => &["alerts", "ack"],
             Op::PrincipalsCreate => &["principals", "create"],
@@ -266,6 +274,12 @@ impl Op {
             }
             Op::WorkFail => {
                 "Give an item you claimed back as failed. It is tried again after a backoff, or goes to the dead topic when its attempts are used."
+            }
+            Op::WorkList => {
+                "List the live items of a work queue in publish order, one page as one JSON object, with each item's state, attempt and holder; --state filters and --after takes the next value of the page before."
+            }
+            Op::WorkShow => {
+                "Show one work item of a queue: its state, attempt, holder and lease expiry or when it becomes claimable, and its message as published; a finished item shows only that it is finished."
             }
             Op::AlertsPublish => {
                 "Publish an alert and print it as stored. Its id is the alert's id."
@@ -382,6 +396,26 @@ impl Op {
                 ),
                 required("reason", Kind::Text, "Why it failed."),
             ],
+            Op::WorkList => vec![
+                TENANT,
+                QUEUE,
+                optional(
+                    "state",
+                    Kind::Text,
+                    "Only items in this state: claimable, leased or backoff.",
+                ),
+                optional(
+                    "after",
+                    Kind::Int,
+                    "Start after this position: the next of the page before.",
+                ),
+                optional(
+                    "count",
+                    Kind::Int,
+                    "How many to list at most. The server decides if not given.",
+                ),
+            ],
+            Op::WorkShow => vec![TENANT, QUEUE, required("item", Kind::Text, "The item id.")],
             Op::AlertsPublish => envelope(&[TENANT]),
             Op::AlertsAck => vec![TENANT, required("alert", Kind::Text, "The alert's id.")],
             Op::PrincipalsCreate => vec![
@@ -836,6 +870,60 @@ pub async fn run(
             let reason = [("reason", json!(reason))];
             lease_call(client, op, &args, "fail", &reason, Replay::Unsafe).await
         }
+        Op::WorkList => {
+            let tenant: TenantId = args.parse("tenant")?;
+            let queue: Segment = args.parse("queue")?;
+            let mut query: Vec<(&str, String)> = Vec::new();
+            if let Some(state) = args.text("state") {
+                query.push(("state", state.to_owned()));
+            }
+            if let Some(after) = args.int("after") {
+                query.push(("after", after.to_string()));
+            }
+            if let Some(count) = args.int("count") {
+                query.push(("count", count.to_string()));
+            }
+            let reply = client
+                .call(
+                    Method::GET,
+                    &[
+                        "v1",
+                        "tenants",
+                        tenant.as_str(),
+                        "work",
+                        queue.as_str(),
+                        "items",
+                    ],
+                    &query,
+                    None,
+                    Replay::Safe,
+                )
+                .await?;
+            Ok(vec![answered(reply, "work_list")?])
+        }
+        Op::WorkShow => {
+            let tenant: TenantId = args.parse("tenant")?;
+            let queue: Segment = args.parse("queue")?;
+            let item: ItemId = args.parse("item")?;
+            let reply = client
+                .call(
+                    Method::GET,
+                    &[
+                        "v1",
+                        "tenants",
+                        tenant.as_str(),
+                        "work",
+                        queue.as_str(),
+                        "items",
+                        item.as_str(),
+                    ],
+                    &[],
+                    None,
+                    Replay::Safe,
+                )
+                .await?;
+            Ok(vec![answered(reply, "work_show")?])
+        }
         Op::AlertsPublish => {
             let tenant: TenantId = args.parse("tenant")?;
             let reply = client
@@ -1119,6 +1207,8 @@ mod tests {
                 "work_extend",
                 "work_ack",
                 "work_fail",
+                "work_list",
+                "work_show",
                 "alerts_publish",
                 "alerts_ack",
                 "principals_create",
