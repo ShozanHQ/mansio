@@ -63,7 +63,7 @@ pub use settings::{
     Backend, CredentialSettings, DEFAULT_LISTEN, DEFAULT_METRICS, DEFAULT_SINK_PATH,
     DEFAULT_SINK_SYNC, DEFAULT_SNAPSHOT_DIR, DEFAULT_SNAPSHOT_INTERVAL_SECONDS,
     DEFAULT_TOKEN_PRINCIPAL, Limits, Settings, SettingsError, StreamSettings, WebhookSettings,
-    WorkSettings, retention_warning,
+    WorkSettings, development_defaults, provision_development_defaults, retention_warning,
 };
 pub use sink::{FileSink, SinkOpenError};
 pub use webhooks::Webhooks;

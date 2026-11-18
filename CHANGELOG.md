@@ -15,6 +15,10 @@ All notable changes to mansio are listed here. The format follows
   and `work_show`. A finished item shows only that it is finished. The page
   size is set by `MANSIO_WORK_LIST_DEFAULT_COUNT` and
   `MANSIO_WORK_LIST_MAX_COUNT`, which `GET /v1/settings` shows.
+- A startup warning for each development default from `compose.yaml` in use:
+  mansio-server names `MANSIO_TOKEN` and `MANSIO_IGGY_PASSWORD`, and
+  `provision-admin` names `IGGY_ROOT_PASSWORD`. The warning never shows the
+  value.
 - A release pipeline: release-plz opens the release pull request, merging it
   publishes the crates through crates.io trusted publishing and creates a
   signed `vX.Y.Z` tag, and the release carries `mansio` archives for macOS,
