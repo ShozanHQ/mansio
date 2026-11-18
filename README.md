@@ -95,7 +95,9 @@ port is published on `127.0.0.1:8090`. The token and the passwords in
 token, `iggy` for Iggy's root user, `mansio-dev-admin` for the Iggy user
 mansio-server acts as). Set `MANSIO_TOKEN`, `IGGY_ROOT_PASSWORD` and
 `MANSIO_IGGY_PASSWORD` in the environment, or in a `.env` file, to change
-them. Only Iggy and `iggy-admin` are given the root password.
+them. mansio-server logs a warning for the token and for its Iggy password,
+and `iggy-admin` for the root password, when each is still the default. Only
+Iggy and `iggy-admin` are given the root password.
 
 ```sh
 export MANSIO_TOKEN=mansio-dev-token

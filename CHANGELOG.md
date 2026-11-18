@@ -7,6 +7,10 @@ All notable changes to mansio are listed here. The format follows
 
 ### Added
 
+- A startup warning for each development default from `compose.yaml` in use:
+  mansio-server names `MANSIO_TOKEN` and `MANSIO_IGGY_PASSWORD`, and
+  `provision-admin` names `IGGY_ROOT_PASSWORD`. The warning never shows the
+  value.
 - A release pipeline: release-plz opens the release pull request, merging it
   publishes the crates through crates.io trusted publishing and creates a
   signed `vX.Y.Z` tag, and the release carries `mansio` archives for macOS,
@@ -20,6 +24,10 @@ All notable changes to mansio are listed here. The format follows
 - The README and ARCHITECTURE.md state the guarantee as at-least-once delivery
   with each item acknowledged at most once, and the README's Install says to
   build from a clone until a release is published.
+- `cargo deny check` passes again: the unmaintained advisories for `chrono`
+  (RUSTSEC-2026-0543) and `humantime` (RUSTSEC-2026-0542), both pulled in by
+  `iggy` with no safe upgrade, are acknowledged by id in `deny.toml` until
+  2026-12-18.
 
 - mansio moves to the `iggy` SDK 0.12.0 and Iggy server 0.10.0 (`compose.yaml`
   pins `apache/iggy:0.10.0` by digest), the released pair for binary protocol

@@ -10,7 +10,10 @@ use std::sync::Arc;
 use anyhow::Context;
 use mansio_core::{Broker, BrokerError, MemoryBroker, NoSink, Sink};
 use mansio_iggy::{IggyBroker, Provisioned, provision_admin};
-use mansio_server::{Auth, Backend, FileSink, Server, Settings, retention_warning};
+use mansio_server::{
+    Auth, Backend, FileSink, Server, Settings, development_defaults,
+    provision_development_defaults, retention_warning,
+};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -34,6 +37,9 @@ async fn main() -> anyhow::Result<()> {
 /// Make the Iggy user the server acts as, or set its permissions again.
 async fn provision() -> anyhow::Result<()> {
     let config = Settings::provision_from_env().context("reading settings")?;
+    for warning in provision_development_defaults(&config) {
+        warn!("{warning}");
+    }
     let user = config.admin_username.clone();
     let done = provision_admin(config)
         .await
@@ -47,6 +53,9 @@ async fn provision() -> anyhow::Result<()> {
 
 async fn serve() -> anyhow::Result<()> {
     let settings = Settings::from_env().context("reading settings")?;
+    for warning in development_defaults(&settings) {
+        warn!("{warning}");
+    }
 
     let broker_name = settings.broker.name();
     let broker: Arc<dyn Broker> = match settings.broker {
