@@ -161,6 +161,14 @@ pub const ENDS: &str = "every item ends acked or dead";
 pub const RETRY_ACKED: &str = "an item is acked after a retry";
 pub const REACHES_DEAD: &str = "an item reaches dead";
 
+/// Whether the item has ended: acked once, or dead once.
+///
+/// Shared by [`WorkItem`]'s `eventually` rule and by tests that wrap the
+/// model, so a seeded copy cannot drift from the engine's condition.
+pub fn item_ends(s: &Item) -> bool {
+    s.acks == 1 || s.dead == 1
+}
+
 /// The bounds that keep the check finite.
 const RESTARTS: u8 = 1;
 const LOST: u8 = 1;
@@ -505,7 +513,7 @@ impl Model for WorkItem {
                         && s.live_leases() == 0);
                 within && dead_only_when_spent && nowhere_else
             }),
-            Property::eventually(ENDS, |_, s: &Item| s.acks == 1 || s.dead == 1),
+            Property::eventually(ENDS, |_, s: &Item| item_ends(s)),
             Property::sometimes(RETRY_ACKED, |_, s: &Item| s.acks == 1 && s.attempt >= 2),
             Property::sometimes(REACHES_DEAD, |_, s: &Item| s.dead == 1),
         ]

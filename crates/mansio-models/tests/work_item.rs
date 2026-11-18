@@ -21,7 +21,7 @@ mod helpers {
     use std::hash::Hash;
     use std::num::NonZeroU8;
 
-    use mansio_models::work_item::{ENDS, Item, Step, WorkItem, replay};
+    use mansio_models::work_item::{ENDS, Item, Step, WorkItem, item_ends, replay};
     use mansio_models::{Outcome, Readable, Report, check};
     use stateright::{Model, Property};
 
@@ -171,10 +171,9 @@ mod helpers {
         }
 
         fn properties(&self) -> Vec<Property<Self>> {
-            // The engine's `eventually` rule, with the same condition.
-            vec![Property::eventually(ENDS, |_, s: &Item| {
-                s.acks == 1 || s.dead == 1
-            })]
+            // The engine's `eventually` rule, taken from the work-item model
+            // via `item_ends` so the condition cannot drift.
+            vec![Property::eventually(ENDS, |_, s: &Item| item_ends(s))]
         }
     }
 
