@@ -6,6 +6,12 @@ all-features = true
 
 [advisories]
 yanked = "deny"
+# Unmaintained advisories with no safe upgrade, acknowledged by id. Each
+# entry is reviewed again on the date in its reason.
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained with no safe upgrade; it comes in through iggy, the direct dependency of mansio-iggy (cargo tree -i chrono); look again on 2026-12-18." },
+    { id = "RUSTSEC-2026-0542", reason = "humantime is unmaintained with no safe upgrade; it comes in through iggy, the direct dependency of mansio-iggy (cargo tree -i humantime); look again on 2026-12-18." },
+]
 
 [licenses]
 # Permissive licences only. A new dependency under another licence fails CI
