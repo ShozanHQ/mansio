@@ -137,6 +137,12 @@ publish is also appended to `mansio-sink.jsonl`.
 
 ## Install
 
+No release is published yet. Until one is, build from a clone:
+`cargo install --path crates/mansio --locked` for the command line, and
+`docker compose up --build --wait` (see [Run it](#run-it)) for the server.
+
+Once 0.1.0 is published:
+
 Each release, `vX.Y.Z`, is on the
 [releases page](https://github.com/ShozanHQ/mansio/releases).
 
@@ -147,7 +153,7 @@ Linux (x86-64 and arm64) and Windows (x86-64), each with its `.sha256`:
 gh release download v0.1.0 --repo ShozanHQ/mansio --pattern 'mansio-aarch64-apple-darwin.tar.xz*'
 ```
 
-Or from source: `cargo install mansio --locked`.
+Or from crates.io, once it is published there: `cargo install mansio --locked`.
 
 The server, as a multi-arch (linux/amd64 and linux/arm64) image:
 
@@ -160,7 +166,8 @@ The libraries, `mansio-core`, `mansio-iggy` and `mansio-server`, are on
 
 ## Verify a release
 
-Everything a release publishes was built by this repository's release workflow,
+Once 0.1.0 is published:
+everything a release publishes was built by this repository's release workflow,
 and you can check that before you run it. You need the
 [GitHub CLI](https://cli.github.com) for the first two checks and
 [cosign](https://docs.sigstore.dev/cosign/installation/) for the others.
@@ -206,8 +213,12 @@ git -c gpg.ssh.allowedSignersFile=.github/release-signers verify-tag v0.1.0
 
 ## The guarantee
 
-Work is never dropped and never done twice, for consumers that are not always
-connected. [`tests/offline/run.sh`](tests/offline/run.sh) is that claim, run on
+No work item is lost, and each is acknowledged at most once, for consumers that
+are not always connected. Delivery is at least once: an item whose lease ends
+is given to another consumer, so a worker makes its effect idempotent on
+`itemid`, does the effect, then acknowledges. The test below counts
+acknowledgements, not effects (the paragraph after its scenarios says why).
+[`tests/offline/run.sh`](tests/offline/run.sh) is that claim, run on
 every pull request by the `offline` job of CI, against Iggy through compose. It
 mints an agent credential for a fresh tenant with `mansio principals create`
 and runs three scenarios of N items (`MANSIO_OFFLINE_ITEMS`, 50) with a
@@ -441,7 +452,7 @@ starts, not inside a request. The same key from another principal is answered
 409 with no envelope. A publish
 without a key, a key on `presence` and `work_publish` are not deduplicated, and a
 publish that answered 503 may be stored without its key being remembered, so
-consumers still deduplicate on `id`. ARCHITECTURE.md has the whole rule.
+consumers still deduplicate on `id` and `idempotencykey`. ARCHITECTURE.md has the whole rule.
 
 A refusal is `{"error":{"code":"...","message":"..."}}` with status 400, 401
 (no valid credential), 403 (a valid credential that may not do this, or a lease
@@ -1002,6 +1013,10 @@ for it, so a sum across servers does not count a tenant twice.
 Every durable publish mansio makes (messages, work, transitions) is recorded
 in the sink and then published, with a lock per tenant held across both, so
 the sink sees each tenant's messages in the order the topics hold them.
+So one tenant's durable writes, the claims of every queue included, go one at
+a time, each waiting for the sink and then the broker. A tenant's rate is about
+one over the sum of those two delays; load that needs more is split across
+tenants.
 
 ## Settings
 
@@ -1033,7 +1048,7 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_RECOVERY_LOG_SECONDS` | `60` | While the broker will not list its tenants at startup (for example an Iggy user that may not list streams), the server asks again after a wait that doubles from one tick up to this many seconds, and logs the failure at most once per this interval. At least 1. |
 | `MANSIO_SNAPSHOT_INTERVAL_SECONDS` | `300` | How often the state of a tenant that has changed is written to a snapshot, which the next start reads instead of replaying every topic from offset 0 (see "Snapshots" in ARCHITECTURE.md). 0 writes none. |
 | `MANSIO_SNAPSHOT_DIR` | `mansio-snapshots` | The directory of the snapshots, one file per tenant; `/data/snapshots` in the container image. Empty keeps none. A snapshot that cannot be read is ignored with a warning and the start replays from offset 0. |
-| `MANSIO_OWNER_TTL_SECONDS` | `0` | Set on every mansio-server that shares a broker, to the same value (3 or more; 30 or more for a cluster that stays up for months, because every owner appends a record each quarter of it, about 11,500 a day per tenant at 30, and a starting server reads them all), to run more than one: a tenant is served by one of them, and another takes it over this long (and a quarter more) after its server stops renewing it. `0` serves every tenant and must be the only server on its broker (see [More than one server per broker](#more-than-one-server-per-broker)). |
+| `MANSIO_OWNER_TTL_SECONDS` | `0` | Set on every mansio-server that shares a broker, to the same value (3 or more; 30 or more for a cluster that stays up for months, because every owner appends a record each quarter of it, about 11,500 a day at 30 per server that owns tenants, and a starting server reads them all), to run more than one: a tenant is served by one of them, and another takes it over this long (and a quarter more) after its server stops renewing it. `0` serves every tenant and must be the only server on its broker (see [More than one server per broker](#more-than-one-server-per-broker)). |
 | `MANSIO_ALERT_RESURFACE_SECONDS` | `3600` | How long an alert may go unacknowledged before it is surfaced again, and again after each further interval. |
 | `MANSIO_TICK_MILLIS` | `500` | How often the timer looks for leases to expire, items to republish and alerts to surface again. |
 | `MANSIO_IDEMPOTENCY_WINDOW_SECONDS` | `86400` | How long a publish's `idempotencykey` is remembered. A second publish to the same tenant and topic with the same key inside the window is answered 200 with the first envelope and offset and publishes nothing. At least `1`, at most `315360000` (ten years). |

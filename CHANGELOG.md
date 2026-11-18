@@ -17,6 +17,10 @@ All notable changes to mansio are listed here. The format follows
 
 ### Changed
 
+- The README and ARCHITECTURE.md state the guarantee as at-least-once delivery
+  with each item acknowledged at most once, and the README's Install says to
+  build from a clone until a release is published.
+
 - mansio moves to the `iggy` SDK 0.12.0 and Iggy server 0.10.0 (`compose.yaml`
   pins `apache/iggy:0.10.0` by digest), the released pair for binary protocol
   0.12. mansio no longer works with Iggy server 0.9: an SDK only talks to
