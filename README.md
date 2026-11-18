@@ -359,9 +359,10 @@ mansio webhooks rotate --id WEBHOOKID
   lease is given it again, so a claim whose answer is lost does not leave an
   item leased to nobody), `work extend` (a repeat leaves the lease running to
   the later of the two ends) and `consumers commit`. A `publish`, an `ack` and the
-  like are not, so give a `publish`, `work publish` or `alerts publish` an
-  `--id` and send it again yourself if it fails: a 409 then means the first
-  attempt was stored.
+  like are not, so give a `work publish` or `alerts publish` an `--id` and
+  send it again yourself if it fails: a 409 then means the first attempt was
+  stored. Give a `publish` an `--idempotency-key` instead of an `--id`: a
+  plain publish does not check the id.
 
 ## MCP
 
@@ -439,7 +440,9 @@ the envelope back from the topic, and if retention has removed it the answer is
 409 naming the first id. The log is read when the server
 starts, not inside a request. The same key from another principal is answered
 409 with no envelope. A publish
-without a key, a key on `presence` and `work_publish` are not deduplicated, and a
+without a key and a key on `presence` are not deduplicated, and `work_publish`
+refuses a key with a 400 that names `id`, because a work item is made safe to
+send again by its id; a
 publish that answered 503 may be stored without its key being remembered, so
 consumers still deduplicate on `id`. ARCHITECTURE.md has the whole rule.
 
@@ -572,8 +575,17 @@ curl ... -d '{"lease_id":"<uuid>","consumer":"worker-1","reason":"out of memory"
 - A client that gets a 503 from `work_publish` or `alerts_publish` cannot tell
   whether the message was stored. It sends it again with the same `id`: a 409
   then means the first attempt was stored, and there is nothing to resend.
-  Without an `id` the resend is a new item. A 502 is a refusal the broker
-  named before it stored anything: nothing was stored.
+  Without an `id` the resend is a new item, so choose the id before the first
+  send:
+
+  ```sh
+  id=0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b1
+  mansio work publish --tenant t --queue q --type job --source ci --id "$id"   # 201
+  mansio work publish --tenant t --queue q --type job --source ci --id "$id"   # 409: the first was stored
+  ```
+
+  A 502 is a refusal the broker named before it stored anything: nothing was
+  stored.
 - A restarted server rebuilds all of this from `work.<queue>`, `facts.work`
   and `dead`, so it drops no item and republishes none twice. A publish that
   fails may still have been stored, so the server rebuilds the tenant from the

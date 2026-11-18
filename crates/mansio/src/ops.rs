@@ -148,7 +148,27 @@ const CONSUMER_NAMED: Param = required(
     Kind::Text,
     "The consumer's name, one of yours: the server keeps its position.",
 );
-const ENVELOPE: [Param; 8] = [
+const IDEMPOTENCY_KEY: Param = optional(
+    "idempotency_key",
+    Kind::Text,
+    "A key that makes a publish safe to send again: a second publish to the topic with the same key inside the window answers 200 with the first and publishes nothing.",
+);
+const ID_ALERT: Param = optional(
+    "id",
+    Kind::Text,
+    "The id to give it, a lowercase UUID. Sending the same id again is how a lost answer is safely retried.",
+);
+const ID_EVENT: Param = optional(
+    "id",
+    Kind::Text,
+    "The id to give it, a lowercase UUID. A repeated id is not refused here: to make a resend safe, give an idempotency_key.",
+);
+const ID_WORK: Param = optional(
+    "id",
+    Kind::Text,
+    "The id to give it, a lowercase UUID. Give an id to make the publish safe to send again: a repeat of the id answers 409, which means the first one was stored.",
+);
+const ENVELOPE: [Param; 6] = [
     required("type", Kind::Text, "What happened (CloudEvents type)."),
     required(
         "source",
@@ -166,16 +186,6 @@ const ENVELOPE: [Param; 8] = [
         "causation_id",
         Kind::Text,
         "The event that caused this one.",
-    ),
-    optional(
-        "idempotency_key",
-        Kind::Text,
-        "A key that makes a publish safe to send again: a second publish to the topic with the same key inside the window answers 200 with the first and publishes nothing.",
-    ),
-    optional(
-        "id",
-        Kind::Text,
-        "The id to give it, a lowercase UUID. Sending the same id again is how a lost answer is safely retried.",
     ),
 ];
 
@@ -253,7 +263,7 @@ impl Op {
                 "Stream the envelopes of a topic as they arrive, one JSON object per line. With --consumer the server keeps the position, so a restart resumes at the next envelope; stop with SIGINT or SIGTERM."
             }
             Op::WorkPublish => {
-                "Publish a work item to a queue and print it as stored. The item is named by its id."
+                "Publish a work item to a queue and print it as stored. The item is named by its id. To resend safely, choose the id before the first send."
             }
             Op::WorkPull => {
                 "Claim the oldest claimable item of a queue under a lease and print the lease id, the consumer, the expiry and the item. Prints nothing if there is none. A consumer that holds a live lease is given it again, so asking again after a lost answer is safe."
@@ -299,10 +309,16 @@ impl Op {
 
     /// The parameters.
     pub fn params(self) -> Vec<Param> {
-        let envelope =
-            |first: &[Param]| -> Vec<Param> { first.iter().copied().chain(ENVELOPE).collect() };
+        let envelope = |first: &[Param], last: &[Param]| -> Vec<Param> {
+            first
+                .iter()
+                .copied()
+                .chain(ENVELOPE)
+                .chain(last.iter().copied())
+                .collect()
+        };
         match self {
-            Op::Publish => envelope(&[TENANT, TOPIC]),
+            Op::Publish => envelope(&[TENANT, TOPIC], &[IDEMPOTENCY_KEY, ID_EVENT]),
             Op::Poll => vec![
                 TENANT,
                 TOPIC,
@@ -332,7 +348,7 @@ impl Op {
                 ),
                 optional("limit", Kind::Int, "Stop after this many envelopes."),
             ],
-            Op::WorkPublish => envelope(&[TENANT, QUEUE]),
+            Op::WorkPublish => envelope(&[TENANT, QUEUE], &[ID_WORK]),
             Op::WorkPull => vec![
                 TENANT,
                 QUEUE,
@@ -382,7 +398,7 @@ impl Op {
                 ),
                 required("reason", Kind::Text, "Why it failed."),
             ],
-            Op::AlertsPublish => envelope(&[TENANT]),
+            Op::AlertsPublish => envelope(&[TENANT], &[IDEMPOTENCY_KEY, ID_ALERT]),
             Op::AlertsAck => vec![TENANT, required("alert", Kind::Text, "The alert's id.")],
             Op::PrincipalsCreate => vec![
                 required(

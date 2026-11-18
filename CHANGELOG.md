@@ -17,6 +17,8 @@ All notable changes to mansio are listed here. The format follows
 
 ### Changed
 
+- `work publish` and the `work_publish` tool no longer take an idempotency key, which they accepted and ignored: a body with `idempotencykey` is refused with 400 that names `id`, and a work item is sent again safely by choosing its `id` first (a repeat answers 409). The `publish` help now points at `idempotency_key` instead of the id.
+
 - mansio moves to the `iggy` SDK 0.12.0 and Iggy server 0.10.0 (`compose.yaml`
   pins `apache/iggy:0.10.0` by digest), the released pair for binary protocol
   0.12. mansio no longer works with Iggy server 0.9: an SDK only talks to
