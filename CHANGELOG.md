@@ -7,6 +7,10 @@ All notable changes to mansio are listed here. The format follows
 
 ### Added
 
+- A startup warning for each development default from `compose.yaml` in use:
+  mansio-server names `MANSIO_TOKEN` and `MANSIO_IGGY_PASSWORD`, and
+  `provision-admin` names `IGGY_ROOT_PASSWORD`. The warning never shows the
+  value.
 - A release pipeline: release-plz opens the release pull request, merging it
   publishes the crates through crates.io trusted publishing and creates a
   signed `vX.Y.Z` tag, and the release carries `mansio` archives for macOS,
@@ -18,6 +22,10 @@ All notable changes to mansio are listed here. The format follows
 ### Changed
 
 - `work publish` and the `work_publish` tool no longer take an idempotency key, which they accepted and ignored: a body with `idempotencykey` is refused with 400 that names `id`, and a work item is sent again safely by choosing its `id` first (a repeat answers 409). The `publish` help now points at `idempotency_key` instead of the id.
+- `cargo deny check` passes again: the unmaintained advisories for `chrono`
+  (RUSTSEC-2026-0543) and `humantime` (RUSTSEC-2026-0542), both pulled in by
+  `iggy` with no safe upgrade, are acknowledged by id in `deny.toml` until
+  2026-12-18.
 
 - mansio moves to the `iggy` SDK 0.12.0 and Iggy server 0.10.0 (`compose.yaml`
   pins `apache/iggy:0.10.0` by digest), the released pair for binary protocol
