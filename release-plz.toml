@@ -20,8 +20,6 @@ pr_name = "chore: release v{{ version }}"
 [changelog]
 # The history is not in the conventional commit style (a squash commit's title
 # is the pull request's title), so every commit is listed, under one heading.
-conventional_commits = false
-filter_unconventional = false
 commit_parsers = [{ message = ".*", group = "Changed" }]
 
 [[package]]
