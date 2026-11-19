@@ -4,7 +4,8 @@
 //! (`work.<queue>`, `facts.work`, `dead`, `alerts`, `facts.alert`), and
 //! [`crate::recover`] rebuilds it from them on start.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::Bound;
 use std::time::Duration;
 
 use mansio_core::{
@@ -188,6 +189,10 @@ pub(crate) struct Queue {
     /// `(order, id)` of every item in [`Phase::Ready`], so that the oldest
     /// is the first.
     ready: BTreeSet<(u64, ItemId)>,
+    /// Every open item by its order, so that a list walks the queue in
+    /// position order without sorting it. An order belongs to one item. It is
+    /// derived from `items` and is not part of a [`QueueRecord`].
+    positions: BTreeMap<u64, ItemId>,
     /// The order the next addition gets.
     next_order: u64,
     /// When each leased, backing-off and owing item is due.
@@ -239,6 +244,7 @@ impl Queue {
             // An order past `next_order` would let a later addition stand
             // before an earlier one.
             queue.next_order = queue.next_order.max(item.order.saturating_add(1));
+            queue.positions.insert(item.order, id.clone());
             if item.phase == Phase::Ready {
                 queue.ready.insert((item.order, id.clone()));
             }
@@ -255,6 +261,19 @@ impl Queue {
     /// Whether the id belongs to an item, open or done.
     pub(crate) fn knows(&self, id: &ItemId) -> bool {
         self.items.contains_key(id) || self.finished.contains(id)
+    }
+
+    /// The open items in position order, from the first one after position
+    /// `after` (from the first of all when there is none), each with its
+    /// position.
+    pub(crate) fn items_after(
+        &self,
+        after: Option<u64>,
+    ) -> impl Iterator<Item = (u64, &ItemId, &Item)> {
+        let start = after.map_or(Bound::Unbounded, Bound::Excluded);
+        self.positions
+            .range((start, Bound::Unbounded))
+            .filter_map(|(order, id)| self.items.get(id).map(|item| (*order, id, item)))
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&ItemId, &Item)> {
@@ -340,6 +359,7 @@ impl Queue {
         if phase == Phase::Ready {
             self.ready.insert((order, id.clone()));
         }
+        self.positions.insert(order, id.clone());
         self.timers.add(&id, &phase);
         self.items.insert(
             id,
@@ -354,6 +374,7 @@ impl Queue {
     fn remove(&mut self, id: &ItemId) {
         if let Some(old) = self.items.remove(id) {
             self.ready.remove(&(old.order, id.clone()));
+            self.positions.remove(&old.order);
             self.timers.remove(id, &old.phase);
         }
     }
@@ -383,6 +404,8 @@ impl Queue {
         let order = self.take_order();
         if let Some(item) = self.items.get_mut(id) {
             self.ready.remove(&(item.order, id.clone()));
+            self.positions.remove(&item.order);
+            self.positions.insert(order, id.clone());
             item.message = message;
             item.order = order;
         }
@@ -853,6 +876,70 @@ mod tests {
         queue.insert(a.clone(), message(1).1, leased(7));
         queue.insert(a.clone(), message(1).1, Phase::Ready);
         assert!(due(&queue, i64::MAX).is_empty());
+    }
+
+    fn listed(queue: &Queue) -> Vec<ItemId> {
+        queue
+            .items_after(None)
+            .map(|(_, id, _)| id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_position_index_holds_exactly_the_live_items_in_order() {
+        let mut queue = Queue::default();
+        let ids: Vec<ItemId> = (1..=4)
+            .map(|n| {
+                let (id, message) = message(n);
+                queue.insert(id.clone(), message, Phase::Ready);
+                id
+            })
+            .collect();
+        assert_eq!(listed(&queue), ids);
+
+        // A new version moves an item to the end.
+        queue.set_message(&ids[0], message(1).1);
+        assert_eq!(
+            listed(&queue),
+            [
+                ids[1].clone(),
+                ids[2].clone(),
+                ids[3].clone(),
+                ids[0].clone()
+            ]
+        );
+        // Inserting an id again does too.
+        queue.insert(ids[1].clone(), message(2).1, Phase::Ready);
+        assert_eq!(
+            listed(&queue),
+            [
+                ids[2].clone(),
+                ids[3].clone(),
+                ids[0].clone(),
+                ids[1].clone()
+            ]
+        );
+        // A finished item leaves it.
+        queue.finish(&ids[3]);
+        assert_eq!(
+            listed(&queue),
+            [ids[2].clone(), ids[0].clone(), ids[1].clone()]
+        );
+
+        // After a position, the rest.
+        let all: Vec<u64> = queue.items_after(None).map(|(at, _, _)| at).collect();
+        let after: Vec<ItemId> = queue
+            .items_after(Some(all[0]))
+            .map(|(_, id, _)| id.clone())
+            .collect();
+        assert_eq!(after, [ids[0].clone(), ids[1].clone()]);
+        assert_eq!(queue.items_after(Some(u64::MAX)).count(), 0);
+
+        // A record keeps the positions, and a queue made from it lists alike.
+        let record = queue.to_record();
+        let rebuilt = Queue::from_record(record);
+        assert_eq!(listed(&rebuilt), listed(&queue));
+        assert_eq!(rebuilt.items_after(None).count(), rebuilt.len());
     }
 
     #[test]

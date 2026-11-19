@@ -25,6 +25,7 @@ mod restart;
 mod surfaces;
 mod webhooks;
 mod work;
+mod work_list;
 
 use std::path::PathBuf;
 use std::process::{Command, Output};

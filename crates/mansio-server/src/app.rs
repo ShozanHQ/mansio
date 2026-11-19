@@ -346,7 +346,11 @@ impl Server {
             .route("/v1/events", get(events_api::events_stream))
             .route(
                 "/v1/tenants/{tenant}/work/{queue}/items",
-                post(work_api::work_publish),
+                post(work_api::work_publish).get(work_api::work_list),
+            )
+            .route(
+                "/v1/tenants/{tenant}/work/{queue}/items/{item}",
+                get(work_api::work_show),
             )
             .route(
                 "/v1/tenants/{tenant}/work/{queue}/pull",
@@ -563,6 +567,8 @@ async fn settings(
         max_body_bytes: u64::try_from(limits.max_body_bytes).unwrap_or(u64::MAX),
         poll_default_count: limits.poll_default_count,
         poll_max_count: limits.poll_max_count,
+        work_list_default_count: limits.work_list_default_count,
+        work_list_max_count: limits.work_list_max_count,
         agent_credential_ttl_seconds: seconds(credentials.agent_ttl),
         credential_recheck_seconds: seconds(credentials.recheck),
         credential_sweep_seconds: seconds(credentials.sweep),
@@ -834,6 +840,7 @@ mod tests {
                 max_body_bytes: 2048,
                 poll_default_count: 3,
                 poll_max_count: 5,
+                ..Limits::default()
             })
             .router()
     }

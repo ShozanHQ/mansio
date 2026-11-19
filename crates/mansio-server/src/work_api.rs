@@ -1,17 +1,20 @@
-//! The HTTP handlers for work items and alerts: `work_publish`, `work_pull`,
-//! `work_extend`, `work_ack`, `work_fail`, `alerts_publish` and `alerts_ack`.
+//! The HTTP handlers for work items and alerts: `work_publish`, `work_list`,
+//! `work_show`, `work_pull`, `work_extend`, `work_ack`, `work_fail`, `alerts_publish` and `alerts_ack`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Json;
-use axum::extract::rejection::{BytesRejection, PathRejection};
-use axum::extract::{Path, State};
+use axum::extract::rejection::{BytesRejection, PathRejection, QueryRejection};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use mansio_core::api::{AckRequest, ExtendRequest, FailRequest, Published, PullRequest};
+use mansio_core::api::{
+    AckRequest, ExtendRequest, FailRequest, Published, PullRequest, WorkItem, WorkItems, WorkState,
+};
 use mansio_core::{Action, BrokerError, ConsumerName, ItemId, LeaseId, Segment, TenantId, Topic};
+use serde::Deserialize;
 
 use crate::app::{AppState, Origin, build_envelope, parse_body, parse_part, read_body};
 use crate::auth::{Actor, Authenticated};
@@ -99,6 +102,118 @@ pub(crate) async fn work_pull(
         Some(claimed) => Json(claimed).into_response(),
         None => StatusCode::NO_CONTENT.into_response(),
     })
+}
+
+/// The query of `work_list`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ListQuery {
+    state: Option<String>,
+    after: Option<u64>,
+    count: Option<u32>,
+}
+
+/// The read a credential makes as itself before the engine is reached, so
+/// the broker decides whether it may read the queue. `false` if the queue
+/// does not exist.
+async fn may_read(
+    state: &AppState,
+    actor: &Actor,
+    tenant: &TenantId,
+    topic: &Topic,
+) -> Result<bool, ApiError> {
+    if actor.is_admin() {
+        return Ok(true);
+    }
+    match state
+        .broker
+        .poll(&actor.caller(), tenant, topic, 0, 0)
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(BrokerError::NotFound(_)) => Ok(false),
+        Err(error) => Err(ApiError::from(error).logged(tenant, topic)),
+    }
+}
+
+/// `GET /v1/tenants/{tenant}/work/{queue}/items`: a page of the queue's live
+/// items in publish order, without their envelopes. `state` is one of
+/// `claimable`, `leased` and `backoff`; `after` is the `next` of the page
+/// before.
+pub(crate) async fn work_list(
+    State(state): State<Arc<AppState>>,
+    Authenticated(actor): Authenticated,
+    path: Result<Path<(String, String)>, PathRejection>,
+    query: Result<Query<ListQuery>, QueryRejection>,
+) -> Result<Json<WorkItems>, ApiError> {
+    let Path((tenant, queue)) = path.map_err(|e| path_error(&e))?;
+    let (tenant, queue): (TenantId, Segment) = (parse_part(&tenant)?, parse_part(&queue)?);
+    let topic = Topic::Work(queue.clone());
+    actor.authorize(Action::Poll, &tenant, &topic)?;
+    let Query(query) = query.map_err(|e| ApiError::BadRequest(e.body_text()))?;
+    let wanted = match query.state.as_deref() {
+        None => None,
+        Some("claimable") => Some(WorkState::Claimable),
+        Some("leased") => Some(WorkState::Leased),
+        Some("backoff") => Some(WorkState::Backoff),
+        Some("finished") => {
+            return Err(ApiError::BadRequest(
+                "finished items are not listed; show one by its id".to_owned(),
+            ));
+        }
+        Some(other) => {
+            return Err(ApiError::BadRequest(format!(
+                "state must be claimable, leased or backoff, not {other}"
+            )));
+        }
+    };
+    let limits = &state.limits;
+    let count = query.count.unwrap_or(limits.work_list_default_count);
+    if count == 0 || count > limits.work_list_max_count {
+        return Err(ApiError::BadRequest(format!(
+            "count must be between 1 and {}",
+            limits.work_list_max_count
+        )));
+    }
+    if !may_read(&state, &actor, &tenant, &topic).await? {
+        return Ok(Json(WorkItems {
+            items: Vec::new(),
+            next: None,
+        }));
+    }
+    let count = usize::try_from(count).unwrap_or(usize::MAX);
+    let page = state
+        .engine
+        .work_list(&tenant, &queue, wanted, query.after, count)
+        .await
+        .map_err(|error| error.logged(&tenant, &topic))?;
+    Ok(Json(page))
+}
+
+/// `GET /v1/tenants/{tenant}/work/{queue}/items/{item}`: one item. A live one
+/// comes with its envelope, a finished one as finished and nothing more.
+pub(crate) async fn work_show(
+    State(state): State<Arc<AppState>>,
+    Authenticated(actor): Authenticated,
+    path: Result<Path<(String, String, String)>, PathRejection>,
+) -> Result<Json<WorkItem>, ApiError> {
+    let Path((tenant, queue, item)) = path.map_err(|e| path_error(&e))?;
+    let (tenant, queue, item): (TenantId, Segment, ItemId) = (
+        parse_part(&tenant)?,
+        parse_part(&queue)?,
+        parse_part(&item)?,
+    );
+    let topic = Topic::Work(queue.clone());
+    actor.authorize(Action::Poll, &tenant, &topic)?;
+    if !may_read(&state, &actor, &tenant, &topic).await? {
+        return Err(ApiError::NotFound(format!("no item {item} in {queue}")));
+    }
+    let shown = state
+        .engine
+        .work_show(&tenant, &queue, &item)
+        .await
+        .map_err(|error| error.logged(&tenant, &topic))?;
+    Ok(Json(shown))
 }
 
 /// `POST /v1/tenants/{tenant}/work/{queue}/items/{item}/extend`: move the end
