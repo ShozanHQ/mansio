@@ -43,7 +43,7 @@
 #   MANSIO_WEBHOOK_TIMEOUT_SECONDS, MANSIO_WEBHOOK_URL_MAX_BYTES,
 #   MANSIO_WEBHOOK_ALLOW_PRIVATE_DESTINATIONS,
 #   MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS,
-#   MANSIO_OWNER_TTL_SECONDS
+#   MANSIO_OWNER_TTL_SECONDS, MANSIO_EXPECT_PEERS
 #
 # A webhook to a program on the host is reached from the container as
 # host.docker.internal, which the mansio-server service maps to the host.
@@ -138,7 +138,7 @@ services:
         condition: service_healthy
       iggy-admin:
         condition: service_completed_successfully
-    environment:
+    environment: &mansio-server-env
       MANSIO_BROKER: iggy
       MANSIO_TOKEN: ${MANSIO_TOKEN:-mansio-dev-token}
       MANSIO_IGGY_ADDRESS: iggy:8090
@@ -180,6 +180,7 @@ services:
       MANSIO_WEBHOOK_ALLOW_PRIVATE_DESTINATIONS: ${MANSIO_WEBHOOK_ALLOW_PRIVATE_DESTINATIONS:-}
       MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS: ${MANSIO_WEBHOOK_ROTATION_GRACE_SECONDS:-}
       MANSIO_OWNER_TTL_SECONDS: ${MANSIO_OWNER_TTL_SECONDS:-}
+      MANSIO_EXPECT_PEERS: ${MANSIO_EXPECT_PEERS:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -195,15 +196,27 @@ services:
       # /healthz is dark until it has. Failures in this period do not count.
       start_period: ${MANSIO_HEALTH_START_PERIOD:-60s}
 
-  # A second server on the same Iggy, to share tenants with the first: run
-  # both with MANSIO_OWNER_TTL_SECONDS set, and start this one with
+  # A second server on the same Iggy, to share tenants with the first. Start
+  # both with
   #
-  #   docker compose --profile ha up --build --wait
+  #   MANSIO_OWNER_TTL_SECONDS=30 docker compose --profile ha up --build --wait
+  #
+  # Without the variable this server refuses to start (it runs with
+  # MANSIO_EXPECT_PEERS=true), and its log says why. The limits of two servers:
+  # each server delivers every webhook it holds, so a receiver sees a delivery
+  # once per server and deduplicates on the envelope id; a named consumer's
+  # position committed on one server is not seen by the other until it
+  # restarts.
   #
   # It has a sink and snapshots of its own, and listens on host port 7071.
   mansio-server-b:
     <<: *mansio-server
     profiles: ["ha"]
+    # The merge above takes the top level only, so the environment is merged
+    # here. The owner ttl is the first server's, so both always get one value.
+    environment:
+      <<: *mansio-server-env
+      MANSIO_EXPECT_PEERS: "true"
     # A server that is killed stays down, so that the run shows the other
     # taking its tenants. One that came back would be a new identity that waits
     # out the ttl all the same.
