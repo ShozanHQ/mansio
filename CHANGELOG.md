@@ -25,6 +25,9 @@ All notable changes to mansio are listed here. The format follows
 
 ### Changed
 
+- The README and ARCHITECTURE.md state the guarantee as at-least-once delivery
+  with each item acknowledged at most once, and the README's Install says to
+  build from a clone until a release is published.
 - `work publish` and the `work_publish` tool no longer take an idempotency key, which they accepted and ignored: a body with `idempotencykey` is refused with 400 that names `id`, and a work item is sent again safely by choosing its `id` first (a repeat answers 409). The `publish` help now points at `idempotency_key` instead of the id.
 - `cargo deny check` passes again: the unmaintained advisories for `chrono`
   (RUSTSEC-2026-0543) and `humantime` (RUSTSEC-2026-0542), both pulled in by
