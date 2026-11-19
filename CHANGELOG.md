@@ -7,6 +7,14 @@ All notable changes to mansio are listed here. The format follows
 
 ### Added
 
+- `work_list` and `work_show`: a queue's live work items can be listed, one
+  page at a time in publish order with each item's state, attempt, holder and
+  lease expiry or retry time, and one item shown with its envelope, on
+  `GET /v1/tenants/{tenant}/work/{queue}/items` and `.../items/{item}`, as
+  `mansio work list` and `mansio work show`, and as the MCP tools `work_list`
+  and `work_show`. A finished item shows only that it is finished. The page
+  size is set by `MANSIO_WORK_LIST_DEFAULT_COUNT` and
+  `MANSIO_WORK_LIST_MAX_COUNT`, which `GET /v1/settings` shows.
 - `MANSIO_EXPECT_PEERS`: a server with it `true` and no
   `MANSIO_OWNER_TTL_SECONDS` refuses to start. The `ha` profile's second server
   sets it, so the two-server command is now
@@ -25,6 +33,9 @@ All notable changes to mansio are listed here. The format follows
 
 ### Changed
 
+- The README and ARCHITECTURE.md state the guarantee as at-least-once delivery
+  with each item acknowledged at most once, and the README's Install says to
+  build from a clone until a release is published.
 - `work publish` and the `work_publish` tool no longer take an idempotency key, which they accepted and ignored: a body with `idempotencykey` is refused with 400 that names `id`, and a work item is sent again safely by choosing its `id` first (a repeat answers 409). The `publish` help now points at `idempotency_key` instead of the id.
 - `cargo deny check` passes again: the unmaintained advisories for `chrono`
   (RUSTSEC-2026-0543) and `humantime` (RUSTSEC-2026-0542), both pulled in by

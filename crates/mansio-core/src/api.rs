@@ -6,7 +6,10 @@ use crate::access::Grant;
 use crate::broker::Stored;
 use crate::credential::Credential;
 use crate::envelope::{Envelope, Timestamp};
-use crate::id::{ConsumerName, LeaseId, PrincipalKind, PrincipalName, TenantId};
+use crate::id::{
+    ConsumerName, EventType, ItemId, LeaseId, Principal, PrincipalKind, PrincipalName, Subject,
+    TenantId,
+};
 use crate::principal::PrincipalInfo;
 use crate::topic::Topic;
 use crate::webhook::{StartPosition, WebhookInfo, WebhookSecret};
@@ -70,6 +73,75 @@ pub struct Claimed {
     pub expires_at: Timestamp,
     /// The work message, with its `itemid` and `attempt`.
     pub item: Envelope,
+}
+
+/// Where a work item stands, as `work_list` and `work_show` answer it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkState {
+    /// Waiting for a consumer to claim it.
+    Claimable,
+    /// Claimed, until its lease ends.
+    Leased,
+    /// Failed or expired, waiting out its backoff before it is claimable
+    /// again.
+    Backoff,
+    /// Acknowledged or sent to `dead`. Only `work_show` answers it.
+    Finished,
+}
+
+/// One work item as `work_list` and `work_show` answer it. A value that does
+/// not apply to the item's state is left out. The lease id is never part of
+/// it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkItem {
+    /// The item's id.
+    pub item_id: ItemId,
+    /// Where the item stands.
+    pub state: WorkState,
+    /// The attempt of the item's current version, from 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    /// The type of the current version's envelope.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub event_type: Option<EventType>,
+    /// The subject of the current version's envelope, if it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<Subject>,
+    /// When the current version was published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<Timestamp>,
+    /// Who published the current version. For attempt 2 and later that is the
+    /// engine, which republishes a retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<Principal>,
+    /// Who holds the lease. `leased` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<Principal>,
+    /// The consumer name the lease was taken under. `leased` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumer: Option<ConsumerName>,
+    /// When the lease ends. `leased` only; it may be in the past until the
+    /// timer expires the lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<Timestamp>,
+    /// When the item becomes claimable. `backoff` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimable_at: Option<Timestamp>,
+    /// The current version's envelope as published. `work_show` of a live
+    /// item only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope: Option<Envelope>,
+}
+
+/// The answer to `work_list`: a page of live items in publish order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkItems {
+    /// The items of the page.
+    pub items: Vec<WorkItem>,
+    /// The `after` of the next page. Absent when no more item matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<u64>,
 }
 
 /// The body of `work_ack`.
@@ -268,6 +340,10 @@ pub struct EffectiveSettings {
     pub poll_default_count: u32,
     /// `MANSIO_POLL_MAX_COUNT`.
     pub poll_max_count: u32,
+    /// `MANSIO_WORK_LIST_DEFAULT_COUNT`.
+    pub work_list_default_count: u32,
+    /// `MANSIO_WORK_LIST_MAX_COUNT`.
+    pub work_list_max_count: u32,
     /// `MANSIO_AGENT_CREDENTIAL_TTL_SECONDS`: how long an agent credential
     /// lasts when the request does not say.
     pub agent_credential_ttl_seconds: u64,

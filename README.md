@@ -139,6 +139,12 @@ publish is also appended to `mansio-sink.jsonl`.
 
 ## Install
 
+No release is published yet. Until one is, build from a clone:
+`cargo install --path crates/mansio --locked` for the command line, and
+`docker compose up --build --wait` (see [Run it](#run-it)) for the server.
+
+Once 0.1.0 is published:
+
 Each release, `vX.Y.Z`, is on the
 [releases page](https://github.com/ShozanHQ/mansio/releases).
 
@@ -149,7 +155,7 @@ Linux (x86-64 and arm64) and Windows (x86-64), each with its `.sha256`:
 gh release download v0.1.0 --repo ShozanHQ/mansio --pattern 'mansio-aarch64-apple-darwin.tar.xz*'
 ```
 
-Or from source: `cargo install mansio --locked`.
+Or from crates.io, once it is published there: `cargo install mansio --locked`.
 
 The server, as a multi-arch (linux/amd64 and linux/arm64) image:
 
@@ -162,7 +168,8 @@ The libraries, `mansio-core`, `mansio-iggy` and `mansio-server`, are on
 
 ## Verify a release
 
-Everything a release publishes was built by this repository's release workflow,
+Once 0.1.0 is published:
+everything a release publishes was built by this repository's release workflow,
 and you can check that before you run it. You need the
 [GitHub CLI](https://cli.github.com) for the first two checks and
 [cosign](https://docs.sigstore.dev/cosign/installation/) for the others.
@@ -208,8 +215,12 @@ git -c gpg.ssh.allowedSignersFile=.github/release-signers verify-tag v0.1.0
 
 ## The guarantee
 
-Work is never dropped and never done twice, for consumers that are not always
-connected. [`tests/offline/run.sh`](tests/offline/run.sh) is that claim, run on
+No work item is lost, and each is acknowledged at most once, for consumers that
+are not always connected. Delivery is at least once: an item whose lease ends
+is given to another consumer, so a worker makes its effect idempotent on
+`itemid`, does the effect, then acknowledges. The test below counts
+acknowledgements, not effects (the paragraph after its scenarios says why).
+[`tests/offline/run.sh`](tests/offline/run.sh) is that claim, run on
 every pull request by the `offline` job of CI, against Iggy through compose. It
 mints an agent credential for a fresh tenant with `mansio principals create`
 and runs three scenarios of N items (`MANSIO_OFFLINE_ITEMS`, 50) with a
@@ -302,6 +313,8 @@ as a space, and each flag is a parameter of the operation, with `-` for `_`.
 | `poll` | The envelopes from `--offset` on, so the next poll starts at the offset plus the number of lines. |
 | `watch` | The envelopes of a topic as they arrive, until stopped. |
 | `work pull` | The lease: `{"lease_id", "consumer", "expires_at", "item"}`. Nothing, and exit 0, if there is no item. |
+| `work list` | One page as one line: `{"items", "next"}`, the live items of a queue in publish order. `next` is the next page's `--after`, and is left out on the last page. |
+| `work show` | One work item: a live one with its envelope, a finished one as `{"item_id", "state": "finished"}`. |
 | `work extend`, `work ack`, `work fail`, `alerts ack` | The envelope of the transition. For `work extend` it is the `extended` fact, and `data.expires_at` is where the lease now ends. |
 | `principals create` | `{"principal", "credential"}`: the credential is shown this once. |
 | `principals list`, `webhooks list` | One principal, or webhook, a line. |
@@ -386,7 +399,7 @@ or not JSON is a JSON-RPC parse error and does not end the server.
 | Tool | |
 |---|---|
 | `publish`, `poll` | Publish to a topic; read a topic. |
-| `work_publish`, `work_pull`, `work_extend`, `work_ack`, `work_fail` | Work items. `work_pull` takes `wait` seconds, and `work_extend` takes `seconds`. |
+| `work_publish`, `work_pull`, `work_extend`, `work_ack`, `work_fail`, `work_list`, `work_show` | Work items. `work_pull` takes `wait` seconds, and `work_extend` takes `seconds`. `work_list` takes `state`, `after` and `count`. |
 | `alerts_publish`, `alerts_ack` | Alerts. |
 | `consumers_get`, `consumers_commit` | Where a named consumer stands. |
 | `principals_create`, `principals_list`, `principals_revoke` | Credentials, with the admin token. |
@@ -446,7 +459,7 @@ without a key and a key on `presence` are not deduplicated, and `work_publish`
 refuses a key with a 400 that names `id`, because a work item is made safe to
 send again by its id; a
 publish that answered 503 may be stored without its key being remembered, so
-consumers still deduplicate on `id`. ARCHITECTURE.md has the whole rule.
+consumers still deduplicate on `id` and `idempotencykey`. ARCHITECTURE.md has the whole rule.
 
 A refusal is `{"error":{"code":"...","message":"..."}}` with status 400, 401
 (no valid credential), 403 (a valid credential that may not do this, or a lease
@@ -479,8 +492,8 @@ envelope on `facts.work` and in the sink. Work does not go through the generic
 messages route, which refuses `work.<queue>` and the topics mansio writes
 itself: `facts.work`, `facts.alert`, `facts.principal`, `facts.webhook` and
 `dead`. The
-operations are `work_publish`, `work_pull`, `work_extend`, `work_ack` and
-`work_fail`.
+operations are `work_publish`, `work_pull`, `work_extend`, `work_ack`,
+`work_fail`, and two reads, `work_list` and `work_show`.
 
 ```sh
 # work_publish: the item is named by the id of its message, and starts at attempt 1.
@@ -508,7 +521,63 @@ curl ... -d '{"lease_id":"<uuid>","consumer":"worker-1"}' \
   http://127.0.0.1:7070/v1/tenants/acme/work/builds/items/<itemid>/ack
 curl ... -d '{"lease_id":"<uuid>","consumer":"worker-1","reason":"out of memory"}' \
   http://127.0.0.1:7070/v1/tenants/acme/work/builds/items/<itemid>/fail
+
+# work_list: a page of the queue's live items in publish order, without their
+# envelopes. `state` is claimable, leased or backoff; `after` is the `next` of
+# the page before; `count` is MANSIO_WORK_LIST_DEFAULT_COUNT if not given.
+curl -H "Authorization: Bearer $MANSIO_TOKEN" \
+  'http://127.0.0.1:7070/v1/tenants/acme/work/builds/items?state=claimable&count=2'
+# 200 {"items":[{"item_id":"<id>","state":"claimable","attempt":1,"type":"build.requested",
+#      "published_at":"...","publisher":"service:mansio"}, ...],"next":4}
+# `next` is there only when another matching item follows, and is the next `after`.
+
+# work_show: one item, with its envelope as published.
+curl -H "Authorization: Bearer $MANSIO_TOKEN" \
+  http://127.0.0.1:7070/v1/tenants/acme/work/builds/items/<itemid>
+# 200 {"item_id":"<id>","state":"leased","attempt":1,...,"holder":"agent:builder-1",
+#      "consumer":"worker-1","expires_at":"...","envelope":{...}}
+# 200 {"item_id":"<id>","state":"finished"}   acked or dead, and nothing more
+# 404 for an id the queue never held
 ```
+
+`work_list` and `work_show` read the state claims are decided from, and change
+nothing. They need what `poll` of `work.<queue>` needs: a `subscribe` grant on
+it, or the admin token. A credential that may not read it, or one of another
+tenant, gets a 403. With servers sharing a broker only the tenant's owner
+answers, as for a claim, and another server answers 503.
+
+| `state` | The item is | Set only in this state |
+|---|---|---|
+| `claimable` | waiting for a consumer | none |
+| `leased` | held under a lease | `holder` (`kind:name`), `consumer`, `expires_at` |
+| `backoff` | failed or expired, waiting out its backoff, or republished and not yet recorded as such | `claimable_at` |
+| `finished` | acked, or sent to `dead` | none: `work_show` only |
+
+- The list holds live items only, in publish order: the order of each item's
+  current version, so an item that is retried moves to the end. A finished
+  item is never listed. `work_show` of one answers `{"item_id","state":"finished"}`
+  and not whether it was acked or went to `dead`: that is on `facts.work` and
+  the `dead` topic. An item on its way to `dead` after its last failure is
+  finished too. An id the queue never held is a 404.
+- A lease that has ended and that the timer has not yet expired is still
+  `leased`, with `expires_at` in the past. The lease id is never in either
+  answer.
+- `attempt`, `type`, `subject`, `published_at` and `publisher` are those of
+  the item's current version. A retried item is republished by the engine, so
+  from attempt 2 on `publisher` is `service:mansio-engine` and `published_at`
+  is the time of the retry: the first publisher is not answered.
+- `work_list` takes `state`, `after` and `count`, and refuses a `count` of 0
+  or over `MANSIO_WORK_LIST_MAX_COUNT`, `state=finished`, any other state, an
+  unknown query field and an `after` that is not a whole number with a 400.
+- `next` is the position of the last item of the page, and the `after` of the
+  next. It is valid until the tenant's state is rebuilt: on a start without a
+  usable snapshot, after a publish that answered 503, and when another server
+  takes the tenant over. A rebuild keeps the order and not the numbers. An
+  item that gets a new version while a client pages, a retry, moves to the
+  end, so it may be seen twice across pages; on a queue that does not change
+  between pages each item is seen once.
+- A finished id older than `MANSIO_RETENTION_WORK_SECONDS` is not rebuilt
+  after a restart, so `work_show` of it then answers 404.
 
 - A claim is a lease of `MANSIO_LEASE_SECONDS`. Nobody else is given the item
   while it holds, and two concurrent pulls never get the same one. Work that
@@ -1023,6 +1092,10 @@ for it, so a sum across servers does not count a tenant twice.
 Every durable publish mansio makes (messages, work, transitions) is recorded
 in the sink and then published, with a lock per tenant held across both, so
 the sink sees each tenant's messages in the order the topics hold them.
+So one tenant's durable writes, the claims of every queue included, go one at
+a time, each waiting for the sink and then the broker. A tenant's rate is about
+one over the sum of those two delays; load that needs more is split across
+tenants.
 
 ## Settings
 
@@ -1046,6 +1119,8 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_MAX_BODY_BYTES` | `1048576` | Largest request body; a larger one is a 413. Iggy has a cap of its own on a message payload, 64 000 000 bytes (the stored envelope, not the body's `data` alone), and a body over it is refused by Iggy as a 502, which a client does not retry. A value above about 64 000 000 lets a body reach that refusal; a value below it makes this setting the limit. Raise it only when messages are that large: Iggy holds a whole message in memory. |
 | `MANSIO_POLL_DEFAULT_COUNT` | `100` | Envelopes a poll returns when `count` is not given. |
 | `MANSIO_POLL_MAX_COUNT` | `1000` | The most a poll may ask for. Also how many messages the server reads at a time when it rebuilds its state on start. |
+| `MANSIO_WORK_LIST_DEFAULT_COUNT` | `100` | Items a `work_list` returns when `count` is not given. At least 1 and at most `MANSIO_WORK_LIST_MAX_COUNT`, else the server refuses to start. |
+| `MANSIO_WORK_LIST_MAX_COUNT` | `1000` | The most a `work_list` may ask for. |
 | `MANSIO_LEASE_SECONDS` | `300` | How long a claim holds, and how long an extension without `seconds` runs from now. Past it the item expires and, after its backoff, is claimed again. At most `315360000` (ten years). |
 | `MANSIO_LEASE_MAX_SECONDS` | `86400` | The longest a lease may run, counted from the claim however often it is extended. An extension that would pass it is capped there. At least `MANSIO_LEASE_SECONDS`, at most `315360000` (ten years). |
 | `MANSIO_MAX_ATTEMPTS` | `5` | Attempts an item gets. A failure or expiry of the last one sends it to `dead`. |
@@ -1054,7 +1129,7 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_RECOVERY_LOG_SECONDS` | `60` | While the broker will not list its tenants at startup (for example an Iggy user that may not list streams), the server asks again after a wait that doubles from one tick up to this many seconds, and logs the failure at most once per this interval. At least 1. |
 | `MANSIO_SNAPSHOT_INTERVAL_SECONDS` | `300` | How often the state of a tenant that has changed is written to a snapshot, which the next start reads instead of replaying every topic from offset 0 (see "Snapshots" in ARCHITECTURE.md). 0 writes none. |
 | `MANSIO_SNAPSHOT_DIR` | `mansio-snapshots` | The directory of the snapshots, one file per tenant; `/data/snapshots` in the container image. Empty keeps none. A snapshot that cannot be read is ignored with a warning and the start replays from offset 0. |
-| `MANSIO_OWNER_TTL_SECONDS` | `0` | Set on every mansio-server that shares a broker, to the same value (3 or more; 30 or more for a cluster that stays up for months, because every owner appends a record each quarter of it, about 11,500 a day per tenant at 30, and a starting server reads them all), to run more than one: a tenant is served by one of them, and another takes it over this long (and a quarter more) after its server stops renewing it. `0` serves every tenant and must be the only server on its broker (see [More than one server per broker](#more-than-one-server-per-broker)). |
+| `MANSIO_OWNER_TTL_SECONDS` | `0` | Set on every mansio-server that shares a broker, to the same value (3 or more; 30 or more for a cluster that stays up for months, because every owner appends a record each quarter of it, about 11,500 a day at 30 per server that owns tenants, and a starting server reads them all), to run more than one: a tenant is served by one of them, and another takes it over this long (and a quarter more) after its server stops renewing it. `0` serves every tenant and must be the only server on its broker (see [More than one server per broker](#more-than-one-server-per-broker)). |
 | `MANSIO_EXPECT_PEERS` | `false` | `true` or `false`. Set `true` on a server that shares its broker with another: with `MANSIO_OWNER_TTL_SECONDS` at `0` it refuses to start and names both settings. The `ha` profile of `compose.yaml` sets it on its second server. Read at start only. |
 | `MANSIO_ALERT_RESURFACE_SECONDS` | `3600` | How long an alert may go unacknowledged before it is surfaced again, and again after each further interval. |
 | `MANSIO_TICK_MILLIS` | `500` | How often the timer looks for leases to expire, items to republish and alerts to surface again. |

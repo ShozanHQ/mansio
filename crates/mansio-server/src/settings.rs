@@ -53,6 +53,11 @@ pub struct Limits {
     pub poll_default_count: u32,
     /// The most a poll may ask for (`MANSIO_POLL_MAX_COUNT`).
     pub poll_max_count: u32,
+    /// How many items a work list returns when `count` is not given
+    /// (`MANSIO_WORK_LIST_DEFAULT_COUNT`).
+    pub work_list_default_count: u32,
+    /// The most a work list may ask for (`MANSIO_WORK_LIST_MAX_COUNT`).
+    pub work_list_max_count: u32,
 }
 
 impl Default for Limits {
@@ -61,6 +66,8 @@ impl Default for Limits {
             max_body_bytes: 1024 * 1024,
             poll_default_count: 100,
             poll_max_count: 1000,
+            work_list_default_count: 100,
+            work_list_max_count: 1000,
         }
     }
 }
@@ -608,11 +615,25 @@ impl Settings {
             poll_default_count: env
                 .parse("MANSIO_POLL_DEFAULT_COUNT", defaults.poll_default_count)?,
             poll_max_count: env.parse("MANSIO_POLL_MAX_COUNT", defaults.poll_max_count)?,
+            work_list_default_count: env.parse(
+                "MANSIO_WORK_LIST_DEFAULT_COUNT",
+                defaults.work_list_default_count,
+            )?,
+            work_list_max_count: env
+                .parse("MANSIO_WORK_LIST_MAX_COUNT", defaults.work_list_max_count)?,
         };
         if limits.poll_default_count == 0 || limits.poll_default_count > limits.poll_max_count {
             return Err(SettingsError::Invalid {
                 name: "MANSIO_POLL_DEFAULT_COUNT",
                 reason: "must be at least 1 and at most MANSIO_POLL_MAX_COUNT".to_owned(),
+            });
+        }
+        if limits.work_list_default_count == 0
+            || limits.work_list_default_count > limits.work_list_max_count
+        {
+            return Err(SettingsError::Invalid {
+                name: "MANSIO_WORK_LIST_DEFAULT_COUNT",
+                reason: "must be at least 1 and at most MANSIO_WORK_LIST_MAX_COUNT".to_owned(),
             });
         }
 
@@ -1010,6 +1031,8 @@ mod tests {
             ("MANSIO_MAX_BODY_BYTES", "2048"),
             ("MANSIO_POLL_DEFAULT_COUNT", "10"),
             ("MANSIO_POLL_MAX_COUNT", "50"),
+            ("MANSIO_WORK_LIST_DEFAULT_COUNT", "20"),
+            ("MANSIO_WORK_LIST_MAX_COUNT", "300"),
         ])
         .unwrap();
         assert_eq!(settings.listen.port(), 9000);
@@ -1020,7 +1043,9 @@ mod tests {
             Limits {
                 max_body_bytes: 2048,
                 poll_default_count: 10,
-                poll_max_count: 50
+                poll_max_count: 50,
+                work_list_default_count: 20,
+                work_list_max_count: 300,
             }
         );
     }
@@ -1670,6 +1695,9 @@ mod tests {
             ("MANSIO_POLL_MAX_COUNT", "many"),
             ("MANSIO_POLL_DEFAULT_COUNT", "0"),
             ("MANSIO_POLL_DEFAULT_COUNT", "2000"),
+            ("MANSIO_WORK_LIST_DEFAULT_COUNT", "0"),
+            ("MANSIO_WORK_LIST_DEFAULT_COUNT", "2000"),
+            ("MANSIO_WORK_LIST_MAX_COUNT", "many"),
             ("MANSIO_IGGY_CONNECT_TIMEOUT_SECONDS", "soon"),
             ("MANSIO_IGGY_SIGNIN_TIMEOUT_SECONDS", "0"),
             ("MANSIO_IGGY_SESSION_IDLE_SECONDS", "0"),
