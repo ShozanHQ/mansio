@@ -21,5 +21,8 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
+
 [lints]
 workspace = true
