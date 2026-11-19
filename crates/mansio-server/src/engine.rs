@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 
-use mansio_core::api::{Claimed, Published};
+use mansio_core::api::{Claimed, Published, WorkItem, WorkItems, WorkState};
 use mansio_core::{
     AlertEvent, AlertFact, Broker, BrokerError, Caller, ConsumerName, Envelope, EventId,
     IdempotencyKey, ItemId, LeaseId, Next, Principal, Segment, Sink, SystemLog, TenantId,
@@ -1037,6 +1037,88 @@ impl Engine {
         Ok(stored)
     }
 
+    /// A page of the queue's live items in position order, after position
+    /// `after` when there is one, of `state` when there is one. `count` items
+    /// at most; `next` is the position of the last of them when another
+    /// matching item follows. Read from the state claims are decided from;
+    /// nothing changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns 503 if another server owns the tenant.
+    pub async fn work_list(
+        &self,
+        tenant: &TenantId,
+        queue: &Segment,
+        state: Option<WorkState>,
+        after: Option<u64>,
+        count: usize,
+    ) -> Result<WorkItems, ApiError> {
+        let held = self.lock(tenant).await?;
+        let mut page = WorkItems {
+            items: Vec::new(),
+            next: None,
+        };
+        let Some(q) = held.queues.get(queue) else {
+            return Ok(page);
+        };
+        let mut last = None;
+        for (order, id, item) in q.items_after(after) {
+            let Some(found) = work_state(item) else {
+                continue;
+            };
+            if state.is_some_and(|wanted| wanted != found) {
+                continue;
+            }
+            if page.items.len() == count {
+                page.next = last;
+                break;
+            }
+            page.items.push(work_item(id, item, found, false)?);
+            last = Some(order);
+        }
+        Ok(page)
+    }
+
+    /// One item of the queue: a live one with its envelope, a finished one as
+    /// finished and nothing more.
+    ///
+    /// # Errors
+    ///
+    /// Returns 404 if the queue never held the item, and 503 if another
+    /// server owns the tenant.
+    pub async fn work_show(
+        &self,
+        tenant: &TenantId,
+        queue: &Segment,
+        item: &ItemId,
+    ) -> Result<WorkItem, ApiError> {
+        let held = self.lock(tenant).await?;
+        let q = held.queues.get(queue);
+        let finished = || WorkItem {
+            item_id: item.clone(),
+            state: WorkState::Finished,
+            attempt: None,
+            event_type: None,
+            subject: None,
+            published_at: None,
+            publisher: None,
+            holder: None,
+            consumer: None,
+            expires_at: None,
+            claimable_at: None,
+            envelope: None,
+        };
+        match q.and_then(|q| q.get(item)) {
+            Some(open) => match work_state(open) {
+                Some(state) => work_item(item, open, state, true),
+                None => Ok(finished()),
+            },
+            None if q.is_some_and(|q| q.knows(item)) => Ok(finished()),
+            None => Err(ApiError::NotFound(format!("no item {item} in {queue}"))),
+        }
+    }
+
     /// Give an item back as failed. Only the holder, naming the consumer and
     /// presenting the lease id, may. The item is republished after a backoff, or goes to `dead` if it
     /// has used its attempts.
@@ -1580,6 +1662,64 @@ fn see_owner(held: &mut TenantState, epoch: u64) {
 
 fn outcome_unknown(error: &BrokerError) -> bool {
     matches!(error, BrokerError::Unavailable(_))
+}
+
+/// What an item answers to `work_list` and `work_show`, from the phase it is
+/// in. `None` for the two phases on their way to `dead`: the engine has
+/// decided them, they will not be claimable again, and both routes answer
+/// them as finished. It is the one place that says so.
+fn work_state(item: &Item) -> Option<WorkState> {
+    match &item.phase {
+        Phase::Ready => Some(WorkState::Claimable),
+        Phase::Leased(_) => Some(WorkState::Leased),
+        Phase::Backoff {
+            next: Next::Retry, ..
+        }
+        | Phase::Owed {
+            then: Then::Ready, ..
+        } => Some(WorkState::Backoff),
+        Phase::Backoff {
+            next: Next::Dead, ..
+        }
+        | Phase::Owed {
+            then: Then::Gone, ..
+        } => None,
+    }
+}
+
+/// The answer for one open item in `state`, with its envelope if asked.
+fn work_item(
+    id: &ItemId,
+    item: &Item,
+    state: WorkState,
+    with_envelope: bool,
+) -> Result<WorkItem, ApiError> {
+    let message = &item.message;
+    let mut view = WorkItem {
+        item_id: id.clone(),
+        state,
+        attempt: Some(item.attempt()),
+        event_type: Some(message.event_type.clone()),
+        subject: message.subject.clone(),
+        published_at: message.time.clone(),
+        publisher: Some(message.principal.clone()),
+        holder: None,
+        consumer: None,
+        expires_at: None,
+        claimable_at: None,
+        envelope: with_envelope.then(|| message.clone()),
+    };
+    match &item.phase {
+        Phase::Leased(lease) => {
+            view.holder = Some(lease.holder.clone());
+            view.consumer = Some(lease.consumer.clone());
+            view.expires_at = Some(timestamp(lease.expires_at)?);
+        }
+        Phase::Backoff { due, .. } => view.claimable_at = Some(timestamp(*due)?),
+        Phase::Owed { .. } => view.claimable_at = message.time.clone(),
+        Phase::Ready => {}
+    }
+    Ok(view)
 }
 
 /// The open item, or 404.
