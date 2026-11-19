@@ -95,7 +95,9 @@ port is published on `127.0.0.1:8090`. The token and the passwords in
 token, `iggy` for Iggy's root user, `mansio-dev-admin` for the Iggy user
 mansio-server acts as). Set `MANSIO_TOKEN`, `IGGY_ROOT_PASSWORD` and
 `MANSIO_IGGY_PASSWORD` in the environment, or in a `.env` file, to change
-them. Only Iggy and `iggy-admin` are given the root password.
+them. mansio-server logs a warning for the token and for its Iggy password,
+and `iggy-admin` for the root password, when each is still the default. Only
+Iggy and `iggy-admin` are given the root password.
 
 ```sh
 export MANSIO_TOKEN=mansio-dev-token
@@ -359,9 +361,10 @@ mansio webhooks rotate --id WEBHOOKID
   lease is given it again, so a claim whose answer is lost does not leave an
   item leased to nobody), `work extend` (a repeat leaves the lease running to
   the later of the two ends) and `consumers commit`. A `publish`, an `ack` and the
-  like are not, so give a `publish`, `work publish` or `alerts publish` an
-  `--id` and send it again yourself if it fails: a 409 then means the first
-  attempt was stored.
+  like are not, so give a `work publish` or `alerts publish` an `--id` and
+  send it again yourself if it fails: a 409 then means the first attempt was
+  stored. Give a `publish` an `--idempotency-key` instead of an `--id`: a
+  plain publish does not check the id.
 
 ## MCP
 
@@ -439,7 +442,9 @@ the envelope back from the topic, and if retention has removed it the answer is
 409 naming the first id. The log is read when the server
 starts, not inside a request. The same key from another principal is answered
 409 with no envelope. A publish
-without a key, a key on `presence` and `work_publish` are not deduplicated, and a
+without a key and a key on `presence` are not deduplicated, and `work_publish`
+refuses a key with a 400 that names `id`, because a work item is made safe to
+send again by its id; a
 publish that answered 503 may be stored without its key being remembered, so
 consumers still deduplicate on `id`. ARCHITECTURE.md has the whole rule.
 
@@ -572,8 +577,17 @@ curl ... -d '{"lease_id":"<uuid>","consumer":"worker-1","reason":"out of memory"
 - A client that gets a 503 from `work_publish` or `alerts_publish` cannot tell
   whether the message was stored. It sends it again with the same `id`: a 409
   then means the first attempt was stored, and there is nothing to resend.
-  Without an `id` the resend is a new item. A 502 is a refusal the broker
-  named before it stored anything: nothing was stored.
+  Without an `id` the resend is a new item, so choose the id before the first
+  send:
+
+  ```sh
+  id=0192f1c2-7d3e-7a4b-8c5d-6e7f8091a2b1
+  mansio work publish --tenant t --queue q --type job --source ci --id "$id"   # 201
+  mansio work publish --tenant t --queue q --type job --source ci --id "$id"   # 409: the first was stored
+  ```
+
+  A 502 is a refusal the broker named before it stored anything: nothing was
+  stored.
 - A restarted server rebuilds all of this from `work.<queue>`, `facts.work`
   and `dead`, so it drops no item and republishes none twice. A publish that
   fails may still have been stored, so the server rebuilds the tenant from the
@@ -824,8 +838,17 @@ When the owner stops, another server takes its tenants within
 (a stop in order, `SIGTERM`). Nothing is lost: the new owner rebuilds the
 tenant from the broker as a restart does, so a lease the old owner gave is held
 until it ends and the item is then retried, and every item that was waiting is
-claimable. Try it with `docker compose --profile ha up --build --wait`, which
-adds a second server on port 7071 (set the variable for both).
+claimable. Try it with a second server on port 7071:
+
+    MANSIO_OWNER_TTL_SECONDS=30 docker compose --profile ha up --build --wait
+
+Two limits stay with two servers. Each server delivers every webhook it holds,
+so a receiver sees a delivery once per server and deduplicates on the envelope
+id. A named consumer's position committed on one server is not seen by the
+other until it restarts.
+
+The profile's second server runs with `MANSIO_EXPECT_PEERS=true`, so it refuses
+to start without `MANSIO_OWNER_TTL_SECONDS`.
 
 Credentials follow the broker: a server reads new records of the principals log
 at every sweep (`MANSIO_CREDENTIAL_SWEEP_SECONDS`) and, at most once per
@@ -834,11 +857,9 @@ server works on the other, including after the first dies.
 
 Still per server: webhooks and consumer positions are read when a server
 starts, so a webhook or a named consumer made through one server is known to
-another only after that restarts, a position committed on one is not seen by
-the other, and each server delivers the webhooks it holds (a server that holds
-webhooks logs a warning at start when this setting is on). The bootstrap
-`MANSIO_TOKEN` works on all of them. Iggy's own clustering is separate: mansio
-uses one Iggy.
+another only after that restarts, and a server that holds webhooks logs a
+warning at start when this setting is on. The bootstrap `MANSIO_TOKEN` works on
+all of them. Iggy's own clustering is separate: mansio uses one Iggy.
 
 ### Credentials
 
@@ -1034,6 +1055,7 @@ Every limit, interval and switch is a variable. Nothing else is configured.
 | `MANSIO_SNAPSHOT_INTERVAL_SECONDS` | `300` | How often the state of a tenant that has changed is written to a snapshot, which the next start reads instead of replaying every topic from offset 0 (see "Snapshots" in ARCHITECTURE.md). 0 writes none. |
 | `MANSIO_SNAPSHOT_DIR` | `mansio-snapshots` | The directory of the snapshots, one file per tenant; `/data/snapshots` in the container image. Empty keeps none. A snapshot that cannot be read is ignored with a warning and the start replays from offset 0. |
 | `MANSIO_OWNER_TTL_SECONDS` | `0` | Set on every mansio-server that shares a broker, to the same value (3 or more; 30 or more for a cluster that stays up for months, because every owner appends a record each quarter of it, about 11,500 a day per tenant at 30, and a starting server reads them all), to run more than one: a tenant is served by one of them, and another takes it over this long (and a quarter more) after its server stops renewing it. `0` serves every tenant and must be the only server on its broker (see [More than one server per broker](#more-than-one-server-per-broker)). |
+| `MANSIO_EXPECT_PEERS` | `false` | `true` or `false`. Set `true` on a server that shares its broker with another: with `MANSIO_OWNER_TTL_SECONDS` at `0` it refuses to start and names both settings. The `ha` profile of `compose.yaml` sets it on its second server. Read at start only. |
 | `MANSIO_ALERT_RESURFACE_SECONDS` | `3600` | How long an alert may go unacknowledged before it is surfaced again, and again after each further interval. |
 | `MANSIO_TICK_MILLIS` | `500` | How often the timer looks for leases to expire, items to republish and alerts to surface again. |
 | `MANSIO_IDEMPOTENCY_WINDOW_SECONDS` | `86400` | How long a publish's `idempotencykey` is remembered. A second publish to the same tenant and topic with the same key inside the window is answered 200 with the first envelope and offset and publishes nothing. At least `1`, at most `315360000` (ten years). |

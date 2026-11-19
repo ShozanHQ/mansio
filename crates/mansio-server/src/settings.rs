@@ -17,7 +17,7 @@ use mansio_iggy::{
     DEFAULT_SIGNIN_TIMEOUT, DEFAULT_USERNAME, DurabilityPolicy, IggyConfig, ProvisionConfig,
     Retention, check_segment_size,
 };
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 
 /// Default listen address: loopback only. The container image listens on all
@@ -31,6 +31,10 @@ pub const DEFAULT_SINK_PATH: &str = "mansio-sink.jsonl";
 pub const DEFAULT_SINK_SYNC: bool = true;
 /// Whether `GET /metrics` is served and counted by default (`MANSIO_METRICS`).
 pub const DEFAULT_METRICS: bool = true;
+
+/// Whether the server is told another server shares its broker, so it refuses
+/// to start with ownership off (`MANSIO_EXPECT_PEERS`).
+pub const DEFAULT_EXPECT_PEERS: bool = false;
 /// Default directory of the snapshots (`MANSIO_SNAPSHOT_DIR`).
 pub const DEFAULT_SNAPSHOT_DIR: &str = "mansio-snapshots";
 /// Default interval between snapshots, in seconds
@@ -498,6 +502,48 @@ pub fn retention_warning(retention: &Retention) -> Option<String> {
     }
 }
 
+/// The token `compose.yaml` ships for `MANSIO_TOKEN`.
+const DEVELOPMENT_TOKEN: &str = "mansio-dev-token";
+/// The password `compose.yaml` ships for `MANSIO_IGGY_PASSWORD`.
+const DEVELOPMENT_IGGY_PASSWORD: &str = "mansio-dev-admin";
+/// The password `compose.yaml` ships for `IGGY_ROOT_PASSWORD`.
+const DEVELOPMENT_ROOT_PASSWORD: &str = "iggy";
+
+fn development_default_warning(name: &str) -> String {
+    format!(
+        "{name} is the development default from compose.yaml, which is public; \
+         set it before the server is reachable from another machine"
+    )
+}
+
+/// One warning for each of `MANSIO_TOKEN` and `MANSIO_IGGY_PASSWORD` that is
+/// the development default from `compose.yaml`. The text names the setting,
+/// never the value.
+#[must_use]
+pub fn development_defaults(settings: &Settings) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if settings.token.expose_secret() == DEVELOPMENT_TOKEN {
+        warnings.push(development_default_warning("MANSIO_TOKEN"));
+    }
+    if let Backend::Iggy(iggy) = &settings.broker
+        && iggy.password.expose_secret() == DEVELOPMENT_IGGY_PASSWORD
+    {
+        warnings.push(development_default_warning("MANSIO_IGGY_PASSWORD"));
+    }
+    warnings
+}
+
+/// One warning if `IGGY_ROOT_PASSWORD` is the development default from
+/// `compose.yaml`. The text names the setting, never the value.
+#[must_use]
+pub fn provision_development_defaults(config: &ProvisionConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if config.root_password.expose_secret() == DEVELOPMENT_ROOT_PASSWORD {
+        warnings.push(development_default_warning("IGGY_ROOT_PASSWORD"));
+    }
+    warnings
+}
+
 /// Everything the binary is configured with.
 #[derive(Debug)]
 pub struct Settings {
@@ -517,6 +563,10 @@ pub struct Settings {
     /// Whether `GET /metrics` is served and what it reports is counted
     /// (`MANSIO_METRICS`, default `true`).
     pub metrics: bool,
+    /// Whether another server shares this broker (`MANSIO_EXPECT_PEERS`,
+    /// default `false`). With it `true` and `MANSIO_OWNER_TTL_SECONDS` zero,
+    /// the server refuses to start. Read at start only.
+    pub expect_peers: bool,
     /// The directory of the snapshots of each tenant's state
     /// (`MANSIO_SNAPSHOT_DIR`); `None` keeps none, and every start replays
     /// every topic from offset 0.
@@ -597,6 +647,15 @@ impl Settings {
             owner_ttl: env.seconds("MANSIO_OWNER_TTL_SECONDS", work_defaults.owner_ttl)?,
         };
         work.validate()?;
+        let expect_peers = env.parse("MANSIO_EXPECT_PEERS", DEFAULT_EXPECT_PEERS)?;
+        if expect_peers && work.owner_ttl.is_zero() {
+            return Err(SettingsError::Invalid {
+                name: "MANSIO_EXPECT_PEERS",
+                reason: "true needs MANSIO_OWNER_TTL_SECONDS set, to the same value (3 or \
+                         more) on every server, or two servers could lease the same item"
+                    .to_owned(),
+            });
+        }
 
         let credential_defaults = CredentialSettings::default();
         let credentials = CredentialSettings {
@@ -689,6 +748,7 @@ impl Settings {
             },
             sink_sync: env.parse("MANSIO_SINK_SYNC", DEFAULT_SINK_SYNC)?,
             metrics: env.parse("MANSIO_METRICS", DEFAULT_METRICS)?,
+            expect_peers,
             snapshot_dir: match env.raw("MANSIO_SNAPSHOT_DIR") {
                 None => Some(PathBuf::from(DEFAULT_SNAPSHOT_DIR)),
                 Some(dir) if dir.is_empty() => None,
@@ -868,7 +928,6 @@ mod tests {
     use std::collections::HashMap;
 
     use mansio_iggy::Durability;
-    use secrecy::ExposeSecret;
 
     use super::*;
 
@@ -1057,6 +1116,49 @@ mod tests {
         assert_eq!(with("0").unwrap().work.owner_ttl, Duration::ZERO);
         // Too short to renew inside: renewals are a quarter of it apart.
         assert!(with("2").is_err());
+    }
+
+    #[test]
+    fn a_server_that_expects_peers_needs_an_owner_ttl() {
+        let base = [("MANSIO_TOKEN", "t"), ("MANSIO_BROKER", "memory")];
+        let with = |peers: &'static str, ttl: Option<&'static str>| {
+            let mut pairs = base.to_vec();
+            pairs.push(("MANSIO_EXPECT_PEERS", peers));
+            if let Some(ttl) = ttl {
+                pairs.push(("MANSIO_OWNER_TTL_SECONDS", ttl));
+            }
+            settings(&pairs)
+        };
+
+        for ttl in [None, Some("0"), Some("")] {
+            let err = with("true", ttl).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    SettingsError::Invalid {
+                        name: "MANSIO_EXPECT_PEERS",
+                        ..
+                    }
+                ),
+                "{err:?}"
+            );
+            assert!(err.to_string().contains("MANSIO_OWNER_TTL_SECONDS"));
+        }
+        assert!(with("true", Some("30")).unwrap().expect_peers);
+
+        assert!(!settings(&base).unwrap().expect_peers);
+        assert!(!with("false", None).unwrap().expect_peers);
+        assert!(!with("false", Some("0")).unwrap().expect_peers);
+        assert!(!with("", None).unwrap().expect_peers);
+
+        let err = with("1", Some("30")).unwrap_err();
+        assert!(matches!(
+            err,
+            SettingsError::Invalid {
+                name: "MANSIO_EXPECT_PEERS",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1332,6 +1434,65 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn development_defaults_are_named_and_never_shown() {
+        let both = settings(&[
+            ("MANSIO_TOKEN", "mansio-dev-token"),
+            ("MANSIO_IGGY_PASSWORD", "mansio-dev-admin"),
+        ])
+        .unwrap();
+        let warnings = development_defaults(&both);
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("MANSIO_TOKEN"));
+        assert!(warnings[1].contains("MANSIO_IGGY_PASSWORD"));
+
+        let other = settings(&[("MANSIO_TOKEN", "t"), ("MANSIO_IGGY_PASSWORD", "p")]).unwrap();
+        assert!(development_defaults(&other).is_empty());
+
+        let token_only = settings(&[
+            ("MANSIO_TOKEN", "mansio-dev-token"),
+            ("MANSIO_IGGY_PASSWORD", "p"),
+        ])
+        .unwrap();
+        let only = development_defaults(&token_only);
+        assert_eq!(only.len(), 1);
+        assert!(only[0].contains("MANSIO_TOKEN"));
+
+        let memory = settings(&[
+            ("MANSIO_BROKER", "memory"),
+            ("MANSIO_TOKEN", "mansio-dev-token"),
+            ("MANSIO_IGGY_PASSWORD", "mansio-dev-admin"),
+        ])
+        .unwrap();
+        let only = development_defaults(&memory);
+        assert_eq!(only.len(), 1);
+        assert!(only[0].contains("MANSIO_TOKEN"));
+
+        for warning in warnings.iter().chain(&only) {
+            assert!(!warning.contains("mansio-dev-token"));
+            assert!(!warning.contains("mansio-dev-admin"));
+        }
+    }
+
+    #[test]
+    fn the_root_password_default_is_named_and_never_shown() {
+        let config = |root: &str| {
+            let map: HashMap<String, String> = [
+                ("IGGY_ROOT_PASSWORD", root),
+                ("MANSIO_IGGY_PASSWORD", "admin-secret"),
+            ]
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+            Settings::provision_from_lookup(|name| map.get(name).cloned()).unwrap()
+        };
+        let warnings = provision_development_defaults(&config("iggy"));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("IGGY_ROOT_PASSWORD"));
+        assert!(!warnings[0].contains("iggy"));
+        assert!(provision_development_defaults(&config("root-secret")).is_empty());
     }
 
     #[test]

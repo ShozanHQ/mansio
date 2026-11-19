@@ -19,7 +19,9 @@ use mansio_core::api::Published;
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
-use crate::harness::Target;
+use mansio_core::EventId;
+
+use crate::harness::{Target, job};
 
 /// The most keys a test that fills the bound will publish.
 const LARGEST_BOUND: u64 = 200;
@@ -84,6 +86,39 @@ async fn a_repeated_key_is_answered_with_the_first_and_publishes_nothing() -> an
         assert_eq!(status, StatusCode::CREATED);
     }
     assert_eq!(target.read("facts.build").await?.len(), 4);
+    Ok(())
+}
+
+#[tokio::test]
+async fn work_is_resent_by_id_and_an_event_by_key() -> anyhow::Result<()> {
+    let target = Target::start().await?;
+    let queue = "keyed";
+    let topic = format!("work.{queue}");
+    let uri = target.tenant_uri(&format!("work/{queue}/items"));
+
+    // A key on work is refused, and says what to use.
+    let mut keyed = job(1);
+    keyed["idempotencykey"] = json!("k1");
+    let (status, response) = target.authed(Method::POST, &uri, Some(&keyed)).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    let message = response["error"]["message"].as_str().unwrap_or("");
+    assert!(message.contains("idempotencykey") && message.contains("id"));
+    assert!(target.read(&topic).await?.is_empty());
+
+    // The id is what makes a resend safe.
+    let mut item = job(2);
+    item["id"] = json!(EventId::generate().to_string());
+    let (status, response) = target.authed(Method::POST, &uri, Some(&item)).await?;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    let (status, response) = target.authed(Method::POST, &uri, Some(&item)).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(target.read(&topic).await?.len(), 1);
+
+    // An event with a key is unchanged.
+    let (status, _) = send(&target, "facts.build", &body("k1", 1)).await?;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = send(&target, "facts.build", &body("k1", 1)).await?;
+    assert_eq!(status, StatusCode::OK);
     Ok(())
 }
 

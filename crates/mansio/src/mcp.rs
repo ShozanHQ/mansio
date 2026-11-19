@@ -414,6 +414,21 @@ mod tests {
         assert_eq!(schema["properties"]["seconds"]["type"], "integer");
         assert!(extend["description"].as_str().unwrap().contains("lease"));
 
+        let work_publish = listed.iter().find(|t| t["name"] == "work_publish").unwrap();
+        let properties = &work_publish["inputSchema"]["properties"];
+        assert!(properties.get("idempotency_key").is_none());
+        assert!(
+            properties["id"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("409")
+        );
+        let publish = listed.iter().find(|t| t["name"] == "publish").unwrap();
+        let id = publish["inputSchema"]["properties"]["id"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(!id.contains("409") && id.contains("idempotency_key"));
+
         let create = listed
             .iter()
             .find(|t| t["name"] == "principals_create")

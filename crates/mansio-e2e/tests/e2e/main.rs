@@ -9,6 +9,7 @@
 //! it accepts. See `e2e/harness.rs`.
 
 mod alerts;
+mod compose;
 mod consumers;
 mod credentials;
 mod events;
