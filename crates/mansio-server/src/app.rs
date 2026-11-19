@@ -670,6 +670,10 @@ pub(crate) fn build_envelope(
         )));
     }
 
+    if origin == Origin::WorkItem && attributes.contains_key("idempotencykey") {
+        return Err(bad("idempotencykey is not taken by work_publish: a work item is made safe to send again by its id, and a repeated id answers 409".to_owned()));
+    }
+
     attributes
         .entry("specversion")
         .or_insert_with(|| "1.0".into());
