@@ -1519,6 +1519,71 @@ async fn an_alert_with_a_time_in_the_future_is_still_surfaced_again() {
         .unwrap();
 }
 
+// ---- what work_list and work_show answer ---------------------------------------
+
+#[tokio::test]
+async fn the_two_phases_on_their_way_to_dead_show_as_finished_and_are_not_listed() {
+    for refused in ["dead", "mansio.work.dead"] {
+        let rig = failing_last_attempt(refused).await;
+        let dying = rig.read(&Topic::Work(queue())).await[0]
+            .item_id
+            .clone()
+            .unwrap();
+        let other = rig.publish_item("other").await;
+
+        let listed = rig
+            .engine
+            .work_list(&tenant(), &queue(), None, None, 10)
+            .await
+            .unwrap();
+        let ids: Vec<&ItemId> = listed.items.iter().map(|item| &item.item_id).collect();
+        assert_eq!(ids, [&other], "{refused}");
+        assert_eq!(listed.next, None);
+
+        let shown = rig
+            .engine
+            .work_show(&tenant(), &queue(), &dying)
+            .await
+            .unwrap();
+        assert_eq!(shown.state, WorkState::Finished, "{refused}");
+        assert_eq!(shown.attempt, None);
+        assert_eq!(shown.envelope, None);
+    }
+}
+
+#[tokio::test]
+async fn a_list_and_a_show_read_the_state_and_change_nothing() {
+    let rig = Rig::new();
+    let first = rig.publish_item("first").await;
+    rig.publish_item("second").await;
+    let claim = rig.pull("one").await.unwrap();
+    let before = rig.transitions().await;
+
+    let page = rig
+        .engine
+        .work_list(&tenant(), &queue(), None, None, 1)
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].item_id, first);
+    assert_eq!(page.items[0].state, WorkState::Leased);
+    assert_eq!(page.items[0].holder, Some(agent("one")));
+    assert!(page.next.is_some());
+    let shown = rig
+        .engine
+        .work_show(&tenant(), &queue(), &first)
+        .await
+        .unwrap();
+    assert_eq!(shown.envelope.as_ref().map(|e| e.id), Some(claim.item.id));
+    assert_eq!(rig.transitions().await, before);
+
+    let missing: ItemId = EventId::generate().to_string().parse().unwrap();
+    assert!(matches!(
+        rig.engine.work_show(&tenant(), &queue(), &missing).await,
+        Err(ApiError::NotFound(_))
+    ));
+}
+
 // ---- a message that cannot be read -------------------------------------------
 
 #[tokio::test]
