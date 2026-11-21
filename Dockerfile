@@ -13,7 +13,7 @@
 # the pin there changes the image. The check after it fails the build if the
 # compiler that will build is not the one the file names. The tag below is not
 # the pin and need not move with it.
-FROM rust:1.99.0-slim-trixie@sha256:2752b332db73fdbb7dc576f06c82ed1f312005784ef913d7e04a28f5f55dc581 AS toolchain
+FROM rust:1.99.1-slim-trixie@sha256:f6c4a35d21dbb3c89d7a8d056c193e94fc09037f2b58dd858b09c39a47dd02d7 AS toolchain
 # cargo-chef is installed with `cargo install`, which Dependabot's docker
 # ecosystem does not read and cargo-deny (workspace only) does not see. Its
 # version is written here and nowhere else, and is moved by hand when a new
