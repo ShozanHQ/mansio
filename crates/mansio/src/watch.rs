@@ -41,16 +41,16 @@ const GAVE_UP: u8 = 3;
 /// No signal has come.
 const RUNNING: u8 = 0;
 /// The first signal has come: finish the envelope and stop.
-const ASKED: u8 = 1;
+pub(crate) const ASKED: u8 = 1;
 /// The second signal came while a command was running: kill it and exit.
-const KILL: u8 = 2;
+pub(crate) const KILL: u8 = 2;
 
 /// Tells the watch to stop when SIGINT or SIGTERM comes.
-struct Stop {
+pub(crate) struct Stop {
     stage: watch::Receiver<u8>,
     /// Set while a command runs, so that the listener leaves a second signal
     /// to the loop, which holds the command and kills it first.
-    command_running: Arc<AtomicBool>,
+    pub(crate) command_running: Arc<AtomicBool>,
 }
 
 impl Stop {
@@ -59,7 +59,7 @@ impl Stop {
     /// once, for a commit that hangs or a server that does not answer. When a
     /// command is running the second is recorded instead, and the loop kills
     /// the command and exits.
-    fn listen() -> Self {
+    pub(crate) fn listen() -> Self {
         let (sender, stage) = watch::channel(RUNNING);
         let command_running = Arc::new(AtomicBool::new(false));
         let running = Arc::clone(&command_running);
@@ -81,16 +81,16 @@ impl Stop {
         }
     }
 
-    fn is_set(&self) -> bool {
+    pub(crate) fn is_set(&self) -> bool {
         *self.stage.borrow() >= ASKED
     }
 
-    fn must_kill(&self) -> bool {
+    pub(crate) fn must_kill(&self) -> bool {
         *self.stage.borrow() >= KILL
     }
 
     /// Completes when the stage has reached `at_least`.
-    async fn reached(&self, at_least: u8) {
+    pub(crate) async fn reached(&self, at_least: u8) {
         let mut receiver = self.stage.clone();
         while *receiver.borrow_and_update() < at_least {
             if receiver.changed().await.is_err() {
@@ -101,7 +101,7 @@ impl Stop {
     }
 
     /// Completes when the signal has come.
-    async fn wait(&self) {
+    pub(crate) async fn wait(&self) {
         self.reached(ASKED).await;
     }
 }

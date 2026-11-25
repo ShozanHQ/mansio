@@ -43,6 +43,9 @@ pub enum Op {
     WorkAck,
     /// Give a claimed item back as failed.
     WorkFail,
+    /// Claim one item, run a command for it with the lease held, and ack or
+    /// fail it by how the command ended.
+    WorkRun,
     /// List the live items of a queue.
     WorkList,
     /// Show one item of a queue.
@@ -145,6 +148,11 @@ const CONSUMER_PULL: Param = required(
     Kind::Text,
     "The name this consumer pulls under. A consumer that holds a live lease is given it again.",
 );
+const WAIT: Param = optional(
+    "wait",
+    Kind::Int,
+    "Keep looking for this many seconds until an item can be claimed.",
+);
 const CONSUMER_HELD: Param = required(
     "consumer",
     Kind::Text,
@@ -198,7 +206,7 @@ const ENVELOPE: [Param; 6] = [
 
 impl Op {
     /// Every operation, in the order they are listed.
-    pub const ALL: [Op; 21] = [
+    pub const ALL: [Op; 22] = [
         Op::Publish,
         Op::Poll,
         Op::Watch,
@@ -207,6 +215,7 @@ impl Op {
         Op::WorkExtend,
         Op::WorkAck,
         Op::WorkFail,
+        Op::WorkRun,
         Op::WorkList,
         Op::WorkShow,
         Op::AlertsPublish,
@@ -233,6 +242,7 @@ impl Op {
             Op::WorkExtend => &["work", "extend"],
             Op::WorkAck => &["work", "ack"],
             Op::WorkFail => &["work", "fail"],
+            Op::WorkRun => &["work", "run"],
             Op::WorkList => &["work", "list"],
             Op::WorkShow => &["work", "show"],
             Op::AlertsPublish => &["alerts", "publish"],
@@ -259,10 +269,11 @@ impl Op {
         Op::ALL.into_iter().find(|op| op.path() == path)
     }
 
-    /// Whether the MCP server offers it as a tool. `watch` streams, which a
+    /// Whether the MCP server offers it as a tool. `watch` streams, and
+    /// `work run` runs a program of the caller's and waits for it, which a
     /// tool call cannot.
     pub fn is_tool(self) -> bool {
-        self != Op::Watch
+        !matches!(self, Op::Watch | Op::WorkRun)
     }
 
     /// What the operation does, in a sentence.
@@ -287,6 +298,9 @@ impl Op {
             }
             Op::WorkFail => {
                 "Give an item you claimed back as failed. It is tried again after a backoff, or goes to the dead topic when its attempts are used."
+            }
+            Op::WorkRun => {
+                "Claim one item of a queue as work pull does, run the command after -- with the item on its standard input, extend the lease while it runs, and ack the item when the command exits 0 or fail it when it does not. Prints the envelope of the ack or the fail; nothing when there was no item or the lease was lost."
             }
             Op::WorkList => {
                 "List the live items of a work queue in publish order, one page as one JSON object, with each item's state, attempt and holder; --state filters and --after takes the next value of the page before."
@@ -375,14 +389,16 @@ impl Op {
                 ),
             ],
             Op::WorkPublish => envelope(&[TENANT, QUEUE], &[ID_WORK]),
-            Op::WorkPull => vec![
+            Op::WorkPull => vec![TENANT, QUEUE, CONSUMER_PULL, WAIT],
+            Op::WorkRun => vec![
                 TENANT,
                 QUEUE,
                 CONSUMER_PULL,
-                optional(
-                    "wait",
-                    Kind::Int,
-                    "Keep looking for this many seconds until an item can be claimed.",
+                WAIT,
+                required(
+                    "command",
+                    Kind::Argv,
+                    "The command to run for the item, after --: the item is its standard input, and its exit status decides the ack or the fail.",
                 ),
             ],
             Op::WorkExtend => vec![
@@ -606,17 +622,21 @@ impl<'a> Args<'a> {
             consumer,
             from: from.unwrap_or(0),
             limit: self.int("limit"),
-            command: self
-                .get("command")
-                .and_then(Value::as_array)
-                .map(|words| {
-                    words
-                        .iter()
-                        .filter_map(|word| word.as_str().map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            command: self.command(),
         })
+    }
+
+    /// The `command` argument, its program first; empty for none.
+    pub fn command(&self) -> Vec<String> {
+        self.get("command")
+            .and_then(Value::as_array)
+            .map(|words| {
+                words
+                    .iter()
+                    .filter_map(|word| word.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -706,7 +726,7 @@ fn answered(reply: Option<Json>, what: &str) -> anyhow::Result<Json> {
 }
 
 /// A member of an answer.
-fn member(answer: &RawValue, name: &str) -> anyhow::Result<Json> {
+pub(crate) fn member(answer: &RawValue, name: &str) -> anyhow::Result<Json> {
     serde_json::from_str::<BTreeMap<String, Json>>(answer.get())
         .ok()
         .and_then(|mut members| members.remove(name))
@@ -829,7 +849,8 @@ pub async fn consumer_commit(
 }
 
 /// Do an operation, and return what it prints, one JSON value per line.
-/// `watch` streams and is run by [`crate::watch`] instead.
+/// `watch` streams and is run by [`crate::watch`] instead, and `work run` by
+/// `run.rs`.
 ///
 /// # Errors
 ///
@@ -844,6 +865,7 @@ pub async fn run(
     let args = Args::check(op, values)?;
     match op {
         Op::Watch => bail!("watch streams, and is not run as a single call"),
+        Op::WorkRun => bail!("work run runs a command, and is not run as a single call"),
         Op::Publish => {
             let tenant: TenantId = args.parse("tenant")?;
             let topic: Topic = args.parse("topic")?;
@@ -1186,7 +1208,7 @@ async fn lease_call(
 /// `work_pull`, looking again every poll interval until an item is claimed or
 /// `wait` seconds have passed. A pull is safe to repeat: a consumer that holds
 /// a lease is given it again, so a lost answer costs nothing.
-async fn work_pull(client: &Client, args: &Args<'_>) -> anyhow::Result<Vec<Json>> {
+pub(crate) async fn work_pull(client: &Client, args: &Args<'_>) -> anyhow::Result<Vec<Json>> {
     let tenant: TenantId = args.parse("tenant")?;
     let queue: Segment = args.parse("queue")?;
     let consumer: ConsumerName = args.parse("consumer")?;
@@ -1254,6 +1276,7 @@ mod tests {
                 "work_extend",
                 "work_ack",
                 "work_fail",
+                "work_run",
                 "work_list",
                 "work_show",
                 "alerts_publish",
@@ -1289,7 +1312,8 @@ mod tests {
             }
         }
         assert!(!Op::Watch.is_tool());
-        assert_eq!(Op::ALL.iter().filter(|op| !op.is_tool()).count(), 1);
+        assert!(!Op::WorkRun.is_tool());
+        assert_eq!(Op::ALL.iter().filter(|op| !op.is_tool()).count(), 2);
     }
 
     #[test]
