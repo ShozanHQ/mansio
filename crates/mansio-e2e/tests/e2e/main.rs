@@ -23,6 +23,8 @@ mod passes;
 mod receiver;
 mod restart;
 mod surfaces;
+#[cfg(unix)]
+mod watcher;
 mod webhooks;
 mod work;
 mod work_list;

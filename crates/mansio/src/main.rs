@@ -4,6 +4,7 @@
 //! (`work_pull`) with the same name and the same parameters, and both are
 //! clients of the HTTP API. `mansio mcp` serves the tools on stdio.
 
+mod child;
 mod cli;
 mod client;
 mod mcp;
@@ -23,21 +24,24 @@ fn print(lines: &[client::Json]) {
     }
 }
 
-async fn run() -> anyhow::Result<()> {
+async fn run() -> anyhow::Result<ExitCode> {
     let matches = cli::command().get_matches();
     let chosen = cli::chosen(&matches)?;
     // Nothing is sent without a token, and a command that has none says so
     // before it does anything.
     let client = Client::from_lookup(cli::connection(&matches), |name| std::env::var(name).ok())?;
     match chosen {
-        Chosen::Mcp => mcp::serve(client).await.context("serving MCP"),
+        Chosen::Mcp => {
+            mcp::serve(client).await.context("serving MCP")?;
+            Ok(ExitCode::SUCCESS)
+        }
         Chosen::Op(ops::Op::Watch, args) => {
             let watched = ops::Args::check(ops::Op::Watch, &args)?.watch()?;
             watch::watch(&client, watched).await
         }
         Chosen::Op(op, args) => {
             print(&ops::run(&client, op, &args).await?);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
     }
 }
@@ -45,7 +49,7 @@ async fn run() -> anyhow::Result<()> {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     match run().await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) => {
             eprintln!("mansio: {error:#}");
             ExitCode::FAILURE

@@ -37,6 +37,11 @@ fn property(param: &Param) -> Value {
         Kind::Text => json!({"type": "string", "description": param.help}),
         Kind::Int => json!({"type": "integer", "minimum": 0, "description": param.help}),
         Kind::Json => json!({"description": param.help}),
+        Kind::Argv => json!({
+            "type": "array",
+            "items": {"type": "string"},
+            "description": param.help,
+        }),
         Kind::Scopes => json!({
             "type": "array",
             "description": param.help,
