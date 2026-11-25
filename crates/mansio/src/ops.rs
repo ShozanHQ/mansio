@@ -43,8 +43,8 @@ pub enum Op {
     WorkAck,
     /// Give a claimed item back as failed.
     WorkFail,
-    /// Claim one item, run a command for it while holding the lease, and ack
-    /// or fail it by how the command ends.
+    /// Claim one item, run a command for it with the lease held, and ack or
+    /// fail it by how the command ended.
     WorkRun,
     /// List the live items of a queue.
     WorkList,
@@ -147,6 +147,11 @@ const CONSUMER_PULL: Param = required(
     "consumer",
     Kind::Text,
     "The name this consumer pulls under. A consumer that holds a live lease is given it again.",
+);
+const WAIT: Param = optional(
+    "wait",
+    Kind::Int,
+    "Keep looking for this many seconds until an item can be claimed.",
 );
 const CONSUMER_HELD: Param = required(
     "consumer",
@@ -264,9 +269,9 @@ impl Op {
         Op::ALL.into_iter().find(|op| op.path() == path)
     }
 
-    /// Whether the MCP server offers it as a tool. `watch` streams, which a
-    /// tool call cannot, and `work run` runs a program of the caller's and
-    /// waits for it, which a tool call cannot either.
+    /// Whether the MCP server offers it as a tool. `watch` streams, and
+    /// `work run` runs a program of the caller's and waits for it, which a
+    /// tool call cannot.
     pub fn is_tool(self) -> bool {
         !matches!(self, Op::Watch | Op::WorkRun)
     }
@@ -295,7 +300,7 @@ impl Op {
                 "Give an item you claimed back as failed. It is tried again after a backoff, or goes to the dead topic when its attempts are used."
             }
             Op::WorkRun => {
-                "Claim one item of a queue as work pull does, run the command after -- with the item on its standard input, extend the lease while it runs, and ack the item when the command exits 0 or fail it when it does not. Prints the envelope of the ack or the fail; nothing when there is no item. Exits 3 when the command failed or was stopped, and 4 when the lease was lost or could grow no further."
+                "Claim one item of a queue as work pull does, run the command after -- with the item on its standard input, extend the lease while it runs, and ack the item when the command exits 0 or fail it when it does not. Prints the envelope of the ack or the fail; nothing when there was no item or the lease was lost."
             }
             Op::WorkList => {
                 "List the live items of a work queue in publish order, one page as one JSON object, with each item's state, attempt and holder; --state filters and --after takes the next value of the page before."
@@ -384,14 +389,16 @@ impl Op {
                 ),
             ],
             Op::WorkPublish => envelope(&[TENANT, QUEUE], &[ID_WORK]),
-            Op::WorkPull => vec![
+            Op::WorkPull => vec![TENANT, QUEUE, CONSUMER_PULL, WAIT],
+            Op::WorkRun => vec![
                 TENANT,
                 QUEUE,
                 CONSUMER_PULL,
-                optional(
-                    "wait",
-                    Kind::Int,
-                    "Keep looking for this many seconds until an item can be claimed.",
+                WAIT,
+                required(
+                    "command",
+                    Kind::Argv,
+                    "The command to run for the item, after --: the item is its standard input, and its exit status decides the ack or the fail.",
                 ),
             ],
             Op::WorkExtend => vec![
@@ -433,15 +440,6 @@ impl Op {
                 ),
                 required("reason", Kind::Text, "Why it failed."),
             ],
-            Op::WorkRun => {
-                let mut params = Op::WorkPull.params();
-                params.push(required(
-                    "command",
-                    Kind::Argv,
-                    "The command to run for the item, after --: the item is its standard input, and its exit status decides the ack or the fail.",
-                ));
-                params
-            }
             Op::WorkList => vec![
                 TENANT,
                 QUEUE,
@@ -628,8 +626,7 @@ impl<'a> Args<'a> {
         })
     }
 
-    /// The words of the `command` parameter, its program first; empty when
-    /// there is none.
+    /// The `command` argument, its program first; empty for none.
     pub fn command(&self) -> Vec<String> {
         self.get("command")
             .and_then(Value::as_array)
@@ -852,8 +849,8 @@ pub async fn consumer_commit(
 }
 
 /// Do an operation, and return what it prints, one JSON value per line.
-/// `watch` streams and is run by [`crate::watch`] instead, and `work run`
-/// runs a command and is run by [`crate::run`].
+/// `watch` streams and is run by [`crate::watch`] instead, and `work run` by
+/// `run.rs`.
 ///
 /// # Errors
 ///
@@ -1317,77 +1314,6 @@ mod tests {
         assert!(!Op::Watch.is_tool());
         assert!(!Op::WorkRun.is_tool());
         assert_eq!(Op::ALL.iter().filter(|op| !op.is_tool()).count(), 2);
-    }
-
-    fn parse(words: &[&str]) -> Result<clap::ArgMatches, clap::Error> {
-        crate::cli::command()
-            .try_get_matches_from(std::iter::once("mansio").chain(words.iter().copied()))
-    }
-
-    #[test]
-    fn work_run_takes_the_pull_and_the_words_after_the_double_dash() {
-        let matches = parse(&[
-            "work",
-            "run",
-            "--tenant",
-            "acme",
-            "--queue",
-            "builds",
-            "--consumer",
-            "w1",
-            "--wait",
-            "5",
-            "--",
-            "a",
-            "b",
-        ])
-        .unwrap();
-        let crate::cli::Chosen::Op(op, values) = crate::cli::chosen(&matches).unwrap() else {
-            panic!("not an operation");
-        };
-        assert_eq!(op, Op::WorkRun);
-        assert_eq!(
-            Value::Object(values.clone()),
-            json!({
-                "tenant": "acme",
-                "queue": "builds",
-                "consumer": "w1",
-                "wait": 5,
-                "command": ["a", "b"],
-            })
-        );
-        let args = Args::check(Op::WorkRun, &values).unwrap();
-        assert_eq!(args.command(), ["a", "b"]);
-        assert_eq!(args.int("wait"), Some(5));
-
-        let base = [
-            "work",
-            "run",
-            "--tenant",
-            "acme",
-            "--queue",
-            "builds",
-            "--consumer",
-            "w1",
-        ];
-        assert!(parse(&base).is_err(), "no command");
-        let mut dashes = base.to_vec();
-        dashes.push("--");
-        assert!(parse(&dashes).is_err(), "nothing after --");
-    }
-
-    #[tokio::test]
-    async fn work_run_is_not_a_single_call() {
-        let values = object(json!({
-            "tenant": "acme", "queue": "builds", "consumer": "w", "command": ["true"]
-        }));
-        let error = run(&client_for("http://127.0.0.1:9"), Op::WorkRun, &values)
-            .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("not run as a single call"),
-            "{error}"
-        );
     }
 
     #[test]

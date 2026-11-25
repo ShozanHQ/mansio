@@ -43,13 +43,27 @@ pub const DEFAULT_WATCH_RETRY_CAP_MILLIS: u64 = 60_000;
 /// The default number of times `watch` may run its command for one envelope
 /// (`MANSIO_WATCH_ATTEMPTS`): 0 is no limit.
 pub const DEFAULT_WATCH_ATTEMPTS: u64 = 0;
-/// The default share of a lease, in percent, that passes before `work run`
-/// extends it (`MANSIO_RUN_EXTEND_AT_PERCENT`): a whole number from 1 to 90.
+/// The default share of the time to the lease's end, in percent, after which
+/// `work run` extends the lease (`MANSIO_RUN_EXTEND_AT_PERCENT`).
 pub const DEFAULT_RUN_EXTEND_AT_PERCENT: u64 = 50;
-/// The default time, in seconds, that `work run` gives its command to end
-/// before it kills it: before the longest lease ends, and after a signal
-/// (`MANSIO_RUN_STOP_GRACE_SECONDS`).
+/// The default time, in seconds, that `work run` lets its command run after a
+/// signal or before the longest lease ends (`MANSIO_RUN_STOP_GRACE_SECONDS`).
 pub const DEFAULT_RUN_STOP_GRACE_SECONDS: u64 = 10;
+
+/// A request the server refused: its status, and the text a refusal prints.
+#[derive(Debug)]
+pub(crate) struct Refused {
+    pub(crate) status: StatusCode,
+    pub(crate) text: String,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl std::error::Error for Refused {}
 
 /// Whether a request can be sent again after its answer may have been lost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,13 +207,13 @@ impl Client {
     }
 
     /// The share of the time from the last answer to the lease's end, in
-    /// percent, after which `work run` extends the lease.
+    /// percent, after which `work run` extends the lease: 1 to 90.
     pub fn run_extend_at_percent(&self) -> u64 {
         self.run_extend_at_percent
     }
 
-    /// How long `work run` lets its command end by itself, before the longest
-    /// lease ends or after a signal, before it kills it.
+    /// How long `work run` lets its command run after a signal, and how long
+    /// before the longest lease ends it stops the command.
     pub fn run_stop_grace(&self) -> Duration {
         self.run_stop_grace
     }
@@ -303,23 +317,6 @@ fn answer(status: StatusCode, bytes: &[u8]) -> anyhow::Result<Option<Json>> {
         text: refusal(status, bytes),
     }))
 }
-
-/// A refusal by the server: its status, and the text that says why. It reads
-/// as the text, so what is printed is the same as before; `work run` reads
-/// the status to tell a lost lease from a failure it can try again.
-#[derive(Debug)]
-pub(crate) struct Refused {
-    pub(crate) status: StatusCode,
-    pub(crate) text: String,
-}
-
-impl std::fmt::Display for Refused {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.text)
-    }
-}
-
-impl std::error::Error for Refused {}
 
 fn refusal(status: StatusCode, body: &[u8]) -> String {
     match serde_json::from_slice::<mansio_core::api::ErrorBody>(body) {

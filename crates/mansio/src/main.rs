@@ -66,9 +66,9 @@ mod parity {
     //! The two are built from one description of the operations, and this
     //! reads them back from what each actually offers, so that a change to
     //! either that drops an operation or a parameter fails here. The
-    //! exemptions are named: `watch` streams, which a tool call cannot;
+    //! exemptions are named: `watch` streams, which a tool call cannot,
     //! `work run` runs a program of the caller's and waits for it, which a
-    //! tool call cannot either; and `mcp` is what serves the tools.
+    //! tool call cannot either, and `mcp` is what serves the tools.
 
     use std::collections::{BTreeMap, BTreeSet};
 

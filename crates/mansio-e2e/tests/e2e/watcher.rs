@@ -106,7 +106,7 @@ async fn printed_lines(
 /// Start the binary with its standard output piped and its standard error
 /// not read: the command's output goes there, and an orphaned command may
 /// hold it open.
-pub(crate) fn spawn(
+fn spawn(
     target: &Target,
     token: &str,
     args: &[&str],
