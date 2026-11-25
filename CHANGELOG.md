@@ -5,6 +5,32 @@ All notable changes to mansio are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0](https://github.com/ShozanHQ/mansio/releases/tag/v0.1.0) - 2026-11-25
+
+### Changed
+
+- `mansio watch` runs a command for each envelope, and moves on only when the command succeeds
+- Merge branch 'main' into the-release-configuration-parses-so-the-
+- A queue's live work items can be listed, and one item's state read, on the HTTP API, the CLI and MCP
+- Merge branch 'main' into the-release-configuration-parses-so-the-
+- Work publish refuses an idempotency key and says to use the item's id, so a retry can no longer make a second job in silence
+- The release configuration parses, so the release run gets past its first step
+- a start position, a destination policy, secret rotation and lifecycle facts
+- Keep every JSON number in an envelope's data exactly as published
+- A publish with an idempotency key already seen on that topic returns the first envelope
+- Merge branch 'surfaces' into work-extend
+- Outer gate round 1
+- The webhooks log is versioned and fails loud; retries back off and log once
+- Merge branch 'surfaces' into work-extend
+- Round 2 from the review
+- Round 2 from the review
+- work_extend renews a lease, so a long build keeps its item
+- CLI and MCP on one operation table, server-sent events with resume, signed webhooks
+- Merge credentials into surfaces
+- Surfaces (pre-merge)
+- Durable topics, no duplicate on an unlocated publish, broker errors logged
+- Cargo workspace, Apache Iggy in compose, the envelope and topic types, CI
+
 ### Added
 
 - `mansio watch ... -- CMD`: runs a command for each envelope, with the envelope on its standard input, and prints and commits the envelope only when the command exits 0; a failed command is run again after `MANSIO_WATCH_RETRY_BASE_MILLIS` doubling to `MANSIO_WATCH_RETRY_CAP_MILLIS`, and after `MANSIO_WATCH_ATTEMPTS` runs the watch exits 3.
