@@ -9,6 +9,7 @@ mod cli;
 mod client;
 mod mcp;
 mod ops;
+mod run;
 mod watch;
 
 use std::process::ExitCode;
@@ -39,6 +40,7 @@ async fn run() -> anyhow::Result<ExitCode> {
             let watched = ops::Args::check(ops::Op::Watch, &args)?.watch()?;
             watch::watch(&client, watched).await
         }
+        Chosen::Op(ops::Op::WorkRun, args) => run::work_run(&client, &args).await,
         Chosen::Op(op, args) => {
             print(&ops::run(&client, op, &args).await?);
             Ok(ExitCode::SUCCESS)
@@ -64,8 +66,9 @@ mod parity {
     //! The two are built from one description of the operations, and this
     //! reads them back from what each actually offers, so that a change to
     //! either that drops an operation or a parameter fails here. The
-    //! exemptions are named: `watch` streams, which a tool call cannot, and
-    //! `mcp` is what serves the tools.
+    //! exemptions are named: `watch` streams, which a tool call cannot;
+    //! `work run` runs a program of the caller's and waits for it, which a
+    //! tool call cannot either; and `mcp` is what serves the tools.
 
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -74,7 +77,7 @@ mod parity {
     use super::*;
 
     /// Commands that are not tools.
-    const COMMAND_ONLY: [&str; 2] = ["watch", "mcp"];
+    const COMMAND_ONLY: [&str; 3] = ["watch", "work_run", "mcp"];
 
     /// What a command offers: its flags, and which of them are required.
     #[derive(Debug, PartialEq, Eq)]

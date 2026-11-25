@@ -21,14 +21,14 @@ const TOPIC: &str = "facts.build";
 
 /// A command that waits at the gate `$1/gate`, after it has counted its run
 /// in `$1/runs` and written its pid to `$1/pid`.
-const GATED: &str =
+pub(crate) const GATED: &str =
     r#"echo run >> "$1/runs"; echo $$ > "$1/pid"; while [ ! -e "$1/gate" ]; do sleep 0.05; done"#;
 
 /// A directory of the test's own, removed when it is dropped.
-struct Scratch(PathBuf);
+pub(crate) struct Scratch(PathBuf);
 
 impl Scratch {
-    fn new(target: &Target, name: &str) -> anyhow::Result<Self> {
+    pub(crate) fn new(target: &Target, name: &str) -> anyhow::Result<Self> {
         let tenant: String = target
             .tenant
             .chars()
@@ -44,13 +44,13 @@ impl Scratch {
     }
 
     /// The directory as a word for the command line.
-    fn arg(&self) -> anyhow::Result<&str> {
+    pub(crate) fn arg(&self) -> anyhow::Result<&str> {
         self.0
             .to_str()
             .context("the scratch directory is not UTF-8")
     }
 
-    fn join(&self, name: &str) -> PathBuf {
+    pub(crate) fn join(&self, name: &str) -> PathBuf {
         self.0.join(name)
     }
 }
@@ -106,7 +106,7 @@ async fn printed_lines(
 /// Start the binary with its standard output piped and its standard error
 /// not read: the command's output goes there, and an orphaned command may
 /// hold it open.
-fn spawn(
+pub(crate) fn spawn(
     target: &Target,
     token: &str,
     args: &[&str],
@@ -120,7 +120,7 @@ fn spawn(
 }
 
 /// Run the binary to its end.
-async fn run(
+pub(crate) async fn run(
     target: &Target,
     token: &str,
     args: &[&str],
@@ -134,7 +134,7 @@ async fn run(
 }
 
 /// Wait for a child to exit, without holding up the server in this process.
-async fn exited(
+pub(crate) async fn exited(
     target: &Target,
     child: &mut Child,
     timeout: std::time::Duration,
@@ -148,14 +148,14 @@ async fn exited(
 }
 
 /// Send a signal to a process.
-fn signal(pid: &str, signal: &str) -> anyhow::Result<()> {
+pub(crate) fn signal(pid: &str, signal: &str) -> anyhow::Result<()> {
     let sent = Command::new("kill").args([signal, pid]).status()?;
     ensure!(sent.success(), "kill {signal} {pid} failed");
     Ok(())
 }
 
 /// Wait until a process is gone.
-async fn gone(target: &Target, pid: &str) -> anyhow::Result<()> {
+pub(crate) async fn gone(target: &Target, pid: &str) -> anyhow::Result<()> {
     target
         .until(&format!("process {pid} to be gone"), SLACK, || {
             let alive = Command::new("kill")
@@ -170,7 +170,7 @@ async fn gone(target: &Target, pid: &str) -> anyhow::Result<()> {
 }
 
 /// The pid a command wrote, once it has.
-async fn pid_of(target: &Target, path: &Path) -> anyhow::Result<String> {
+pub(crate) async fn pid_of(target: &Target, path: &Path) -> anyhow::Result<String> {
     let found = file_lines(target, path, 1, SLACK).await?;
     Ok(found.concat().trim().to_owned())
 }

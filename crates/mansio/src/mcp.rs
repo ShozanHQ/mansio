@@ -5,8 +5,9 @@
 //! stdout. A tool has the name of its operation, `work_pull`, and takes the
 //! parameters of its command as properties, `lease_id` for `--lease-id`. It
 //! does what the command does, by the same code, and returns what the command
-//! prints. `watch` is the one command that is not a tool: it streams, which a
-//! call cannot.
+//! prints. Two commands are not tools: `watch` streams, which a call cannot,
+//! and `work run` runs a program of the caller's and waits for it, which a
+//! call cannot either.
 
 use std::sync::Arc;
 
@@ -385,7 +386,8 @@ mod tests {
             .collect();
         assert!(names.contains(&"work_pull") && names.contains(&"webhooks_list"));
         assert!(!names.contains(&"watch"));
-        assert_eq!(names.len(), Op::ALL.len() - 1);
+        assert!(!names.contains(&"work_run"));
+        assert_eq!(names.len(), Op::ALL.len() - 2);
 
         let pull = listed.iter().find(|t| t["name"] == "work_pull").unwrap();
         let schema = &pull["inputSchema"];

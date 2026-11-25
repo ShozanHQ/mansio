@@ -43,6 +43,9 @@ pub enum Op {
     WorkAck,
     /// Give a claimed item back as failed.
     WorkFail,
+    /// Claim one item, run a command for it while holding the lease, and ack
+    /// or fail it by how the command ends.
+    WorkRun,
     /// List the live items of a queue.
     WorkList,
     /// Show one item of a queue.
@@ -198,7 +201,7 @@ const ENVELOPE: [Param; 6] = [
 
 impl Op {
     /// Every operation, in the order they are listed.
-    pub const ALL: [Op; 21] = [
+    pub const ALL: [Op; 22] = [
         Op::Publish,
         Op::Poll,
         Op::Watch,
@@ -207,6 +210,7 @@ impl Op {
         Op::WorkExtend,
         Op::WorkAck,
         Op::WorkFail,
+        Op::WorkRun,
         Op::WorkList,
         Op::WorkShow,
         Op::AlertsPublish,
@@ -233,6 +237,7 @@ impl Op {
             Op::WorkExtend => &["work", "extend"],
             Op::WorkAck => &["work", "ack"],
             Op::WorkFail => &["work", "fail"],
+            Op::WorkRun => &["work", "run"],
             Op::WorkList => &["work", "list"],
             Op::WorkShow => &["work", "show"],
             Op::AlertsPublish => &["alerts", "publish"],
@@ -260,9 +265,10 @@ impl Op {
     }
 
     /// Whether the MCP server offers it as a tool. `watch` streams, which a
-    /// tool call cannot.
+    /// tool call cannot, and `work run` runs a program of the caller's and
+    /// waits for it, which a tool call cannot either.
     pub fn is_tool(self) -> bool {
-        self != Op::Watch
+        !matches!(self, Op::Watch | Op::WorkRun)
     }
 
     /// What the operation does, in a sentence.
@@ -287,6 +293,9 @@ impl Op {
             }
             Op::WorkFail => {
                 "Give an item you claimed back as failed. It is tried again after a backoff, or goes to the dead topic when its attempts are used."
+            }
+            Op::WorkRun => {
+                "Claim one item of a queue as work pull does, run the command after -- with the item on its standard input, extend the lease while it runs, and ack the item when the command exits 0 or fail it when it does not. Prints the envelope of the ack or the fail; nothing when there is no item. Exits 3 when the command failed or was stopped, and 4 when the lease was lost or could grow no further."
             }
             Op::WorkList => {
                 "List the live items of a work queue in publish order, one page as one JSON object, with each item's state, attempt and holder; --state filters and --after takes the next value of the page before."
@@ -424,6 +433,15 @@ impl Op {
                 ),
                 required("reason", Kind::Text, "Why it failed."),
             ],
+            Op::WorkRun => {
+                let mut params = Op::WorkPull.params();
+                params.push(required(
+                    "command",
+                    Kind::Argv,
+                    "The command to run for the item, after --: the item is its standard input, and its exit status decides the ack or the fail.",
+                ));
+                params
+            }
             Op::WorkList => vec![
                 TENANT,
                 QUEUE,
@@ -606,17 +624,22 @@ impl<'a> Args<'a> {
             consumer,
             from: from.unwrap_or(0),
             limit: self.int("limit"),
-            command: self
-                .get("command")
-                .and_then(Value::as_array)
-                .map(|words| {
-                    words
-                        .iter()
-                        .filter_map(|word| word.as_str().map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            command: self.command(),
         })
+    }
+
+    /// The words of the `command` parameter, its program first; empty when
+    /// there is none.
+    pub fn command(&self) -> Vec<String> {
+        self.get("command")
+            .and_then(Value::as_array)
+            .map(|words| {
+                words
+                    .iter()
+                    .filter_map(|word| word.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -706,7 +729,7 @@ fn answered(reply: Option<Json>, what: &str) -> anyhow::Result<Json> {
 }
 
 /// A member of an answer.
-fn member(answer: &RawValue, name: &str) -> anyhow::Result<Json> {
+pub(crate) fn member(answer: &RawValue, name: &str) -> anyhow::Result<Json> {
     serde_json::from_str::<BTreeMap<String, Json>>(answer.get())
         .ok()
         .and_then(|mut members| members.remove(name))
@@ -829,7 +852,8 @@ pub async fn consumer_commit(
 }
 
 /// Do an operation, and return what it prints, one JSON value per line.
-/// `watch` streams and is run by [`crate::watch`] instead.
+/// `watch` streams and is run by [`crate::watch`] instead, and `work run`
+/// runs a command and is run by [`crate::run`].
 ///
 /// # Errors
 ///
@@ -844,6 +868,7 @@ pub async fn run(
     let args = Args::check(op, values)?;
     match op {
         Op::Watch => bail!("watch streams, and is not run as a single call"),
+        Op::WorkRun => bail!("work run runs a command, and is not run as a single call"),
         Op::Publish => {
             let tenant: TenantId = args.parse("tenant")?;
             let topic: Topic = args.parse("topic")?;
@@ -1186,7 +1211,7 @@ async fn lease_call(
 /// `work_pull`, looking again every poll interval until an item is claimed or
 /// `wait` seconds have passed. A pull is safe to repeat: a consumer that holds
 /// a lease is given it again, so a lost answer costs nothing.
-async fn work_pull(client: &Client, args: &Args<'_>) -> anyhow::Result<Vec<Json>> {
+pub(crate) async fn work_pull(client: &Client, args: &Args<'_>) -> anyhow::Result<Vec<Json>> {
     let tenant: TenantId = args.parse("tenant")?;
     let queue: Segment = args.parse("queue")?;
     let consumer: ConsumerName = args.parse("consumer")?;
@@ -1254,6 +1279,7 @@ mod tests {
                 "work_extend",
                 "work_ack",
                 "work_fail",
+                "work_run",
                 "work_list",
                 "work_show",
                 "alerts_publish",
@@ -1289,7 +1315,79 @@ mod tests {
             }
         }
         assert!(!Op::Watch.is_tool());
-        assert_eq!(Op::ALL.iter().filter(|op| !op.is_tool()).count(), 1);
+        assert!(!Op::WorkRun.is_tool());
+        assert_eq!(Op::ALL.iter().filter(|op| !op.is_tool()).count(), 2);
+    }
+
+    fn parse(words: &[&str]) -> Result<clap::ArgMatches, clap::Error> {
+        crate::cli::command()
+            .try_get_matches_from(std::iter::once("mansio").chain(words.iter().copied()))
+    }
+
+    #[test]
+    fn work_run_takes_the_pull_and_the_words_after_the_double_dash() {
+        let matches = parse(&[
+            "work",
+            "run",
+            "--tenant",
+            "acme",
+            "--queue",
+            "builds",
+            "--consumer",
+            "w1",
+            "--wait",
+            "5",
+            "--",
+            "a",
+            "b",
+        ])
+        .unwrap();
+        let crate::cli::Chosen::Op(op, values) = crate::cli::chosen(&matches).unwrap() else {
+            panic!("not an operation");
+        };
+        assert_eq!(op, Op::WorkRun);
+        assert_eq!(
+            Value::Object(values.clone()),
+            json!({
+                "tenant": "acme",
+                "queue": "builds",
+                "consumer": "w1",
+                "wait": 5,
+                "command": ["a", "b"],
+            })
+        );
+        let args = Args::check(Op::WorkRun, &values).unwrap();
+        assert_eq!(args.command(), ["a", "b"]);
+        assert_eq!(args.int("wait"), Some(5));
+
+        let base = [
+            "work",
+            "run",
+            "--tenant",
+            "acme",
+            "--queue",
+            "builds",
+            "--consumer",
+            "w1",
+        ];
+        assert!(parse(&base).is_err(), "no command");
+        let mut dashes = base.to_vec();
+        dashes.push("--");
+        assert!(parse(&dashes).is_err(), "nothing after --");
+    }
+
+    #[tokio::test]
+    async fn work_run_is_not_a_single_call() {
+        let values = object(json!({
+            "tenant": "acme", "queue": "builds", "consumer": "w", "command": ["true"]
+        }));
+        let error = run(&client_for("http://127.0.0.1:9"), Op::WorkRun, &values)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("not run as a single call"),
+            "{error}"
+        );
     }
 
     #[test]

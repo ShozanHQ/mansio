@@ -22,6 +22,8 @@ mod oversized;
 mod passes;
 mod receiver;
 mod restart;
+#[cfg(unix)]
+mod runner;
 mod surfaces;
 #[cfg(unix)]
 mod watcher;
