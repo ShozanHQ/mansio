@@ -4,10 +4,12 @@
 //! (`work_pull`) with the same name and the same parameters, and both are
 //! clients of the HTTP API. `mansio mcp` serves the tools on stdio.
 
+mod child;
 mod cli;
 mod client;
 mod mcp;
 mod ops;
+mod run;
 mod watch;
 
 use std::process::ExitCode;
@@ -23,21 +25,25 @@ fn print(lines: &[client::Json]) {
     }
 }
 
-async fn run() -> anyhow::Result<()> {
+async fn run() -> anyhow::Result<ExitCode> {
     let matches = cli::command().get_matches();
     let chosen = cli::chosen(&matches)?;
     // Nothing is sent without a token, and a command that has none says so
     // before it does anything.
     let client = Client::from_lookup(cli::connection(&matches), |name| std::env::var(name).ok())?;
     match chosen {
-        Chosen::Mcp => mcp::serve(client).await.context("serving MCP"),
+        Chosen::Mcp => {
+            mcp::serve(client).await.context("serving MCP")?;
+            Ok(ExitCode::SUCCESS)
+        }
         Chosen::Op(ops::Op::Watch, args) => {
             let watched = ops::Args::check(ops::Op::Watch, &args)?.watch()?;
             watch::watch(&client, watched).await
         }
+        Chosen::Op(ops::Op::WorkRun, args) => run::work_run(&client, &args).await,
         Chosen::Op(op, args) => {
             print(&ops::run(&client, op, &args).await?);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
     }
 }
@@ -45,7 +51,7 @@ async fn run() -> anyhow::Result<()> {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     match run().await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) => {
             eprintln!("mansio: {error:#}");
             ExitCode::FAILURE
@@ -60,8 +66,9 @@ mod parity {
     //! The two are built from one description of the operations, and this
     //! reads them back from what each actually offers, so that a change to
     //! either that drops an operation or a parameter fails here. The
-    //! exemptions are named: `watch` streams, which a tool call cannot, and
-    //! `mcp` is what serves the tools.
+    //! exemptions are named: `watch` streams, which a tool call cannot,
+    //! `work run` runs a program of the caller's and waits for it, which a
+    //! tool call cannot either, and `mcp` is what serves the tools.
 
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -70,7 +77,7 @@ mod parity {
     use super::*;
 
     /// Commands that are not tools.
-    const COMMAND_ONLY: [&str; 2] = ["watch", "mcp"];
+    const COMMAND_ONLY: [&str; 3] = ["watch", "work_run", "mcp"];
 
     /// What a command offers: its flags, and which of them are required.
     #[derive(Debug, PartialEq, Eq)]

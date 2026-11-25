@@ -5,8 +5,9 @@
 //! stdout. A tool has the name of its operation, `work_pull`, and takes the
 //! parameters of its command as properties, `lease_id` for `--lease-id`. It
 //! does what the command does, by the same code, and returns what the command
-//! prints. `watch` is the one command that is not a tool: it streams, which a
-//! call cannot.
+//! prints. `watch` and `work run` are the commands that are not tools: one
+//! streams, and the other runs a program of the caller's and waits for it,
+//! which a call cannot.
 
 use std::sync::Arc;
 
@@ -37,6 +38,11 @@ fn property(param: &Param) -> Value {
         Kind::Text => json!({"type": "string", "description": param.help}),
         Kind::Int => json!({"type": "integer", "minimum": 0, "description": param.help}),
         Kind::Json => json!({"description": param.help}),
+        Kind::Argv => json!({
+            "type": "array",
+            "items": {"type": "string"},
+            "description": param.help,
+        }),
         Kind::Scopes => json!({
             "type": "array",
             "description": param.help,
@@ -379,8 +385,8 @@ mod tests {
             .map(|tool| tool["name"].as_str().unwrap())
             .collect();
         assert!(names.contains(&"work_pull") && names.contains(&"webhooks_list"));
-        assert!(!names.contains(&"watch"));
-        assert_eq!(names.len(), Op::ALL.len() - 1);
+        assert!(!names.contains(&"watch") && !names.contains(&"work_run"));
+        assert_eq!(names.len(), Op::ALL.len() - 2);
 
         let pull = listed.iter().find(|t| t["name"] == "work_pull").unwrap();
         let schema = &pull["inputSchema"];

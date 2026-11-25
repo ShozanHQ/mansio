@@ -43,6 +43,9 @@ pub enum Op {
     WorkAck,
     /// Give a claimed item back as failed.
     WorkFail,
+    /// Claim one item, run a command for it with the lease held, and ack or
+    /// fail it by how the command ended.
+    WorkRun,
     /// List the live items of a queue.
     WorkList,
     /// Show one item of a queue.
@@ -85,6 +88,9 @@ pub enum Kind {
     /// The scopes of a principal: a list of `{"topic", "verbs"}`. On the
     /// command line it is written as JSON.
     Scopes,
+    /// A list of words: on the command line, everything after `--`, with no
+    /// flag. In the arguments of a call it is a JSON array of strings.
+    Argv,
 }
 
 /// One parameter of an operation: a flag on the command line and a property
@@ -142,6 +148,11 @@ const CONSUMER_PULL: Param = required(
     Kind::Text,
     "The name this consumer pulls under. A consumer that holds a live lease is given it again.",
 );
+const WAIT: Param = optional(
+    "wait",
+    Kind::Int,
+    "Keep looking for this many seconds until an item can be claimed.",
+);
 const CONSUMER_HELD: Param = required(
     "consumer",
     Kind::Text,
@@ -195,7 +206,7 @@ const ENVELOPE: [Param; 6] = [
 
 impl Op {
     /// Every operation, in the order they are listed.
-    pub const ALL: [Op; 21] = [
+    pub const ALL: [Op; 22] = [
         Op::Publish,
         Op::Poll,
         Op::Watch,
@@ -204,6 +215,7 @@ impl Op {
         Op::WorkExtend,
         Op::WorkAck,
         Op::WorkFail,
+        Op::WorkRun,
         Op::WorkList,
         Op::WorkShow,
         Op::AlertsPublish,
@@ -230,6 +242,7 @@ impl Op {
             Op::WorkExtend => &["work", "extend"],
             Op::WorkAck => &["work", "ack"],
             Op::WorkFail => &["work", "fail"],
+            Op::WorkRun => &["work", "run"],
             Op::WorkList => &["work", "list"],
             Op::WorkShow => &["work", "show"],
             Op::AlertsPublish => &["alerts", "publish"],
@@ -256,10 +269,11 @@ impl Op {
         Op::ALL.into_iter().find(|op| op.path() == path)
     }
 
-    /// Whether the MCP server offers it as a tool. `watch` streams, which a
+    /// Whether the MCP server offers it as a tool. `watch` streams, and
+    /// `work run` runs a program of the caller's and waits for it, which a
     /// tool call cannot.
     pub fn is_tool(self) -> bool {
-        self != Op::Watch
+        !matches!(self, Op::Watch | Op::WorkRun)
     }
 
     /// What the operation does, in a sentence.
@@ -268,7 +282,7 @@ impl Op {
             Op::Publish => "Publish an envelope to a topic and print it as stored.",
             Op::Poll => "Print the envelopes in a topic from an offset, one JSON object per line.",
             Op::Watch => {
-                "Stream the envelopes of a topic as they arrive, one JSON object per line. With --consumer the server keeps the position, so a restart resumes at the next envelope; stop with SIGINT or SIGTERM."
+                "Stream the envelopes of a topic as they arrive, one JSON object per line. With --consumer the server keeps the position, so a restart resumes at the next envelope; stop with SIGINT or SIGTERM. With a command after --, the command is run for each envelope, which is printed and committed only when the command exits 0; a command that fails is run again after a wait."
             }
             Op::WorkPublish => {
                 "Publish a work item to a queue and print it as stored. The item is named by its id. To resend safely, choose the id before the first send."
@@ -284,6 +298,9 @@ impl Op {
             }
             Op::WorkFail => {
                 "Give an item you claimed back as failed. It is tried again after a backoff, or goes to the dead topic when its attempts are used."
+            }
+            Op::WorkRun => {
+                "Claim one item of a queue as work pull does, run the command after -- with the item on its standard input, extend the lease while it runs, and ack the item when the command exits 0 or fail it when it does not. Prints the envelope of the ack or the fail; nothing when there was no item or the lease was lost."
             }
             Op::WorkList => {
                 "List the live items of a work queue in publish order, one page as one JSON object, with each item's state, attempt and holder; --state filters and --after takes the next value of the page before."
@@ -353,24 +370,35 @@ impl Op {
                 optional(
                     "consumer",
                     Kind::Text,
-                    "Resume from this named consumer, and commit each offset after its line is written. Not with --from.",
+                    "Resume from this named consumer, and commit each offset after its line is written and, with a command, after the command has exited 0. Not with --from.",
                 ),
                 optional(
                     "from",
                     Kind::Int,
                     "Start at this offset, without keeping a position. Not with --consumer. Default 0.",
                 ),
-                optional("limit", Kind::Int, "Stop after this many envelopes."),
+                optional(
+                    "limit",
+                    Kind::Int,
+                    "Stop after this many envelopes; with a command, envelopes whose command exited 0.",
+                ),
+                optional(
+                    "command",
+                    Kind::Argv,
+                    "A command to run for each envelope, after --: the envelope is its standard input, and the place moves only when it exits 0.",
+                ),
             ],
             Op::WorkPublish => envelope(&[TENANT, QUEUE], &[ID_WORK]),
-            Op::WorkPull => vec![
+            Op::WorkPull => vec![TENANT, QUEUE, CONSUMER_PULL, WAIT],
+            Op::WorkRun => vec![
                 TENANT,
                 QUEUE,
                 CONSUMER_PULL,
-                optional(
-                    "wait",
-                    Kind::Int,
-                    "Keep looking for this many seconds until an item can be claimed.",
+                WAIT,
+                required(
+                    "command",
+                    Kind::Argv,
+                    "The command to run for the item, after --: the item is its standard input, and its exit status decides the ack or the fail.",
                 ),
             ],
             Op::WorkExtend => vec![
@@ -594,7 +622,21 @@ impl<'a> Args<'a> {
             consumer,
             from: from.unwrap_or(0),
             limit: self.int("limit"),
+            command: self.command(),
         })
+    }
+
+    /// The `command` argument, its program first; empty for none.
+    pub fn command(&self) -> Vec<String> {
+        self.get("command")
+            .and_then(Value::as_array)
+            .map(|words| {
+                words
+                    .iter()
+                    .filter_map(|word| word.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -618,6 +660,12 @@ fn kind_ok(param: &Param, value: &Value) -> anyhow::Result<()> {
             Ok(_) => Ok(()),
             Err(reason) => bail!("{name} must be a list of {{\"topic\", \"verbs\"}}: {reason}"),
         },
+        Kind::Argv => match value {
+            Value::Array(words) if !words.is_empty() && words.iter().all(Value::is_string) => {
+                Ok(())
+            }
+            _ => bail!("{name} must be a list of words"),
+        },
     }
 }
 
@@ -634,6 +682,9 @@ pub struct WatchArgs {
     pub from: u64,
     /// Stop after this many envelopes.
     pub limit: Option<u64>,
+    /// The command to run for each envelope, its program first; empty for
+    /// none.
+    pub command: Vec<String>,
 }
 
 /// The attributes of an envelope that a client sets, as JSON text. `data`
@@ -675,7 +726,7 @@ fn answered(reply: Option<Json>, what: &str) -> anyhow::Result<Json> {
 }
 
 /// A member of an answer.
-fn member(answer: &RawValue, name: &str) -> anyhow::Result<Json> {
+pub(crate) fn member(answer: &RawValue, name: &str) -> anyhow::Result<Json> {
     serde_json::from_str::<BTreeMap<String, Json>>(answer.get())
         .ok()
         .and_then(|mut members| members.remove(name))
@@ -798,7 +849,8 @@ pub async fn consumer_commit(
 }
 
 /// Do an operation, and return what it prints, one JSON value per line.
-/// `watch` streams and is run by [`crate::watch`] instead.
+/// `watch` streams and is run by [`crate::watch`] instead, and `work run` by
+/// `run.rs`.
 ///
 /// # Errors
 ///
@@ -813,6 +865,7 @@ pub async fn run(
     let args = Args::check(op, values)?;
     match op {
         Op::Watch => bail!("watch streams, and is not run as a single call"),
+        Op::WorkRun => bail!("work run runs a command, and is not run as a single call"),
         Op::Publish => {
             let tenant: TenantId = args.parse("tenant")?;
             let topic: Topic = args.parse("topic")?;
@@ -1155,7 +1208,7 @@ async fn lease_call(
 /// `work_pull`, looking again every poll interval until an item is claimed or
 /// `wait` seconds have passed. A pull is safe to repeat: a consumer that holds
 /// a lease is given it again, so a lost answer costs nothing.
-async fn work_pull(client: &Client, args: &Args<'_>) -> anyhow::Result<Vec<Json>> {
+pub(crate) async fn work_pull(client: &Client, args: &Args<'_>) -> anyhow::Result<Vec<Json>> {
     let tenant: TenantId = args.parse("tenant")?;
     let queue: Segment = args.parse("queue")?;
     let consumer: ConsumerName = args.parse("consumer")?;
@@ -1223,6 +1276,7 @@ mod tests {
                 "work_extend",
                 "work_ack",
                 "work_fail",
+                "work_run",
                 "work_list",
                 "work_show",
                 "alerts_publish",
@@ -1258,7 +1312,34 @@ mod tests {
             }
         }
         assert!(!Op::Watch.is_tool());
-        assert_eq!(Op::ALL.iter().filter(|op| !op.is_tool()).count(), 1);
+        assert!(!Op::WorkRun.is_tool());
+        assert_eq!(Op::ALL.iter().filter(|op| !op.is_tool()).count(), 2);
+    }
+
+    #[test]
+    fn watch_carries_its_command_and_none_when_there_is_none() {
+        let with = object(json!({
+            "tenant": "acme",
+            "topic": "facts.build",
+            "consumer": "c",
+            "command": ["sh", "-c", "x"],
+        }));
+        let watched = Args::check(Op::Watch, &with).unwrap().watch().unwrap();
+        assert_eq!(watched.command, ["sh", "-c", "x"]);
+        assert_eq!(
+            watched.consumer.map(|c| c.as_str().to_owned()),
+            Some("c".to_owned())
+        );
+
+        let without = object(json!({"tenant": "acme", "topic": "facts.build"}));
+        let watched = Args::check(Op::Watch, &without).unwrap().watch().unwrap();
+        assert!(watched.command.is_empty());
+
+        for bad in [json!([]), json!("sh -c x"), json!(["sh", 1])] {
+            let values = object(json!({"tenant": "acme", "topic": "facts.build", "command": bad}));
+            let error = Args::check(Op::Watch, &values).unwrap_err().to_string();
+            assert!(error.contains("command must be a list of words"), "{error}");
+        }
     }
 
     #[test]

@@ -20,7 +20,11 @@ fn command(target: &Target, token: Option<&str>, args: &[&str]) -> anyhow::Resul
 }
 
 /// The same against any address.
-fn command_at(base: &str, token: Option<&str>, args: &[&str]) -> anyhow::Result<Command> {
+pub(crate) fn command_at(
+    base: &str,
+    token: Option<&str>,
+    args: &[&str],
+) -> anyhow::Result<Command> {
     let mut command = Command::new(crate::cli_binary()?);
     command
         .args(args)
@@ -230,6 +234,27 @@ async fn every_command_refuses_without_a_token_and_calls_nothing() -> anyhow::Re
             "work", "show", "--tenant", &t, "--queue", "builds", "--item", "i",
         ],
         vec!["mcp"],
+        vec![
+            "watch",
+            "--tenant",
+            &t,
+            "--topic",
+            "facts.build",
+            "--",
+            "true",
+        ],
+        vec![
+            "work",
+            "run",
+            "--tenant",
+            &t,
+            "--queue",
+            "builds",
+            "--consumer",
+            "w",
+            "--",
+            "true",
+        ],
     ];
     for args in &commands {
         refused_at(&elsewhere, None, args, "MANSIO_TOKEN").await?;
@@ -407,7 +432,7 @@ async fn watch_resumes_with_the_same_consumer_with_nothing_missed_and_nothing_tw
 }
 
 /// The lines a child prints, as they come.
-fn lines_of(child: &mut Child) -> anyhow::Result<Lines<String>> {
+pub(crate) fn lines_of(child: &mut Child) -> anyhow::Result<Lines<String>> {
     let stdout = child.stdout.take().context("piped stdout")?;
     let (sender, lines) = mpsc::channel();
     std::thread::spawn(move || {

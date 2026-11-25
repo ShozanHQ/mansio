@@ -56,15 +56,16 @@ fn leaf(op: Op, name: &'static str) -> Command {
     let mut command = Command::new(name).about(op.about());
     for param in op.params() {
         let mut arg = Arg::new(param.name)
-            .long(param.flag())
             .value_name(param.name.to_uppercase())
             .help(param.help)
             .required(param.required);
         arg = match param.kind {
-            Kind::Text => arg,
-            Kind::Int => arg.value_parser(value_parser!(u64)),
-            Kind::Json => arg.value_parser(parse_json_text),
-            Kind::Scopes => arg.value_parser(parse_json),
+            Kind::Text => arg.long(param.flag()),
+            Kind::Int => arg.long(param.flag()).value_parser(value_parser!(u64)),
+            Kind::Json => arg.long(param.flag()).value_parser(parse_json_text),
+            Kind::Scopes => arg.long(param.flag()).value_parser(parse_json),
+            // Every word after `--`, flags included, is the command's.
+            Kind::Argv => arg.num_args(1..).last(true),
         };
         command = command.arg(arg);
     }
@@ -163,6 +164,9 @@ pub fn chosen(matches: &ArgMatches) -> anyhow::Result<Chosen> {
                 .map(|text| Value::String(text.clone())),
             Kind::Int => current.get_one::<u64>(param.name).map(|n| Value::from(*n)),
             Kind::Json | Kind::Scopes => current.get_one::<Value>(param.name).cloned(),
+            Kind::Argv => current
+                .get_many::<String>(param.name)
+                .map(|words| Value::Array(words.map(|word| Value::String(word.clone())).collect())),
         };
         if let Some(value) = value {
             args.insert(param.name.to_owned(), value);
@@ -278,6 +282,107 @@ mod tests {
                 connection.token.as_ref().map(ExposeSecret::expose_secret),
                 Some("t")
             );
+        }
+    }
+
+    fn watch_args(rest: &[&str]) -> Map<String, Value> {
+        let mut args = vec!["watch", "--tenant", "acme", "--topic", "facts.build"];
+        args.extend(rest);
+        let Chosen::Op(op, args) = chosen(&parse(&args).unwrap()).unwrap() else {
+            panic!("not an operation");
+        };
+        assert_eq!(op, Op::Watch);
+        args
+    }
+
+    #[test]
+    fn watch_takes_the_words_after_the_double_dash_as_its_command() {
+        let args = watch_args(&["--consumer", "c", "--", "a", "b", "c"]);
+        assert_eq!(
+            Value::Object(args),
+            json!({
+                "tenant": "acme",
+                "topic": "facts.build",
+                "consumer": "c",
+                "command": ["a", "b", "c"],
+            })
+        );
+        // Words that look like flags are the command's, the token's included.
+        let matches = parse(&[
+            "watch",
+            "--tenant",
+            "acme",
+            "--topic",
+            "facts.build",
+            "--",
+            "sh",
+            "-c",
+            "x",
+            "--token",
+            "t",
+            "--limit",
+            "1",
+        ])
+        .unwrap();
+        assert!(connection(&matches).token.is_none());
+        let Chosen::Op(_, args) = chosen(&matches).unwrap() else {
+            panic!("not an operation");
+        };
+        assert_eq!(
+            args["command"],
+            json!(["sh", "-c", "x", "--token", "t", "--limit", "1"])
+        );
+        assert!(!args.contains_key("limit"));
+    }
+
+    #[test]
+    fn watch_without_a_command_parses_as_it_did() {
+        assert_eq!(
+            Value::Object(watch_args(&["--from", "3", "--limit", "2"])),
+            json!({"tenant": "acme", "topic": "facts.build", "from": 3, "limit": 2})
+        );
+        // A `--` with nothing after it is no command.
+        assert_eq!(
+            Value::Object(watch_args(&["--"])),
+            json!({"tenant": "acme", "topic": "facts.build"})
+        );
+    }
+
+    #[test]
+    fn work_run_takes_the_words_after_the_double_dash_and_needs_them() {
+        let claim = [
+            "work",
+            "run",
+            "--tenant",
+            "acme",
+            "--queue",
+            "builds",
+            "--consumer",
+            "w1",
+            "--wait",
+            "5",
+        ];
+        let mut with = claim.to_vec();
+        with.extend(["--", "a", "b"]);
+        let Chosen::Op(op, args) = chosen(&parse(&with).unwrap()).unwrap() else {
+            panic!("not an operation");
+        };
+        assert_eq!(op, Op::WorkRun);
+        assert_eq!(
+            Value::Object(args),
+            json!({
+                "tenant": "acme",
+                "queue": "builds",
+                "consumer": "w1",
+                "wait": 5,
+                "command": ["a", "b"],
+            })
+        );
+
+        let mut empty = claim.to_vec();
+        empty.push("--");
+        for args in [&claim[..], &empty[..]] {
+            assert!(parse(args).is_err(), "{args:?}");
         }
     }
 

@@ -33,6 +33,37 @@ pub const DEFAULT_RETRY_BACKOFF_MILLIS: u64 = 250;
 /// The default wait between looks for something that is not there yet, in
 /// milliseconds (`MANSIO_POLL_INTERVAL_MILLIS`).
 pub const DEFAULT_POLL_INTERVAL_MILLIS: u64 = 500;
+/// The default wait before `watch` runs a failed command again, in
+/// milliseconds (`MANSIO_WATCH_RETRY_BASE_MILLIS`). It doubles with each
+/// failure up to the cap.
+pub const DEFAULT_WATCH_RETRY_BASE_MILLIS: u64 = 1000;
+/// The default longest wait before `watch` runs a failed command again, in
+/// milliseconds (`MANSIO_WATCH_RETRY_CAP_MILLIS`).
+pub const DEFAULT_WATCH_RETRY_CAP_MILLIS: u64 = 60_000;
+/// The default number of times `watch` may run its command for one envelope
+/// (`MANSIO_WATCH_ATTEMPTS`): 0 is no limit.
+pub const DEFAULT_WATCH_ATTEMPTS: u64 = 0;
+/// The default share of the time to the lease's end, in percent, after which
+/// `work run` extends the lease (`MANSIO_RUN_EXTEND_AT_PERCENT`).
+pub const DEFAULT_RUN_EXTEND_AT_PERCENT: u64 = 50;
+/// The default time, in seconds, that `work run` lets its command run after a
+/// signal or before the longest lease ends (`MANSIO_RUN_STOP_GRACE_SECONDS`).
+pub const DEFAULT_RUN_STOP_GRACE_SECONDS: u64 = 10;
+
+/// A request the server refused: its status, and the text a refusal prints.
+#[derive(Debug)]
+pub(crate) struct Refused {
+    pub(crate) status: StatusCode,
+    pub(crate) text: String,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl std::error::Error for Refused {}
 
 /// Whether a request can be sent again after its answer may have been lost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +84,11 @@ pub struct Client {
     retries: u32,
     retry_backoff: Duration,
     poll_interval: Duration,
+    watch_retry_base: Duration,
+    watch_retry_cap: Duration,
+    watch_attempts: u64,
+    run_extend_at_percent: u64,
+    run_stop_grace: Duration,
 }
 
 /// What the caller said on the command line, before the environment fills in
@@ -68,8 +104,11 @@ pub struct Connection {
 impl Client {
     /// Build a client from the command line and the variables `MANSIO_URL`,
     /// `MANSIO_TOKEN`, `MANSIO_TIMEOUT_SECONDS`, `MANSIO_RETRIES`,
-    /// `MANSIO_RETRY_BACKOFF_MILLIS` and `MANSIO_POLL_INTERVAL_MILLIS`, read
-    /// through `lookup`. The command line wins.
+    /// `MANSIO_RETRY_BACKOFF_MILLIS`, `MANSIO_POLL_INTERVAL_MILLIS`,
+    /// `MANSIO_WATCH_RETRY_BASE_MILLIS`, `MANSIO_WATCH_RETRY_CAP_MILLIS`,
+    /// `MANSIO_WATCH_ATTEMPTS`, `MANSIO_RUN_EXTEND_AT_PERCENT` and
+    /// `MANSIO_RUN_STOP_GRACE_SECONDS`, read through `lookup`. The command
+    /// line wins.
     ///
     /// # Errors
     ///
@@ -102,6 +141,26 @@ impl Client {
         let retries = number("MANSIO_RETRIES", u64::from(DEFAULT_RETRIES))?;
         let retry_backoff = number("MANSIO_RETRY_BACKOFF_MILLIS", DEFAULT_RETRY_BACKOFF_MILLIS)?;
         let poll_interval = number("MANSIO_POLL_INTERVAL_MILLIS", DEFAULT_POLL_INTERVAL_MILLIS)?;
+        let watch_retry_base = number(
+            "MANSIO_WATCH_RETRY_BASE_MILLIS",
+            DEFAULT_WATCH_RETRY_BASE_MILLIS,
+        )?;
+        let watch_retry_cap = number(
+            "MANSIO_WATCH_RETRY_CAP_MILLIS",
+            DEFAULT_WATCH_RETRY_CAP_MILLIS,
+        )?;
+        let watch_attempts = number("MANSIO_WATCH_ATTEMPTS", DEFAULT_WATCH_ATTEMPTS)?;
+        let run_extend_at_percent = number(
+            "MANSIO_RUN_EXTEND_AT_PERCENT",
+            DEFAULT_RUN_EXTEND_AT_PERCENT,
+        )?;
+        if !(1..=90).contains(&run_extend_at_percent) {
+            bail!("MANSIO_RUN_EXTEND_AT_PERCENT must be a whole number from 1 to 90");
+        }
+        let run_stop_grace = number(
+            "MANSIO_RUN_STOP_GRACE_SECONDS",
+            DEFAULT_RUN_STOP_GRACE_SECONDS,
+        )?;
         let base = Url::parse(&base).with_context(|| format!("the server address {base:?}"))?;
         if !matches!(base.scheme(), "http" | "https") || base.cannot_be_a_base() {
             bail!("the server address {base} must be an http or https address");
@@ -117,12 +176,46 @@ impl Client {
             retries: u32::try_from(retries).unwrap_or(u32::MAX),
             retry_backoff: Duration::from_millis(retry_backoff),
             poll_interval: Duration::from_millis(poll_interval.max(1)),
+            watch_retry_base: Duration::from_millis(watch_retry_base),
+            watch_retry_cap: Duration::from_millis(watch_retry_cap),
+            watch_attempts,
+            run_extend_at_percent,
+            run_stop_grace: Duration::from_secs(run_stop_grace),
         })
     }
 
     /// How long to wait between looks for something that is not there yet.
     pub fn poll_interval(&self) -> Duration {
         self.poll_interval
+    }
+
+    /// How long `watch` waits before it runs a failed command again the
+    /// first time; the wait doubles with each failure.
+    pub fn watch_retry_base(&self) -> Duration {
+        self.watch_retry_base
+    }
+
+    /// The longest `watch` waits before it runs a failed command again.
+    pub fn watch_retry_cap(&self) -> Duration {
+        self.watch_retry_cap
+    }
+
+    /// How many times `watch` may run its command for one envelope; 0 is no
+    /// limit.
+    pub fn watch_attempts(&self) -> u64 {
+        self.watch_attempts
+    }
+
+    /// The share of the time from the last answer to the lease's end, in
+    /// percent, after which `work run` extends the lease: 1 to 90.
+    pub fn run_extend_at_percent(&self) -> u64 {
+        self.run_extend_at_percent
+    }
+
+    /// How long `work run` lets its command run after a signal, and how long
+    /// before the longest lease ends it stops the command.
+    pub fn run_stop_grace(&self) -> Duration {
+        self.run_stop_grace
     }
 
     fn url(&self, segments: &[&str]) -> anyhow::Result<Url> {
@@ -219,7 +312,10 @@ fn answer(status: StatusCode, bytes: &[u8]) -> anyhow::Result<Option<Json>> {
             serde_json::from_slice(bytes).context("the server's answer was not understood")?;
         return Ok(Some(value));
     }
-    bail!("{}", refusal(status, bytes))
+    Err(anyhow::Error::new(Refused {
+        status,
+        text: refusal(status, bytes),
+    }))
 }
 
 fn refusal(status: StatusCode, body: &[u8]) -> String {
@@ -326,6 +422,24 @@ mod tests {
             &[("MANSIO_TOKEN", "t"), ("MANSIO_RETRIES", "-1")][..],
             &[("MANSIO_TOKEN", "t"), ("MANSIO_RETRY_BACKOFF_MILLIS", "x")][..],
             &[("MANSIO_TOKEN", "t"), ("MANSIO_POLL_INTERVAL_MILLIS", "x")][..],
+            &[
+                ("MANSIO_TOKEN", "t"),
+                ("MANSIO_WATCH_RETRY_BASE_MILLIS", "x"),
+            ][..],
+            &[
+                ("MANSIO_TOKEN", "t"),
+                ("MANSIO_WATCH_RETRY_CAP_MILLIS", "-1"),
+            ][..],
+            &[("MANSIO_TOKEN", "t"), ("MANSIO_WATCH_ATTEMPTS", "1.5")][..],
+            &[("MANSIO_TOKEN", "t"), ("MANSIO_RUN_EXTEND_AT_PERCENT", "0")][..],
+            &[
+                ("MANSIO_TOKEN", "t"),
+                ("MANSIO_RUN_EXTEND_AT_PERCENT", "91"),
+            ][..],
+            &[
+                ("MANSIO_TOKEN", "t"),
+                ("MANSIO_RUN_STOP_GRACE_SECONDS", "x"),
+            ][..],
             &[("MANSIO_TOKEN", "t"), ("MANSIO_URL", "not a url")][..],
             &[("MANSIO_TOKEN", "t"), ("MANSIO_URL", "ftp://h/")][..],
         ] {
