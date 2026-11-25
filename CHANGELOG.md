@@ -7,6 +7,7 @@ All notable changes to mansio are listed here. The format follows
 
 ### Added
 
+- `mansio work run ... -- CMD`: claims one work item, runs a command with the item on its standard input, extends the lease at `MANSIO_RUN_EXTEND_AT_PERCENT` of what is left while it runs, and acks the item when the command exits 0 or fails it when it does not; a lease that is lost or can grow no further ends the command and exits 4, and a signal lets the command end for `MANSIO_RUN_STOP_GRACE_SECONDS` before it is killed.
 - `mansio watch ... -- CMD`: runs a command for each envelope, with the envelope on its standard input, and prints and commits the envelope only when the command exits 0; a failed command is run again after `MANSIO_WATCH_RETRY_BASE_MILLIS` doubling to `MANSIO_WATCH_RETRY_CAP_MILLIS`, and after `MANSIO_WATCH_ATTEMPTS` runs the watch exits 3.
 - `work_list` and `work_show`: a queue's live work items can be listed, one
   page at a time in publish order with each item's state, attempt, holder and

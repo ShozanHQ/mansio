@@ -243,6 +243,18 @@ async fn every_command_refuses_without_a_token_and_calls_nothing() -> anyhow::Re
             "--",
             "true",
         ],
+        vec![
+            "work",
+            "run",
+            "--tenant",
+            &t,
+            "--queue",
+            "builds",
+            "--consumer",
+            "w",
+            "--",
+            "true",
+        ],
     ];
     for args in &commands {
         refused_at(&elsewhere, None, args, "MANSIO_TOKEN").await?;

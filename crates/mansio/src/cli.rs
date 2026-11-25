@@ -349,6 +349,44 @@ mod tests {
     }
 
     #[test]
+    fn work_run_takes_the_words_after_the_double_dash_and_needs_them() {
+        let claim = [
+            "work",
+            "run",
+            "--tenant",
+            "acme",
+            "--queue",
+            "builds",
+            "--consumer",
+            "w1",
+            "--wait",
+            "5",
+        ];
+        let mut with = claim.to_vec();
+        with.extend(["--", "a", "b"]);
+        let Chosen::Op(op, args) = chosen(&parse(&with).unwrap()).unwrap() else {
+            panic!("not an operation");
+        };
+        assert_eq!(op, Op::WorkRun);
+        assert_eq!(
+            Value::Object(args),
+            json!({
+                "tenant": "acme",
+                "queue": "builds",
+                "consumer": "w1",
+                "wait": 5,
+                "command": ["a", "b"],
+            })
+        );
+
+        let mut empty = claim.to_vec();
+        empty.push("--");
+        for args in [&claim[..], &empty[..]] {
+            assert!(parse(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
     fn mcp_is_a_command() {
         assert!(matches!(
             chosen(&parse(&["mcp"]).unwrap()).unwrap(),

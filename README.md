@@ -305,9 +305,11 @@ message on stderr if the server refuses. Without a token every command but
 
 The commands are the operations of the HTTP API, each named as the operation
 with `_` as a space, and each flag is a parameter of the operation, with `-`
-for `_`; and two that are commands only: `watch`, which streams a topic and
-can run a command for each envelope, and `mcp`, which serves the operations as
-tools. `mansio --help` and `mansio work pull --help` list them.
+for `_`; and three that are commands only: `watch`, which streams a topic and
+can run a command for each envelope, `work run`, which claims one work item,
+runs a command for it with the lease held and acks or fails it by how the
+command ends, and `mcp`, which serves the operations as tools. `mansio --help`
+and `mansio work pull --help` list them.
 
 | Command | Prints |
 |---|---|
@@ -315,6 +317,7 @@ tools. `mansio --help` and `mansio work pull --help` list them.
 | `poll` | The envelopes from `--offset` on, so the next poll starts at the offset plus the number of lines. |
 | `watch` | The envelopes of a topic as they arrive, until stopped. With a command after `--`, each envelope once the command has exited 0 for it. |
 | `work pull` | The lease: `{"lease_id", "consumer", "expires_at", "item"}`. Nothing, and exit 0, if there is no item. |
+| `work run` | The envelope of the ack or the fail it sent. Nothing when there was no item, the lease was lost, or the ack or the fail was not answered. |
 | `work list` | One page as one line: `{"items", "next"}`, the live items of a queue in publish order. `next` is the next page's `--after`, and is left out on the last page. |
 | `work show` | One work item: a live one with its envelope, a finished one as `{"item_id", "state": "finished"}`. |
 | `work extend`, `work ack`, `work fail`, `alerts ack` | The envelope of the transition. For `work extend` it is the `extended` fact, and `data.expires_at` is where the lease now ends. |
@@ -344,6 +347,10 @@ mansio work ack  --tenant acme --queue builds --item ITEMID \
 mansio work fail --tenant acme --queue builds --item ITEMID \
   --consumer worker-1 --lease-id LEASEID --reason "out of memory"
 
+# The same worker in one line: claim, run the script with the item on its
+# standard input, extend the lease while it runs, then ack or fail.
+mansio work run --tenant acme --queue builds --consumer worker-1 --wait 30 -- ./build.sh
+
 mansio alerts ack --tenant acme --alert ALERTID
 
 # Credentials and webhooks, with the admin token.
@@ -355,8 +362,8 @@ mansio webhooks list --tenant acme
 mansio webhooks rotate --id WEBHOOKID
 ```
 
-- `work pull --wait SECONDS` looks again every `MANSIO_POLL_INTERVAL_MILLIS`
-  until an item can be claimed or the wait ends.
+- `work pull --wait SECONDS` and `work run --wait SECONDS` look again every
+  `MANSIO_POLL_INTERVAL_MILLIS` until an item can be claimed or the wait ends.
 - `watch --tenant T --topic X --consumer NAME` prints one envelope a line from
   where the named consumer stopped (mansio keeps its position, see
   [Consumers](#consumers)), and commits each offset after the line has been
@@ -391,6 +398,57 @@ mansio webhooks rotate --id WEBHOOKID
   second signal kills it and exits 130. A work item that is retried is
   published again to its queue as a new envelope, so a watcher of
   `work.<queue>` runs its command once for each attempt.
+- `work run --tenant T --queue Q --consumer C [--wait SECONDS] -- CMD [ARGS...]`
+  claims one item as `work pull` does and runs a command for it. With no item
+  it runs nothing and exits 0.
+
+  ```sh
+  mansio work run --tenant acme --queue builds --consumer worker-1 -- ./build.sh
+  ```
+
+  The command gets the item (the `item` of the claim, never the lease id) as
+  one JSON line on its standard input, and `MANSIO_TENANT`, `MANSIO_QUEUE`,
+  `MANSIO_ITEM_ID` and `MANSIO_ATTEMPT` in its environment; `MANSIO_TOKEN` is
+  removed from it, so only the runner extends, acks or fails. Its output goes
+  to the runner's standard error. While it runs the runner extends the lease
+  each time `MANSIO_RUN_EXTEND_AT_PERCENT` of the time from the last answer to
+  the lease's end has passed. When the command exits 0 the item is acked;
+  when it exits with another status, or is ended by a signal, the item is
+  failed with a reason that says so; a command that cannot be started fails
+  the item too. An extension whose end does not move is the longest lease
+  (the server's maximum from the claim, or the end of the runner's
+  credential): the command is let run until `MANSIO_RUN_STOP_GRACE_SECONDS`
+  before that end, then killed, and the item failed. An extension refused
+  with 401, 403, 404 or 409, or a lease whose end passes, means the lease is
+  lost: the command is killed and neither an ack nor a fail is sent. On
+  SIGINT or SIGTERM while it waits for an item it exits 130 and runs nothing.
+  The first signal while the command runs lets it end by itself for up to
+  `MANSIO_RUN_STOP_GRACE_SECONDS`, with the lease held, then kills it and
+  fails the item as `stopped`; a second kills it at once, fails the item and
+  exits 130. A signal is not passed on: a terminal or a service manager
+  signals the whole process group, so the command has it already. It runs
+  one item; a service manager or a shell loop runs it again. It exits:
+
+  | Status | Meaning |
+  |---|---|
+  | `0` | The item is done and acked, or there was nothing to do. |
+  | `1` | An error: the ack or the fail was refused or not answered, for one. |
+  | `3` | The command failed, could not be started, or was stopped. |
+  | `4` | The lease was lost, or could grow no further. |
+  | `130` | A signal ended the wait for an item, or a second signal killed the command. |
+
+  `work run` is at least once. An ack or a fail that is not answered is not
+  sent again, as with `work ack` and `work fail`: the lease runs out and the
+  item is tried again, so a command may run again for an item it already
+  finished. Make the command's effect safe to repeat for one item id. A claim
+  is not capped by the runner's credential, but an extension is, and a
+  credential that ends before the first lease does leaves the runner unable
+  to fail the item: give a runner a credential that outlives at least one
+  lease, and for long work the longest lease. A runner killed with SIGKILL
+  leaves its command running, so run it under a service manager that stops
+  the whole process group. The lease's end is read against the runner's own
+  clock: a clock that is off from the server's by more than half a lease
+  extends late.
 - The CLI and MCP retry on network errors, `MANSIO_RETRIES` times, waiting
   `MANSIO_RETRY_BACKOFF_MILLIS` and then twice as long each time. A request
   whose connection could not be made is always sent again. One whose answer
@@ -410,12 +468,14 @@ mansio webhooks rotate --id WEBHOOKID
 the harness of an agent (Claude Code, Codex and the like) to run. It reads
 `MANSIO_URL` and `MANSIO_TOKEN` as the CLI does, and does not start without a
 token. It offers every command but `watch` (which streams, and a tool call
-cannot) as a tool with the same name as the command, `work_pull` for
-`work pull`, and the parameters of the command as its input, `lease_id` for
-`--lease-id`. A tool does what the command does, by the same code, and returns
-what the command prints; an operation that fails is a result with `isError`,
-so that the model can read the reason and try again. A test lists the commands
-and the tools and fails on any difference beyond `watch` and `mcp`. It speaks
+cannot) and `work run` (which runs a program of the caller's and waits for
+it, which a tool call cannot either) as a tool with the same name as the
+command, `work_pull` for `work pull`, and the parameters of the command as its
+input, `lease_id` for `--lease-id`. A tool does what the command does, by the
+same code, and returns what the command prints; an operation that fails is a
+result with `isError`, so that the model can read the reason and try again. A
+test lists the commands and the tools and fails on any difference beyond
+`watch`, `work run` and `mcp`. It speaks
 the protocol versions 2024-11-05, 2025-03-26, 2025-06-18 and 2025-11-25,
 answers the one the client asks for, and accepts a batch of messages, which
 2025-03-26 requires and later versions do not send. A line that is not UTF-8
@@ -1234,10 +1294,12 @@ topics it creates, and leaves Iggy's own settings at its defaults.
 | `MANSIO_TIMEOUT_SECONDS` | `30` | Time allowed for one request. |
 | `MANSIO_RETRIES` | `3` | How many times a request that failed on the network is tried again. |
 | `MANSIO_RETRY_BACKOFF_MILLIS` | `250` | The wait before the first retry. It doubles with each. |
-| `MANSIO_POLL_INTERVAL_MILLIS` | `500` | How often `watch` and `work pull --wait` look again when there is nothing yet. |
+| `MANSIO_POLL_INTERVAL_MILLIS` | `500` | How often `watch`, `work pull --wait` and `work run --wait` look again when there is nothing yet. |
 | `MANSIO_WATCH_RETRY_BASE_MILLIS` | `1000` | The wait before `watch` runs a failed command again. It doubles with each failure for the same envelope. |
 | `MANSIO_WATCH_RETRY_CAP_MILLIS` | `60000` | The longest wait before `watch` runs a failed command again. |
 | `MANSIO_WATCH_ATTEMPTS` | `0` | How many times `watch` may run its command for one envelope before it exits 3. `0` is no limit. |
+| `MANSIO_RUN_EXTEND_AT_PERCENT` | `50` | How much of the time from the last answer to the lease's end, in percent, passes before `work run` extends the lease. A whole number from 1 to 90. |
+| `MANSIO_RUN_STOP_GRACE_SECONDS` | `10` | How long `work run` lets its command end by itself after a signal, and how long before the longest lease ends it stops the command. `0` or more. |
 
 ### Tests and compose
 
