@@ -303,15 +303,17 @@ Every command prints JSON, one object per line, and exits non-zero with a
 message on stderr if the server refuses. Without a token every command but
 `--help` exits non-zero at once, says so, and sends nothing.
 
-There is one command for each HTTP operation, named as the operation with `_`
-as a space, and each flag is a parameter of the operation, with `-` for `_`.
-`mansio --help` and `mansio work pull --help` list them.
+The commands are the operations of the HTTP API, each named as the operation
+with `_` as a space, and each flag is a parameter of the operation, with `-`
+for `_`; and two that are commands only: `watch`, which streams a topic and
+can run a command for each envelope, and `mcp`, which serves the operations as
+tools. `mansio --help` and `mansio work pull --help` list them.
 
 | Command | Prints |
 |---|---|
 | `publish`, `work publish`, `alerts publish` | The envelope as stored. |
 | `poll` | The envelopes from `--offset` on, so the next poll starts at the offset plus the number of lines. |
-| `watch` | The envelopes of a topic as they arrive, until stopped. |
+| `watch` | The envelopes of a topic as they arrive, until stopped. With a command after `--`, each envelope once the command has exited 0 for it. |
 | `work pull` | The lease: `{"lease_id", "consumer", "expires_at", "item"}`. Nothing, and exit 0, if there is no item. |
 | `work list` | One page as one line: `{"items", "next"}`, the live items of a queue in publish order. `next` is the next page's `--after`, and is left out on the last page. |
 | `work show` | One work item: a live one with its envelope, a finished one as `{"item_id", "state": "finished"}`. |
@@ -366,6 +368,29 @@ mansio webhooks rotate --id WEBHOOKID
   `--from OFFSET` starts at an offset and keeps no place (the default is 0),
   and `--limit N` stops after N envelopes. A topic nobody has published to is
   a 404.
+- `watch ... -- CMD [ARGS...]` runs a command for each envelope, in order:
+
+  ```sh
+  mansio watch --tenant acme --topic work.builds --consumer starter -- ./start-a-worker.sh
+  ```
+
+  The command gets the envelope as one JSON line on its standard input, and
+  `MANSIO_TENANT`, `MANSIO_TOPIC`, `MANSIO_OFFSET`, `MANSIO_EVENT_ID` and
+  `MANSIO_EVENT_TYPE` in its environment; `MANSIO_TOKEN` is removed from it.
+  Its output goes to the watcher's standard error. Only when it exits 0 is
+  the envelope printed and its offset committed, so the command runs at least
+  once for each envelope, and again for one if the watcher is stopped between
+  the command's exit and the commit. A command that fails is run again for
+  the same envelope after a wait from `MANSIO_WATCH_RETRY_BASE_MILLIS` that
+  doubles up to `MANSIO_WATCH_RETRY_CAP_MILLIS`; after
+  `MANSIO_WATCH_ATTEMPTS` runs (0, the default, is no limit) the watcher
+  exits 3 without committing, so the next start resumes at that envelope. A
+  command that cannot be started exits 1. `--limit N` counts envelopes whose
+  command exited 0. On SIGINT or SIGTERM no further envelope is taken: a
+  command that is running is let finish, and is not run again if it fails; a
+  second signal kills it and exits 130. A work item that is retried is
+  published again to its queue as a new envelope, so a watcher of
+  `work.<queue>` runs its command once for each attempt.
 - The CLI and MCP retry on network errors, `MANSIO_RETRIES` times, waiting
   `MANSIO_RETRY_BACKOFF_MILLIS` and then twice as long each time. A request
   whose connection could not be made is always sent again. One whose answer
@@ -1210,6 +1235,9 @@ topics it creates, and leaves Iggy's own settings at its defaults.
 | `MANSIO_RETRIES` | `3` | How many times a request that failed on the network is tried again. |
 | `MANSIO_RETRY_BACKOFF_MILLIS` | `250` | The wait before the first retry. It doubles with each. |
 | `MANSIO_POLL_INTERVAL_MILLIS` | `500` | How often `watch` and `work pull --wait` look again when there is nothing yet. |
+| `MANSIO_WATCH_RETRY_BASE_MILLIS` | `1000` | The wait before `watch` runs a failed command again. It doubles with each failure for the same envelope. |
+| `MANSIO_WATCH_RETRY_CAP_MILLIS` | `60000` | The longest wait before `watch` runs a failed command again. |
+| `MANSIO_WATCH_ATTEMPTS` | `0` | How many times `watch` may run its command for one envelope before it exits 3. `0` is no limit. |
 
 ### Tests and compose
 

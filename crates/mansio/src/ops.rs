@@ -85,6 +85,9 @@ pub enum Kind {
     /// The scopes of a principal: a list of `{"topic", "verbs"}`. On the
     /// command line it is written as JSON.
     Scopes,
+    /// A list of words: on the command line, everything after `--`, with no
+    /// flag. In the arguments of a call it is a JSON array of strings.
+    Argv,
 }
 
 /// One parameter of an operation: a flag on the command line and a property
@@ -268,7 +271,7 @@ impl Op {
             Op::Publish => "Publish an envelope to a topic and print it as stored.",
             Op::Poll => "Print the envelopes in a topic from an offset, one JSON object per line.",
             Op::Watch => {
-                "Stream the envelopes of a topic as they arrive, one JSON object per line. With --consumer the server keeps the position, so a restart resumes at the next envelope; stop with SIGINT or SIGTERM."
+                "Stream the envelopes of a topic as they arrive, one JSON object per line. With --consumer the server keeps the position, so a restart resumes at the next envelope; stop with SIGINT or SIGTERM. With a command after --, the command is run for each envelope, which is printed and committed only when the command exits 0; a command that fails is run again after a wait."
             }
             Op::WorkPublish => {
                 "Publish a work item to a queue and print it as stored. The item is named by its id. To resend safely, choose the id before the first send."
@@ -353,14 +356,23 @@ impl Op {
                 optional(
                     "consumer",
                     Kind::Text,
-                    "Resume from this named consumer, and commit each offset after its line is written. Not with --from.",
+                    "Resume from this named consumer, and commit each offset after its line is written and, with a command, after the command has exited 0. Not with --from.",
                 ),
                 optional(
                     "from",
                     Kind::Int,
                     "Start at this offset, without keeping a position. Not with --consumer. Default 0.",
                 ),
-                optional("limit", Kind::Int, "Stop after this many envelopes."),
+                optional(
+                    "limit",
+                    Kind::Int,
+                    "Stop after this many envelopes; with a command, envelopes whose command exited 0.",
+                ),
+                optional(
+                    "command",
+                    Kind::Argv,
+                    "A command to run for each envelope, after --: the envelope is its standard input, and the place moves only when it exits 0.",
+                ),
             ],
             Op::WorkPublish => envelope(&[TENANT, QUEUE], &[ID_WORK]),
             Op::WorkPull => vec![
@@ -594,6 +606,16 @@ impl<'a> Args<'a> {
             consumer,
             from: from.unwrap_or(0),
             limit: self.int("limit"),
+            command: self
+                .get("command")
+                .and_then(Value::as_array)
+                .map(|words| {
+                    words
+                        .iter()
+                        .filter_map(|word| word.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 }
@@ -618,6 +640,12 @@ fn kind_ok(param: &Param, value: &Value) -> anyhow::Result<()> {
             Ok(_) => Ok(()),
             Err(reason) => bail!("{name} must be a list of {{\"topic\", \"verbs\"}}: {reason}"),
         },
+        Kind::Argv => match value {
+            Value::Array(words) if !words.is_empty() && words.iter().all(Value::is_string) => {
+                Ok(())
+            }
+            _ => bail!("{name} must be a list of words"),
+        },
     }
 }
 
@@ -634,6 +662,9 @@ pub struct WatchArgs {
     pub from: u64,
     /// Stop after this many envelopes.
     pub limit: Option<u64>,
+    /// The command to run for each envelope, its program first; empty for
+    /// none.
+    pub command: Vec<String>,
 }
 
 /// The attributes of an envelope that a client sets, as JSON text. `data`
@@ -1259,6 +1290,32 @@ mod tests {
         }
         assert!(!Op::Watch.is_tool());
         assert_eq!(Op::ALL.iter().filter(|op| !op.is_tool()).count(), 1);
+    }
+
+    #[test]
+    fn watch_carries_its_command_and_none_when_there_is_none() {
+        let with = object(json!({
+            "tenant": "acme",
+            "topic": "facts.build",
+            "consumer": "c",
+            "command": ["sh", "-c", "x"],
+        }));
+        let watched = Args::check(Op::Watch, &with).unwrap().watch().unwrap();
+        assert_eq!(watched.command, ["sh", "-c", "x"]);
+        assert_eq!(
+            watched.consumer.map(|c| c.as_str().to_owned()),
+            Some("c".to_owned())
+        );
+
+        let without = object(json!({"tenant": "acme", "topic": "facts.build"}));
+        let watched = Args::check(Op::Watch, &without).unwrap().watch().unwrap();
+        assert!(watched.command.is_empty());
+
+        for bad in [json!([]), json!("sh -c x"), json!(["sh", 1])] {
+            let values = object(json!({"tenant": "acme", "topic": "facts.build", "command": bad}));
+            let error = Args::check(Op::Watch, &values).unwrap_err().to_string();
+            assert!(error.contains("command must be a list of words"), "{error}");
+        }
     }
 
     #[test]

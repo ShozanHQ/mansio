@@ -7,6 +7,7 @@ All notable changes to mansio are listed here. The format follows
 
 ### Added
 
+- `mansio watch ... -- CMD`: runs a command for each envelope, with the envelope on its standard input, and prints and commits the envelope only when the command exits 0; a failed command is run again after `MANSIO_WATCH_RETRY_BASE_MILLIS` doubling to `MANSIO_WATCH_RETRY_CAP_MILLIS`, and after `MANSIO_WATCH_ATTEMPTS` runs the watch exits 3.
 - `work_list` and `work_show`: a queue's live work items can be listed, one
   page at a time in publish order with each item's state, attempt, holder and
   lease expiry or retry time, and one item shown with its envelope, on
